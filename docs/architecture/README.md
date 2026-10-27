@@ -67,7 +67,11 @@ flowchart TB
    `ss-*` workflows GitHub has disabled, and the open `steward/*` PRs with
    their order ids. A labelled issue that names no check or workflow (an
    adopter report on the slopstopper repo itself, a hand-written note) is
-   reported, never worked: there is nothing to reproduce.
+   reported, never worked: there is nothing to reproduce. The label needs
+   triage rights, so it is trusted on its own; a bare body marker is
+   anyone's to type, so it counts only on an issue a bot opened, which is
+   what `emit` and the failure tracker are. A person's issue never reaches
+   the agent's brief on the strength of a marker.
 3. **plan** turns each inventory into orders and applies the budgets:
 
    | Kind | When | Who does the work | Priority |
@@ -81,10 +85,16 @@ flowchart TB
    target has no `slopstopper install` (below `MIN_INSTALL_VERSION`).
 4. **execute** clones each order's repo, branches `steward/<order id>`
    and runs the executor. Nothing is pushed until the work is committed;
-   the agent cannot push at all.
-5. **report** writes `.steward/reports/run.{md,json}` and the Actions job
+   the agent cannot push at all. The pin moves through one PR at a time:
+   while an upgrade or refresh PR is open, a newer release waits for it
+   to merge or close rather than opening a second one beside it.
+5. **verify** asks the pinned CLI which checks a clone can run: what
+   `checks list --json` says the repo keeps, minus what `profile expand
+   library --json` says needs a deployed surface, minus `security:licences`,
+   which inventories an installed environment the clone does not have (its
+   workflow installs the project first). Exit 2 counts as red.
+6. **report** writes `.steward/reports/run.{md,json}` and the Actions job
    summary.
-
 ## Where the agent is boxed
 
 - It runs inside the clone with `--permission-mode acceptEdits`, an

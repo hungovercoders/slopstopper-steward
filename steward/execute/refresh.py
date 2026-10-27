@@ -16,21 +16,20 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Sequence
 
-from steward.discover import PIN_KEY
-from steward.plan import STATIC_CHECKS
+from steward.checks import FALLBACK_STATIC, NEEDS_ENVIRONMENT
+from steward.discover import PIN_KEY, PIN_LINE
 from steward.versions import MIN_INSTALL_VERSION
 from steward.workspace import Workspace
-
-_PIN_LINE = re.compile(rf'^(\s*"?{re.escape(PIN_KEY)}"?\s*=\s*)"[^"]*"', re.M)
 
 
 def set_pin(mise_toml: Path, version: str) -> str:
     """Rewrite (or seed) the pin. Returns 'moved', 'seeded' or 'unchanged'."""
     if mise_toml.is_file():
         text = mise_toml.read_text(encoding="utf-8")
-        if _PIN_LINE.search(text):
-            new = _PIN_LINE.sub(lambda m: f'{m.group(1)}"{version}"', text, count=1)
+        if PIN_LINE.search(text):
+            new = PIN_LINE.sub(lambda m: f'{m.group(1)}"{version}"', text, count=1)
             if new == text:
                 return "unchanged"
             mise_toml.write_text(new, encoding="utf-8")
@@ -70,20 +69,35 @@ def install_suite(ws: Workspace, cli: Path) -> subprocess.CompletedProcess:
     return done
 
 
-def verify(ws: Workspace, cli: Path) -> list[dict]:
-    """Run every static check the repo keeps; return the red rows as
-    `run --json` printed them. Exit 2 (could not run) counts as red too,
-    because a PR that silently drops a check is the thing to avoid."""
-    listing = subprocess.run([str(cli), "checks", "list", "--json"], cwd=ws.path, capture_output=True, text=True)
+def _json(cli: Path, cwd: Path, *args: str):
+    """One `--json` command of the pinned CLI, parsed; None when it cannot answer."""
     try:
-        rows = json.loads(listing.stdout or "[]")
-    except json.JSONDecodeError:
-        rows = []
-    enabled = {r["name"] for r in rows if not r.get("disabled")} or set(STATIC_CHECKS)
+        done = subprocess.run([str(cli), *args, "--json"], cwd=cwd, capture_output=True, text=True, timeout=120)
+        return json.loads(done.stdout.strip().splitlines()[-1]) if done.returncode == 0 and done.stdout.strip() else None
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
+        return None
+
+
+def static_checks(ws: Workspace, cli: Path) -> list[str]:
+    """The checks this clone can run: what the repo keeps (`checks list`),
+    minus what the `library` profile drops (slopstopper's own list of
+    URL-driven checks), minus what needs an installed environment."""
+    rows = _json(cli, ws.path, "checks", "list") or []
+    expanded = _json(cli, ws.path, "profile", "expand", "library") or {}
+    dropped = set(expanded.get("workflows") or [])
+    if not rows or not dropped:
+        return [c for c in FALLBACK_STATIC if c not in {r["name"] for r in rows if r.get("disabled")}]
+    return [r["name"] for r in rows
+            if not r.get("disabled") and r.get("workflow") not in dropped and r["name"] not in NEEDS_ENVIRONMENT]
+
+
+def verify(ws: Workspace, cli: Path, checks: Sequence[str] | None = None) -> list[dict]:
+    """Run the given checks (default: every static check the repo keeps) and
+    return the red rows as `run --json` printed them. Exit 2 (could not
+    run) counts as red too, because a PR that silently drops a check is the
+    thing to avoid."""
     red = []
-    for check in STATIC_CHECKS:
-        if check not in enabled:
-            continue
+    for check in (static_checks(ws, cli) if checks is None else checks):
         run = subprocess.run([str(cli), "run", "--json", check], cwd=ws.path, capture_output=True, text=True, timeout=900)
         try:
             verdict = json.loads(run.stdout.strip().splitlines()[-1]) if run.stdout.strip() else {}

@@ -86,8 +86,10 @@ def ensure_skills(ws: Workspace, pinned: str | None, slopstopper_repo: str) -> s
         _fetch_tree(slopstopper_repo, f".claude/skills/{skill}", ref, root / skill)
         if not (root / skill / "SKILL.md").is_file():
             raise RuntimeError(f"could not fetch skill {skill} from {slopstopper_repo}@{ref}")
-    with (ws.path / ".git" / "info" / "exclude").open("a", encoding="utf-8") as fh:
-        fh.write(".claude/skills/slopstopper-*/\n")
+        # Kept out of the commit by pathspec (see Workspace.excluded): a
+        # `.gitignore` negation the installer writes would otherwise win
+        # over `.git/info/exclude` and `git add -A` would ship the skills.
+        ws.excluded.append(f".claude/skills/{skill}")
     return f"fetched@{ref}"
 
 

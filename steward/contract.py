@@ -52,8 +52,10 @@ SURFACES: tuple[Surface, ...] = (
             "the installer flag that keeps a clone from editing repo topics"),
     Surface("docs/contributing/README.md", "`run --json <check>`", "execute.refresh.verify",
             "the machine-readable run verdict: {check, exit_code, status, failures, reports}"),
-    Surface("docs/contributing/README.md", "`checks list --json`", "execute.refresh.verify",
-            "the check listing with its `disabled` flag"),
+    Surface("docs/contributing/README.md", "`checks list --json`", "execute.refresh.static_checks",
+            "the check listing with its `disabled` flag and workflow"),
+    Surface("docs/contributing/README.md", "`profile expand <n> --json`", "execute.refresh.static_checks",
+            "the workflows a profile drops: `library` is slopstopper's own list of URL-driven checks"),
     Surface("release-please-config.json", '"include-v-in-tag": true', "execute.agent.ensure_skills",
             "release tags are v<version>, so skills can be fetched at the pinned tag"),
 )

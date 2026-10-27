@@ -45,7 +45,8 @@ this table is stale.
 | `cli/slopstopper/cli.py` | `"install"` | `execute.refresh` | `slopstopper install` writes the suite the pinned CLI ships |
 | `cli/slopstopper/cli.py` | `"--no-topic"` | `execute.refresh` | the installer flag that keeps a clone from editing repo topics |
 | `docs/contributing/README.md` | `\`run --json <check>\`` | `execute.refresh.verify` | the machine-readable run verdict: {check, exit_code, status, failures, reports} |
-| `docs/contributing/README.md` | `\`checks list --json\`` | `execute.refresh.verify` | the check listing with its `disabled` flag |
+| `docs/contributing/README.md` | `\`checks list --json\`` | `execute.refresh.static_checks` | the check listing with its `disabled` flag and workflow |
+| `docs/contributing/README.md` | `\`profile expand <n> --json\`` | `execute.refresh.static_checks` | the workflows a profile drops: `library` is slopstopper's own list of URL-driven checks |
 | `release-please-config.json` | `"include-v-in-tag": true` | `execute.agent.ensure_skills` | release tags are v<version>, so skills can be fetched at the pinned tag |
 <!-- contract:end -->
 

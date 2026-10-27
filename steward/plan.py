@@ -18,12 +18,6 @@ from steward.config import Config
 from steward.inventory import Finding, Inventory
 from steward.versions import MIN_INSTALL_VERSION, behind, parse
 
-STATIC_CHECKS = (
-    "hygiene:complexity", "hygiene:docs-accuracy", "hygiene:docs-size", "hygiene:docs-structure",
-    "hygiene:entry-files", "hygiene:csp-exceptions", "hygiene:privacy",
-    "security:licences",
-)
-
 
 @dataclass
 class Order:
@@ -94,9 +88,21 @@ def _triage_orders(inv: Inventory) -> list[Order]:
             f"fix(slopstopper): {what} (closes #{finding.number})",
             f"open issue #{finding.number}: {finding.title}", 2 if finding.security else 3,
             inv.repo.default_branch, inv.repo.pinned, inv.repo.pinned, finding, agentic=True,
-            details={"static": finding.check in STATIC_CHECKS},
         ))
     return orders
+
+
+PIN_KINDS = ("upgrade", "refresh")
+
+
+def _open_pin_pr(inv: Inventory) -> str | None:
+    """The id of an open upgrade/refresh PR, whatever its target: the pin
+    moves through one PR at a time, so a newer release never opens a second
+    one beside a stale one (two pin PRs can merge in the wrong order)."""
+    for order_id in inv.open_orders:
+        if order_id.split("-", 1)[0] in PIN_KINDS:
+            return order_id
+    return None
 
 
 def _stale_suite_below_floor(inv: Inventory) -> bool:
@@ -129,6 +135,12 @@ def plan_repo(inv: Inventory, target: str | None, cfg: Config) -> Plan:
     for order in sorted(candidates, key=lambda o: o.priority):
         if order.id in inv.open_orders:
             plan.skipped.append({"repo": order.repo, "order": order.id, "why": "open PR", **inv.open_orders[order.id]})
+            continue
+        stale = _open_pin_pr(inv) if order.kind in PIN_KINDS else None
+        if stale:
+            plan.skipped.append({"repo": order.repo, "order": order.id,
+                                 "why": f"open PR for `{stale}` moves the pin already; merge or close it before a new target",
+                                 **inv.open_orders[stale]})
             continue
         if order.agentic and not cfg.agent_enabled:
             plan.skipped.append({"repo": order.repo, "order": order.id, "why": "agent disabled"})

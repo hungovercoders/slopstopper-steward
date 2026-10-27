@@ -36,6 +36,8 @@ class Finding:
     check: str | None = None
     workflow: str | None = None
     kind: str = "check"  # check | workflow-failure | other
+    author: str = ""
+    author_is_bot: bool = False
 
     @property
     def security(self) -> bool:
@@ -43,7 +45,8 @@ class Finding:
 
     def to_dict(self) -> dict:
         return {"number": self.number, "title": self.title, "url": self.url, "labels": self.labels,
-                "check": self.check, "workflow": self.workflow, "kind": self.kind, "security": self.security}
+                "check": self.check, "workflow": self.workflow, "kind": self.kind, "security": self.security,
+                "author": self.author}
 
 
 @dataclass
@@ -69,7 +72,9 @@ def classify(issue: dict) -> Finding:
     labels = [l["name"] if isinstance(l, dict) else str(l) for l in issue.get("labels", [])]
     body = issue.get("body") or ""
     title = issue.get("title") or ""
-    finding = Finding(issue["number"], title, issue.get("html_url", ""), labels)
+    user = issue.get("user") or {}
+    finding = Finding(issue["number"], title, issue.get("html_url", ""), labels,
+                      author=str(user.get("login") or ""), author_is_bot=str(user.get("type") or "") == "Bot")
     check = CHECK_MARKER.search(body)
     workflow = WORKFLOW_MARKER.search(body)
     if check:
@@ -85,7 +90,14 @@ def classify(issue: dict) -> Finding:
 
 
 def _is_slopstoppers(finding: Finding) -> bool:
-    return BRAND_LABEL in finding.labels or finding.kind in ("check", "workflow-failure")
+    """The label needs triage rights to apply, so it is trusted on its own.
+    A bare body marker is anyone's to type, so it counts only when a bot
+    (the Actions token `emit` and the failure tracker run under) opened the
+    issue; otherwise the issue is a person's note and the agent never sees
+    its body."""
+    if BRAND_LABEL in finding.labels:
+        return True
+    return finding.kind in ("check", "workflow-failure") and finding.author_is_bot
 
 
 def read_profile(slopstopper_yml: str | None) -> str | None:

@@ -12,6 +12,7 @@ from steward.execute import agent, refresh
 from steward.execute.agent import AgentResult
 from steward.plan import Order, Plan, plan_all
 from steward.report import Outcome, RunReport
+from steward.versions import MIN_INSTALL_VERSION
 
 STEWARD_URL = "https://github.com/hungovercoders/slopstopper-steward"
 
@@ -26,8 +27,18 @@ def gather(cfg: Config, only: str | None = None) -> tuple[list[inventory.Invento
     return invs, targets, latest
 
 
+_RELEASES: dict[str, list] = {}
+
+
+def _releases(repo: str) -> list:
+    """slopstopper's release list, fetched once per run."""
+    if repo not in _RELEASES:
+        _RELEASES[repo] = gh.api(f"repos/{repo}/releases?per_page=100", paginate=True) or []
+    return _RELEASES[repo]
+
+
 def release_notes(cfg: Config, pinned: str | None, target: str) -> str:
-    rows = gh.api(f"repos/{cfg.slopstopper_repo}/releases?per_page=100", paginate=True) or []
+    rows = _releases(cfg.slopstopper_repo)
     lo, hi = versions.parse(pinned), versions.parse(target)
     picked = []
     for r in rows:
@@ -123,19 +134,34 @@ def _triage_summary(result: AgentResult) -> str:
     return summary
 
 
-def _recheck(order: Order, ws: workspace.Workspace, cli: Path | None) -> list[dict]:
-    """The steward's own gate on a static finding: the named check, re-run."""
-    if not (cli and order.finding and order.finding.check and order.details.get("static")):
+def _recheck(order: Order, ws: workspace.Workspace, cli: Path) -> list[dict]:
+    """The steward's own gate on a finding: the named check, re-run, when it
+    is one a clone can run at all."""
+    check = order.finding.check if order.finding else None
+    if not check or check not in refresh.static_checks(ws, cli):
         return []
-    return [r for r in refresh.verify(ws, cli) if r["check"] == order.finding.check]
+    return refresh.verify(ws, cli, [check])
+
+
+def _verifier_version(order: Order, inv: inventory.Inventory) -> str | None:
+    """The slopstopper-cli to put on the agent's PATH and re-check with: the
+    pin when it is a release the steward can work with, else PyPI's latest,
+    else nothing (a pin like `latest` or one below the floor)."""
+    for candidate in (order.pinned, inv.latest):
+        if versions.parse(candidate) and not versions.behind(candidate, MIN_INSTALL_VERSION):
+            return candidate
+    return None
 
 
 def work_triage(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace) -> Outcome:
     assert order.finding
+    version = _verifier_version(order, inv)
+    if not version:
+        return Outcome(order.to_dict(), "skipped", detail=f"no slopstopper-cli at or above {MIN_INSTALL_VERSION} to work with "
+                       f"(pin {order.pinned or 'none'}, PyPI latest {inv.latest or 'unknown'})")
     issue = gh.api(f"repos/{order.repo}/issues/{order.finding.number}") or {}
-    pinned = order.pinned or inv.latest
-    cli = refresh.cli_for(pinned, ws.path / ".steward-venv", cfg.package) if pinned else None
-    agent.ensure_skills(ws, pinned, cfg.slopstopper_repo)
+    cli = refresh.cli_for(version, ws.path / ".steward-venv", cfg.package)
+    agent.ensure_skills(ws, version, cfg.slopstopper_repo)
     result = agent.run(ws, prompts.triage(order, inv, issue.get("body") or "", cfg.slopstopper_repo), cfg, cli)
     if not result.ran:
         return Outcome(order.to_dict(), "skipped", detail=result.error, agent=result.to_dict())

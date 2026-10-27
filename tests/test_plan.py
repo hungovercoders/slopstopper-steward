@@ -24,7 +24,7 @@ def test_upgrade_first_then_security_then_rest_within_budget():
     p = plan_repo(inv, "0.27.0", CFG)
     assert [o.id for o in p.orders] == ["upgrade-0.27.0", "triage-2"]
     assert [o.id for o in p.deferred] == ["triage-1"]
-    assert p.orders[0].branch == "steward/upgrade-0.27.0" and p.orders[1].details["static"] is False
+    assert p.orders[0].branch == "steward/upgrade-0.27.0"
 
 
 def test_open_pr_dedupes_and_counts_against_budget():

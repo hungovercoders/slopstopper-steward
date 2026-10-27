@@ -21,7 +21,10 @@ from steward.config import Config
 TOPIC = "slopstopper"
 PIN_KEY = "pipx:slopstopper-cli"
 INSTALLED_FROM = ".ss/.installed-from"
-_PIN = re.compile(rf'^\s*"?{re.escape(PIN_KEY)}"?\s*=\s*"([^"]*)"', re.M)
+# The one pattern for the pin line: group 1 is everything up to the value,
+# group 2 the value. `execute/refresh.set_pin` rewrites with it, so the two
+# cannot drift.
+PIN_LINE = re.compile(rf'^(\s*"?{re.escape(PIN_KEY)}"?\s*=\s*)"([^"]*)"', re.M)
 
 
 @dataclass
@@ -51,8 +54,8 @@ class Repo:
 def read_pin(mise_toml: str | None) -> str | None:
     if not mise_toml:
         return None
-    match = _PIN.search(mise_toml)
-    return match.group(1).strip() or None if match else None
+    match = PIN_LINE.search(mise_toml)
+    return match.group(2).strip() or None if match else None
 
 
 def org_repos(org: str) -> list[dict]:

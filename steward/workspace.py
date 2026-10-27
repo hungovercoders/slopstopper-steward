@@ -7,8 +7,9 @@ old branch, not stack on it or be refused by it."""
 
 from __future__ import annotations
 
+import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from steward import gh
@@ -22,19 +23,33 @@ class Workspace:
     repo: str
     path: Path
     default_branch: str
+    # Paths the steward put in the tree for its own use (fetched skills) and
+    # must never commit. A pathspec exclusion, because `.git/info/exclude`
+    # loses to a `.gitignore` negation such as the `!.claude/skills/**` the
+    # slopstopper installer writes.
+    excluded: list[str] = field(default_factory=list)
 
     def git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         return subprocess.run(["git", *args], cwd=self.path, capture_output=True, text=True, check=check)
 
+    def _pathspec(self) -> list[str]:
+        return ["--", ".", *(f":(exclude){p}" for p in self.excluded)]
+
     def dirty(self) -> bool:
-        return bool(self.git("status", "--porcelain").stdout.strip())
+        return bool(self.git("status", "--porcelain", *self._pathspec()).stdout.strip())
 
     def changed_files(self) -> list[str]:
-        out = self.git("status", "--porcelain").stdout
+        out = self.git("status", "--porcelain", *self._pathspec()).stdout
         return sorted(line[3:].strip() for line in out.splitlines() if line.strip())
 
 
 def clone(repo: str, default_branch: str, into: Path) -> Workspace:
+    """A fresh clone at `into`. Whatever an earlier run left there (a
+    `--workdir` reused, a retry) is removed first: the directory is the
+    steward's own, named by repo and order, and `gh repo clone` refuses a
+    non-empty one."""
+    if into.exists():
+        shutil.rmtree(into)
     into.parent.mkdir(parents=True, exist_ok=True)
     result = gh.gh("repo", "clone", repo, str(into), "--", "--depth", "50", "--branch", default_branch, timeout=600)
     if result.returncode != 0:
@@ -72,7 +87,7 @@ def branch(ws: Workspace, name: str) -> None:
 def commit(ws: Workspace, message: str) -> bool:
     if not ws.dirty():
         return False
-    ws.git("add", "-A")
+    ws.git("add", "-A", *ws._pathspec())
     ws.git("commit", "-q", "-m", message)
     return True
 
