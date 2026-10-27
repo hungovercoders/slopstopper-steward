@@ -17,6 +17,11 @@ of two things. A GitHub App is the better one: installable per repo,
 revocable, and its PRs trigger the adopters' own `ss-*` workflows, which
 a PAT from a user account also does but a `GITHUB_TOKEN` would not.
 
+The steward checks only that `gh` holds a token before it starts; an App
+installation token has no user identity, which is fine. A token that
+cannot do the work fails the first real call and the run exits 2 with
+GitHub's message.
+
 **GitHub App (recommended).** Create one under the org (Settings →
 Developer settings → GitHub Apps) with repository permissions
 *Contents: read and write*, *Pull requests: read and write*, *Issues:

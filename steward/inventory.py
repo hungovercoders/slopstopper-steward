@@ -84,6 +84,10 @@ def classify(issue: dict) -> Finding:
     return finding
 
 
+def _is_slopstoppers(finding: Finding) -> bool:
+    return BRAND_LABEL in finding.labels or finding.kind in ("check", "workflow-failure")
+
+
 def read_profile(slopstopper_yml: str | None) -> str | None:
     if not slopstopper_yml:
         return None
@@ -91,28 +95,42 @@ def read_profile(slopstopper_yml: str | None) -> str | None:
     return match.group(1) if match else None
 
 
-def take(repo: Repo, latest: str | None, cfg: Config) -> Inventory:
-    inv = Inventory(repo, latest)
-    inv.profile = read_profile(gh.contents(repo.full_name, ".slopstopper.yml", repo.default_branch))
-    inv.skills_present = gh.contents(repo.full_name, TRIAGE_SKILL, repo.default_branch) is not None
-    issues = gh.api(f"repos/{repo.full_name}/issues?state=open&labels={BRAND_LABEL}&per_page=100", paginate=True) or []
-    for issue in issues:
+def _findings(repo: Repo, cfg: Config) -> list[Finding]:
+    """Every open issue, not only the labelled ones: `emit` falls back to an
+    unlabelled issue when a repo refuses labels, and the body marker is
+    then the only thing that says it is slopstopper's."""
+    out = []
+    for issue in gh.api(f"repos/{repo.full_name}/issues?state=open&per_page=100", paginate=True) or []:
         if "pull_request" in issue:
             continue
         finding = classify(issue)
-        if cfg.ignore_label in finding.labels:
-            continue
-        inv.findings.append(finding)
+        if cfg.ignore_label not in finding.labels and _is_slopstoppers(finding):
+            out.append(finding)
+    return out
+
+
+def _disabled_workflows(repo: Repo) -> list[dict]:
     workflows = (gh.api(f"repos/{repo.full_name}/actions/workflows?per_page=100") or {}).get("workflows", [])
-    inv.disabled_workflows = [
-        {"name": w["name"], "path": w["path"], "state": w["state"]}
-        for w in workflows if w.get("path", "").startswith(".github/workflows/ss-") and w.get("state") != "active"
-    ]
+    return [{"name": w["name"], "path": w["path"], "state": w["state"]}
+            for w in workflows if w.get("path", "").startswith(".github/workflows/ss-") and w.get("state") != "active"]
+
+
+def _open_orders(repo: Repo) -> dict[str, dict]:
+    orders: dict[str, dict] = {}
     for pr in gh.api(f"repos/{repo.full_name}/pulls?state=open&per_page=100", paginate=True) or []:
         ref = (pr.get("head") or {}).get("ref", "")
         if not ref.startswith(BRANCH_PREFIX):
             continue
         marker = ORDER_MARKER.search(pr.get("body") or "")
-        order_id = marker.group(1) if marker else ref[len(BRANCH_PREFIX):]
-        inv.open_orders[order_id] = {"number": pr["number"], "url": pr.get("html_url", "")}
+        orders[marker.group(1) if marker else ref[len(BRANCH_PREFIX):]] = {"number": pr["number"], "url": pr.get("html_url", "")}
+    return orders
+
+
+def take(repo: Repo, latest: str | None, cfg: Config) -> Inventory:
+    inv = Inventory(repo, latest)
+    inv.profile = read_profile(gh.contents(repo.full_name, ".slopstopper.yml", repo.default_branch))
+    inv.skills_present = gh.contents(repo.full_name, TRIAGE_SKILL, repo.default_branch) is not None
+    inv.findings = _findings(repo, cfg)
+    inv.disabled_workflows = _disabled_workflows(repo)
+    inv.open_orders = _open_orders(repo)
     return inv

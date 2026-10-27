@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import urllib.error
 from pathlib import Path
@@ -33,15 +34,15 @@ class CannotRun(Exception):
 def _cfg(args) -> Config:
     try:
         return load(Path(args.config))
-    except (FileNotFoundError, ValueError) as exc:
+    except (OSError, ValueError, TypeError) as exc:
         raise CannotRun(str(exc)) from exc
 
 
 def _need_gh() -> None:
     if not gh.available():
         raise CannotRun("gh is not on PATH; the steward reads and writes GitHub through it")
-    if gh.whoami() is None:
-        raise CannotRun("gh is not authenticated (set GH_TOKEN or run gh auth login)")
+    if not gh.authenticated():
+        raise CannotRun("gh has no token (set GH_TOKEN or run gh auth login)")
 
 
 def cmd_discover(args) -> int:
@@ -168,8 +169,12 @@ def main(argv: list[str] | None = None) -> int:
     except (CannotRun, gh.GhError) as exc:
         print(f"✗ {exc}", file=sys.stderr)
         return 2
-    except urllib.error.URLError as exc:
-        print(f"✗ PyPI unreachable: {exc}", file=sys.stderr)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        print(f"✗ PyPI or GitHub unreachable or answered badly: {exc}", file=sys.stderr)
+        return 2
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        # A tool that hung or could not start is "could not run", never "ran and failed".
+        print(f"✗ could not run: {exc}", file=sys.stderr)
         return 2
 
 

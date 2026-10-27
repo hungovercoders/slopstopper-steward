@@ -40,10 +40,14 @@ def test_take_reads_issues_prs_and_workflows(monkeypatch):
 
     def api(path, **kw):
         if path.startswith("repos/acme/site/issues"):
+            assert "labels=" not in path  # every open issue is read, the marker decides
             return [{"number": 1, "title": "x", "html_url": "u", "labels": [{"name": "slopstopper"}],
                      "body": "<!-- slopstopper:check=hygiene:docs-size -->"},
                     {"number": 2, "title": "pr", "html_url": "u", "labels": [], "body": "", "pull_request": {}},
-                    {"number": 3, "title": "ignored", "html_url": "u", "labels": [{"name": "steward:ignore"}], "body": ""}]
+                    {"number": 3, "title": "ignored", "html_url": "u", "labels": [{"name": "steward:ignore"}], "body": ""},
+                    {"number": 4, "title": "unlabelled but marked", "html_url": "u", "labels": [],
+                     "body": "<!-- slopstopper:check=security:sast -->"},
+                    {"number": 5, "title": "someone else's bug", "html_url": "u", "labels": [{"name": "bug"}], "body": ""}]
         if path.startswith("repos/acme/site/actions/workflows"):
             return {"workflows": [{"name": "a", "path": ".github/workflows/ss-x.yml", "state": "disabled_inactivity"},
                                   {"name": "b", "path": ".github/workflows/ss-y.yml", "state": "active"},
@@ -56,9 +60,27 @@ def test_take_reads_issues_prs_and_workflows(monkeypatch):
     from steward.config import from_dict
     inv = inventory.take(repo, "0.26.0", from_dict({"orgs": ["acme"]}))
     assert inv.profile == "api" and inv.skills_present
-    assert [f.number for f in inv.findings] == [1]
+    assert [f.number for f in inv.findings] == [1, 4]
     assert inv.disabled_workflows == [{"name": "a", "path": ".github/workflows/ss-x.yml", "state": "disabled_inactivity"}]
     assert inv.open_orders == {"upgrade-0.26.0": {"number": 10, "url": "p"}}
+
+
+def test_topic_alone_is_not_an_adopter(monkeypatch):
+    from steward.config import from_dict
+    monkeypatch.setattr(discover.gh, "api", lambda path, **kw: [
+        {"full_name": "acme/tagged", "default_branch": "main", "topics": ["slopstopper"], "archived": False}])
+    monkeypatch.setattr(discover.gh, "contents", lambda r, p, ref=None: None)
+    assert discover.discover(from_dict({"orgs": ["acme"]})) == []
+    assert not discover.Repo("x", topics=["slopstopper"], evidence=["topic"]).adopter
+
+
+def test_topic_alone_is_not_an_adopter(monkeypatch):
+    from steward.config import from_dict
+    monkeypatch.setattr(discover.gh, "api", lambda path, **kw: [
+        {"full_name": "acme/tagged", "default_branch": "main", "topics": ["slopstopper"], "archived": False}])
+    monkeypatch.setattr(discover.gh, "contents", lambda r, p, ref=None: None)
+    assert discover.discover(from_dict({"orgs": ["acme"]})) == []
+    assert not discover.Repo("x", topics=["slopstopper"], evidence=["topic"]).adopter
 
 
 def test_discover_probes_every_repo(monkeypatch):
@@ -71,5 +93,7 @@ def test_discover_probes_every_repo(monkeypatch):
     files = {("acme/a", "mise.toml"): MISE, ("acme/b", ".ss/.installed-from"): "0.20.0\n"}
     monkeypatch.setattr(discover.gh, "contents", lambda r, p, ref=None: files.get((r, p)))
     found = discover.discover(from_dict({"orgs": ["acme"]}))
+    # acme/c has neither file and is left out; a topic alone would be too (see test below)
+    # acme/c has neither file and is left out; a topic alone would be too (see test below)
     assert [(r.full_name, r.evidence) for r in found] == [("acme/a", ["topic", "mise-pin"]), ("acme/b", ["installed-from"])]
     assert found[1].installed_from == "0.20.0" and found[1].default_branch == "trunk"

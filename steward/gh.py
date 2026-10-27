@@ -73,6 +73,16 @@ def contents(repo: str, path: str, ref: str | None = None) -> str | None:
     return result.stdout
 
 
+def authenticated() -> bool:
+    """Whether gh has a token to send. A GitHub App installation token
+    cannot call GET /user, so this asks gh for the token it would use rather
+    than for an identity; a token that turns out to be wrong fails the
+    first real call with a GhError, which exits 2 the same way."""
+    result = gh("auth", "token")
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
 def whoami() -> str | None:
+    """The login behind the token, or None (an App token has none)."""
     result = gh("api", "user", "--jq", ".login")
     return result.stdout.strip() if result.returncode == 0 else None

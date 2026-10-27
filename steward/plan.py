@@ -74,6 +74,7 @@ def _upgrade_order(inv: Inventory, target: str | None) -> Order | None:
                      f"chore(slopstopper): move the CLI pin to {target}", reason, 0,
                      repo.default_branch, target, repo.pinned)
     if repo.pinned and repo.installed_from and parse(repo.installed_from) and parse(repo.pinned) \
+            and not behind(repo.pinned, MIN_INSTALL_VERSION) \
             and parse(repo.installed_from) < parse(repo.pinned):  # type: ignore[operator]
         return Order(f"refresh-{repo.pinned}", "refresh", repo.full_name,
                      f"chore(slopstopper): refresh the suite from slopstopper-cli {repo.pinned}",
@@ -85,6 +86,8 @@ def _upgrade_order(inv: Inventory, target: str | None) -> Order | None:
 def _triage_orders(inv: Inventory) -> list[Order]:
     orders = []
     for finding in sorted(inv.findings, key=lambda f: (not f.security, f.number)):
+        if finding.kind == "other":
+            continue  # plan_repo records it: a labelled issue with no check behind it (an adopter report, a note)
         what = finding.check or finding.workflow or "finding"
         orders.append(Order(
             f"triage-{finding.number}", "triage", inv.repo.full_name,
@@ -96,12 +99,28 @@ def _triage_orders(inv: Inventory) -> list[Order]:
     return orders
 
 
+def _stale_suite_below_floor(inv: Inventory) -> bool:
+    repo = inv.repo
+    if not (repo.pinned and repo.installed_from and parse(repo.installed_from) and parse(repo.pinned)):
+        return False
+    return behind(repo.pinned, MIN_INSTALL_VERSION) and parse(repo.installed_from) < parse(repo.pinned)  # type: ignore[operator]
+
+
 def plan_repo(inv: Inventory, target: str | None, cfg: Config) -> Plan:
     plan = Plan()
     candidates: list[Order] = []
     if target and behind(target, MIN_INSTALL_VERSION):
         plan.skipped.append({"repo": inv.repo.full_name, "order": f"upgrade-{target}",
                              "why": f"{target} predates `slopstopper install` ({MIN_INSTALL_VERSION}+); nothing to move to yet"})
+    elif _stale_suite_below_floor(inv):
+        plan.skipped.append({"repo": inv.repo.full_name, "order": f"refresh-{inv.repo.pinned}",
+                             "why": f"suite written by {inv.repo.installed_from}, but {inv.repo.pinned} has no "
+                                    f"`slopstopper install` to rewrite it ({MIN_INSTALL_VERSION}+)"})
+    for finding in inv.findings:
+        if finding.kind == "other":
+            plan.skipped.append({"repo": inv.repo.full_name, "order": f"triage-{finding.number}",
+                                 "why": f"#{finding.number} carries the label but names no check or workflow; nothing to reproduce",
+                                 "url": finding.url})
     upgrade = _upgrade_order(inv, target)
     if upgrade:
         candidates.append(upgrade)

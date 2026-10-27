@@ -36,7 +36,10 @@ class Repo:
 
     @property
     def adopter(self) -> bool:
-        return bool(self.evidence)
+        """Installed means the files are there. The topic alone is a hint
+        (it needs admin rights to set and survives an uninstall), never a
+        reason to write a suite into a repo."""
+        return "mise-pin" in self.evidence or "installed-from" in self.evidence
 
     def to_dict(self) -> dict:
         return {

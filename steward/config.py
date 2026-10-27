@@ -65,6 +65,17 @@ def _section(data: dict, key: str) -> dict:
     return value
 
 
+def _num(section: dict, key: str, default, kind):
+    """A number with its default when the key is absent or left blank."""
+    value = section.get(key)
+    if value is None or value == "":
+        return default
+    try:
+        return kind(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"steward.yml: `{key}` must be a number, not {value!r}") from exc
+
+
 def _listof(value: object, key: str) -> list[str]:
     if value is None:
         return []
@@ -87,19 +98,19 @@ def from_dict(data: dict) -> Config:
         orgs=orgs,
         include=_listof(repos.get("include"), "repos.include"),
         exclude=_listof(repos.get("exclude"), "repos.exclude"),
-        mode=str(data.get("mode", "pr")),
-        policy=str(upgrade.get("policy", "latest")),
-        min_age_days=int(upgrade.get("min_age_days", 2)),
-        repos_per_run=int(budgets.get("repos_per_run", 5)),
-        prs_per_repo=int(budgets.get("prs_per_repo", 2)),
-        agent_usd=float(budgets.get("agent_usd", 5.0)),
-        agent_turns=int(budgets.get("agent_turns", 60)),
-        agent_enabled=bool(agent.get("enabled", True)),
+        mode=str(data.get("mode") or "pr"),
+        policy=str(upgrade.get("policy") or "latest"),
+        min_age_days=_num(upgrade, "min_age_days", 2, int),
+        repos_per_run=_num(budgets, "repos_per_run", 5, int),
+        prs_per_repo=_num(budgets, "prs_per_repo", 2, int),
+        agent_usd=_num(budgets, "agent_usd", 5.0, float),
+        agent_turns=_num(budgets, "agent_turns", 60, int),
+        agent_enabled=agent.get("enabled") is not False,
         agent_model=str(agent.get("model") or ""),
         pr_labels=_listof(labels.get("pr"), "labels.pr") or ["slopstopper", "steward"],
-        ignore_label=str(labels.get("ignore", "steward:ignore")),
-        slopstopper_repo=str(ss.get("repo", "hungovercoders/slopstopper")),
-        package=str(ss.get("package", "slopstopper-cli")),
+        ignore_label=str(labels.get("ignore") or "steward:ignore"),
+        slopstopper_repo=str(ss.get("repo") or "hungovercoders/slopstopper"),
+        package=str(ss.get("package") or "slopstopper-cli"),
     )
     if cfg.mode not in MODES:
         raise ValueError(f"steward.yml: mode must be one of {MODES}, not {cfg.mode!r}")

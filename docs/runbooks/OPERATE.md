@@ -52,7 +52,8 @@ steward run --repo owner/name --dry-run
 ```
 
 An order whose PR is still open is skipped, so closing the PR is how you
-ask for a fresh attempt.
+ask for a fresh attempt: the next run fetches the old `steward/<order>`
+branch and replaces it (a lease against its tip, so nothing stacks).
 
 ## Budgets
 

@@ -22,7 +22,7 @@ def test_plan_json_shape(monkeypatch, tmp_path, capsys):
     from steward.discover import Repo
     from steward.inventory import Inventory
     monkeypatch.setattr(cli.gh, "available", lambda: True)
-    monkeypatch.setattr(cli.gh, "whoami", lambda: "bot")
+    monkeypatch.setattr(cli.gh, "authenticated", lambda: True)
     inv = Inventory(Repo("acme/a", pinned="0.24.0", evidence=["mise-pin"]), "0.27.0")
     monkeypatch.setattr(runner, "gather", lambda c, only=None: ([inv], {"acme/a": "0.27.0"}, "0.26.0"))
     rc = cli.main(["--config", str(cfg), "plan", "--json"])
@@ -37,7 +37,7 @@ def test_run_dry_run_writes_report(monkeypatch, tmp_path, capsys):
     from steward.discover import Repo
     from steward.inventory import Inventory
     monkeypatch.setattr(cli.gh, "available", lambda: True)
-    monkeypatch.setattr(cli.gh, "whoami", lambda: "bot")
+    monkeypatch.setattr(cli.gh, "authenticated", lambda: True)
     inv = Inventory(Repo("acme/a", pinned="0.24.0", evidence=["mise-pin"]), "0.27.0")
     monkeypatch.setattr(runner, "gather", lambda c, only=None: ([inv], {"acme/a": "0.27.0"}, "0.26.0"))
     rc = cli.main(["--config", str(cfg), "run", "--dry-run", "--report-dir", str(tmp_path / "r"), "--json"])
@@ -48,6 +48,48 @@ def test_run_dry_run_writes_report(monkeypatch, tmp_path, capsys):
 
 def test_missing_config_exits_2(tmp_path, capsys):
     assert cli.main(["--config", str(tmp_path / "none.yml"), "plan"]) == 2
+
+
+def test_blank_numeric_key_is_a_default_not_a_traceback(tmp_path, monkeypatch, capsys):
+    cfg = tmp_path / "steward.yml"
+    cfg.write_text("orgs: [acme]\nupgrade:\n  min_age_days:\nrepos:\n  include:\n    # - acme/a\n")
+    from steward import config
+    loaded = config.load(cfg)
+    assert loaded.min_age_days == 2 and loaded.include == []
+
+
+def test_could_not_run_errors_exit_2(tmp_path, monkeypatch):
+    import subprocess
+    cfg = tmp_path / "steward.yml"
+    cfg.write_text("orgs: [acme]\n")
+    monkeypatch.setattr(cli.gh, "available", lambda: True)
+    monkeypatch.setattr(cli.gh, "authenticated", lambda: True)
+    from steward import runner
+
+    def hang(c, only=None):
+        raise subprocess.TimeoutExpired(["gh"], 120)
+    monkeypatch.setattr(runner, "gather", hang)
+    assert cli.main(["--config", str(cfg), "plan"]) == 2
+
+    def bad_json(c, only=None):
+        raise TimeoutError("read timed out")
+    monkeypatch.setattr(runner, "gather", bad_json)
+    assert cli.main(["--config", str(cfg), "plan"]) == 2
+
+
+def test_app_token_without_identity_is_accepted(monkeypatch, tmp_path):
+    """An installation token cannot call GET /user; the gate asks gh for a token instead."""
+    import subprocess as sp
+    from steward import gh
+
+    def fake_run(args, **kw):
+        if args[:3] == ["gh", "auth", "token"]:
+            return sp.CompletedProcess(args, 0, "ghs_installation\n", "")
+        if args[:3] == ["gh", "api", "user"]:
+            return sp.CompletedProcess(args, 1, "", "HTTP 403: Resource not accessible by integration")
+        raise AssertionError(args)
+    monkeypatch.setattr(gh, "RUN", fake_run)
+    assert gh.authenticated() and gh.whoami() is None
 
 
 def test_module_entrypoint():

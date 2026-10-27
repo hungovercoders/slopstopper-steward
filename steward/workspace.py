@@ -2,7 +2,8 @@
 
 The agent never gets to push; this module is the only writer. Branches
 are `steward/<order id>` and force-pushed with lease, because the steward
-owns them and a re-run after a failed push must not stack stale commits."""
+owns them: a re-run (after a closed PR, or a failed push) must replace the
+old branch, not stack on it or be refused by it."""
 
 from __future__ import annotations
 
@@ -38,10 +39,23 @@ def clone(repo: str, default_branch: str, into: Path) -> Workspace:
     result = gh.gh("repo", "clone", repo, str(into), "--", "--depth", "50", "--branch", default_branch, timeout=600)
     if result.returncode != 0:
         raise gh.GhError(f"clone {repo}: {result.stderr.strip()}")
-    ws = Workspace(repo, into, default_branch)
+    return prepare(Workspace(repo, into, default_branch))
+
+
+def prepare(ws: Workspace) -> Workspace:
+    """Make a fresh clone one the steward can push from.
+
+    `gh repo clone` lends its credential helper to the clone command only,
+    so the clone itself has none: the helper is set here, and reads the
+    same GH_TOKEN gh does. A `--depth` clone is single-branch, so the fetch
+    refspec is widened to every branch; `branch()` then fetches the order's
+    remote branch and the lease in `push()` compares against its real tip.
+    """
     ws.git("config", "user.name", AUTHOR[0])
     ws.git("config", "user.email", AUTHOR[1])
-    exclude = into / ".git" / "info" / "exclude"
+    ws.git("config", "credential.helper", "!gh auth git-credential")
+    ws.git("config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+    exclude = ws.path / ".git" / "info" / "exclude"
     exclude.parent.mkdir(parents=True, exist_ok=True)
     with exclude.open("a", encoding="utf-8") as fh:
         fh.write("\n" + "\n".join(LOCAL_ONLY) + "\n")
@@ -49,6 +63,9 @@ def clone(repo: str, default_branch: str, into: Path) -> Workspace:
 
 
 def branch(ws: Workspace, name: str) -> None:
+    """Start the order's branch from the default branch's tip, having fetched
+    the remote branch of the same name (if any) so the push lease knows it."""
+    ws.git("fetch", "origin", name, check=False)
     ws.git("checkout", "-B", name, f"origin/{ws.default_branch}")
 
 

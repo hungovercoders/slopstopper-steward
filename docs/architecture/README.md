@@ -55,13 +55,19 @@ flowchart TB
 ## One run, step by step
 
 1. **discover** lists every non-archived repo in each org and probes two
-   files per repo (`mise.toml`, `.ss/.installed-from`); the `slopstopper`
-   topic is recorded as evidence but never trusted alone, because topics
-   need admin rights and an install run by a contributor leaves none.
-2. **inventory** reads the pin, `.slopstopper.yml`'s `profile`, the open
-   issues labelled `slopstopper` (classified by the `slopstopper:check=`
-   marker or the failure tracker's title), the `ss-*` workflows GitHub has
-   disabled, and the open `steward/*` PRs with their order ids.
+   files per repo (`mise.toml`, `.ss/.installed-from`); a repo is an
+   adopter only when one of those is present. The `slopstopper` topic is
+   recorded as evidence but never sufficient: it needs admin rights to
+   set, so most installs never get it, and it survives an uninstall, so a
+   topic-only repo must not receive a suite.
+2. **inventory** reads the pin, `.slopstopper.yml`'s `profile`, every
+   open issue (kept when it carries the `slopstopper` label, a
+   `slopstopper:check=` marker, or the failure tracker's title, since
+   `emit` opens an unlabelled issue when a repo refuses labels), the
+   `ss-*` workflows GitHub has disabled, and the open `steward/*` PRs with
+   their order ids. A labelled issue that names no check or workflow (an
+   adopter report on the slopstopper repo itself, a hand-written note) is
+   reported, never worked: there is nothing to reproduce.
 3. **plan** turns each inventory into orders and applies the budgets:
 
    | Kind | When | Who does the work | Priority |
@@ -71,7 +77,8 @@ flowchart TB
    | `triage` | an open finding, security first | the agent with the repo's triage skill | 2 / 3 |
 
    A disabled workflow is reported, not worked: enabling one changes
-   repo settings and needs an admin.
+   repo settings and needs an admin. So is any upgrade or refresh whose
+   target has no `slopstopper install` (below `MIN_INSTALL_VERSION`).
 4. **execute** clones each order's repo, branches `steward/<order id>`
    and runs the executor. Nothing is pushed until the work is committed;
    the agent cannot push at all.
@@ -80,9 +87,19 @@ flowchart TB
 
 ## Where the agent is boxed
 
-- It runs inside the clone with `--permission-mode acceptEdits` and an
-  allow-list of tools: file edits, `slopstopper`, `task`, read-only git,
-  the usual shell readers. No `git commit`, no `gh`, no network tools.
+- It runs inside the clone with `--permission-mode acceptEdits`, an
+  allow-list of tools (file edits, `slopstopper`, `task ss:*`, read-only
+  git, the usual shell readers) and an explicit deny-list (`gh`, `git
+  push`, `git commit`, `curl`, `npx`, `npm`, `pip`, web tools).
+- Its environment is rebuilt from an allow-list: no `GH_TOKEN`, no
+  `GITHUB_TOKEN`, no `STEWARD_*`, nothing else the runner holds. The one
+  secret it gets is the model key, because it is the model. The clone's
+  credential helper reads `GH_TOKEN`, so with none in the environment a
+  `git push` from anything the agent spawns has nothing to authenticate
+  with.
+- The issue body it reads is quoted as data inside the brief, but a brief
+  is still text a model reads: the box above, not the wording, is what
+  stops an instruction planted in an issue from reaching GitHub.
 - `--max-budget-usd` and `--max-turns` come from `budgets.*`.
 - Its brief (`steward/prompts.py`) names the work and the skill. The
   method is the skill's; the brief only adds the rules a steward needs

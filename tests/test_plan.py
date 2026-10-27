@@ -35,8 +35,18 @@ def test_open_pr_dedupes_and_counts_against_budget():
 
 
 def test_refresh_when_suite_older_than_pin():
+    p = plan_repo(_inv(pinned="0.27.0", installed_from="0.22.0"), None, CFG)
+    assert [o.kind for o in p.orders] == ["refresh"] and p.orders[0].target == "0.27.0"
+
+
+def test_refresh_below_install_floor_is_reported_not_worked():
     p = plan_repo(_inv(pinned="0.26.0", installed_from="0.22.0"), None, CFG)
-    assert [o.kind for o in p.orders] == ["refresh"] and p.orders[0].target == "0.26.0"
+    assert p.orders == [] and p.skipped[0]["order"] == "refresh-0.26.0" and "slopstopper install" in p.skipped[0]["why"]
+
+
+def test_other_findings_are_reported_not_worked():
+    p = plan_repo(_inv(pinned="0.27.0", installed_from="0.27.0", findings=[_finding(9, None, kind="other")]), None, CFG)
+    assert p.orders == [] and p.skipped[0]["order"] == "triage-9" and "nothing to reproduce" in p.skipped[0]["why"]
 
 
 def test_current_repo_with_no_findings_is_quiet():
