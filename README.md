@@ -25,7 +25,6 @@ This repo has slopstopper installed on itself (`--profile library`), so the same
 <!-- badges:begin -->
 
 ### 🔒 Security
-[![Licences](https://github.com/hungovercoders/slopstopper-steward/actions/workflows/ss-security-licences-check.yml/badge.svg?branch=main)](https://github.com/hungovercoders/slopstopper-steward/actions/workflows/ss-security-licences-check.yml)
 [![SAST](https://github.com/hungovercoders/slopstopper-steward/actions/workflows/ss-security-sast-check.yml/badge.svg?branch=main)](https://github.com/hungovercoders/slopstopper-steward/actions/workflows/ss-security-sast-check.yml)
 [![Secrets](https://github.com/hungovercoders/slopstopper-steward/actions/workflows/ss-security-secrets-check.yml/badge.svg?branch=main)](https://github.com/hungovercoders/slopstopper-steward/actions/workflows/ss-security-secrets-check.yml)
 [![Dependency CVEs](https://github.com/hungovercoders/slopstopper-steward/actions/workflows/ss-security-vulnerability-all-check.yml/badge.svg?branch=main)](https://github.com/hungovercoders/slopstopper-steward/actions/workflows/ss-security-vulnerability-all-check.yml)
