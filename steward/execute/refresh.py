@@ -20,42 +20,27 @@ from pathlib import Path
 from typing import Sequence
 
 from steward.checks import NEEDS_ENVIRONMENT
-from steward.discover import PIN_KEY, PIN_LINE
+from steward import sandbox
+from steward.pin import PIN_KEY, PIN_LINE, PinError, set_pin  # noqa: F401  (re-exported)
 from steward.versions import MIN_INSTALL_VERSION
 from steward.workspace import Workspace
-
-
-def set_pin(mise_toml: Path, version: str) -> str:
-    """Rewrite (or seed) the pin. Returns 'moved', 'seeded' or 'unchanged'."""
-    if mise_toml.is_file():
-        text = mise_toml.read_text(encoding="utf-8")
-        if PIN_LINE.search(text):
-            new = PIN_LINE.sub(lambda m: f'{m.group(1)}"{version}"', text, count=1)
-            if new == text:
-                return "unchanged"
-            mise_toml.write_text(new, encoding="utf-8")
-            return "moved"
-        line = f'"{PIN_KEY}" = "{version}"\n'
-        if re.search(r"^\[tools\]\s*$", text, re.M):
-            text = re.sub(r"^\[tools\]\s*\n", f"[tools]\n{line}", text, count=1, flags=re.M)
-        else:
-            text = text.rstrip("\n") + f"\n\n[tools]\n{line}"
-        mise_toml.write_text(text, encoding="utf-8")
-        return "seeded"
-    mise_toml.write_text(f'[tools]\n"{PIN_KEY}" = "{version}"\n', encoding="utf-8")
-    return "seeded"
 
 
 def cli_for(version: str, venv: Path, package: str = "slopstopper-cli", source: Path | None = None) -> Path:
     """The `slopstopper` binary of exactly `version`, in its own venv. `source`
     (a slopstopper `cli/` checkout) installs that instead, for the end-to-end
     test against an unreleased installer."""
+    binary, marker = venv / "bin" / "slopstopper", venv / ".steward-installed"
+    want = f"source:{source}" if source else f"{package}=={version}"
+    if binary.exists() and marker.is_file() and marker.read_text(encoding="utf-8") == want:
+        return binary  # one venv per version per run, shared by every order on it
     if not (venv / "bin" / "python").exists():
+        venv.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True, capture_output=True)
-    pip = venv / "bin" / "pip"
-    spec = ["-e", str(source)] if source else [f"{package}=={version}"]
-    subprocess.run([str(pip), "install", "-q", *spec], check=True, capture_output=True, text=True)
-    return venv / "bin" / "slopstopper"
+    spec = ["-e", str(source)] if source else [want]
+    subprocess.run([str(venv / "bin" / "pip"), "install", "-q", *spec], check=True, capture_output=True, text=True)
+    marker.write_text(want, encoding="utf-8")
+    return binary
 
 
 class InstallerMissing(RuntimeError):
@@ -63,8 +48,9 @@ class InstallerMissing(RuntimeError):
 
 
 def install_suite(ws: Workspace, cli: Path) -> subprocess.CompletedProcess:
-    done = subprocess.run([str(cli), "install", "--no-topic", str(ws.path)], cwd=ws.path, capture_output=True,
-                          text=True, check=False, timeout=600)
+    with sandbox.scratch_home() as home:
+        done = subprocess.run([str(cli), "install", "--no-topic", str(ws.path)], cwd=ws.path, capture_output=True,
+                              text=True, check=False, timeout=600, env=sandbox.environment(cli.parent, home))
     if done.returncode == 2 and "invalid choice: 'install'" in done.stderr:
         raise InstallerMissing(f"{cli} has no `install` subcommand; slopstopper-cli {MIN_INSTALL_VERSION}+ is needed")
     return done
@@ -79,7 +65,9 @@ def _json(cli: Path, cwd: Path, *args: str, ok_codes: tuple[int, ...] = (0,)):
     (the CLI prints indented JSON and nothing else there); None when it
     cannot answer."""
     try:
-        done = subprocess.run([str(cli), *args, "--json"], cwd=cwd, capture_output=True, text=True, timeout=120)
+        with sandbox.scratch_home() as home:
+            done = subprocess.run([str(cli), *args, "--json"], cwd=cwd, capture_output=True, text=True, timeout=120,
+                                  env=sandbox.environment(cli.parent, home))
     except (subprocess.TimeoutExpired, OSError):
         return None
     if done.returncode not in ok_codes or not done.stdout.strip():
@@ -137,22 +125,43 @@ def static_checks(ws: Workspace, cli: Path) -> Checks:
     return out
 
 
+CHECK_TIMEOUT = 900
+
+
 def verify(ws: Workspace, cli: Path, checks: Sequence[str]) -> list[dict]:
     """Run the given checks and return the red rows as `run --json` printed
     them. Exit 2 (could not run) counts as red too: the checks handed in are
-    ones this clone can run, so a could-not-run here is a real problem."""
+    ones this clone can run, so a could-not-run here is a real problem. A
+    check that hangs is red with the reason, never an exception that would
+    throw away the work already done. Runs in the sandbox environment: the
+    tree may hold what the agent wrote."""
     red = []
-    for check in checks:
-        run = subprocess.run([str(cli), "run", "--json", check], cwd=ws.path, capture_output=True, text=True, timeout=900)
-        try:
-            verdict = json.loads(run.stdout) if run.stdout.strip() else {}
-        except json.JSONDecodeError:
-            verdict = {}
-        verdict.setdefault("check", check)
-        verdict.setdefault("exit_code", run.returncode)
-        verdict.setdefault("status", {0: "pass", 1: "fail"}.get(run.returncode, "cannot-run"))
-        verdict.setdefault("failures", [])
-        if verdict["exit_code"] != 0:
-            verdict["stderr_tail"] = "\n".join(run.stderr.strip().splitlines()[-10:])
-            red.append(verdict)
+    with sandbox.scratch_home() as home:
+        env = sandbox.environment(cli.parent, home)
+        for check in checks:
+            verdict = _run_one(ws, cli, check, env)
+            if verdict["exit_code"] != 0:
+                red.append(verdict)
     return red
+
+
+def _run_one(ws: Workspace, cli: Path, check: str, env: dict) -> dict:
+    try:
+        run = subprocess.run([str(cli), "run", "--json", check], cwd=ws.path, capture_output=True, text=True,
+                             timeout=CHECK_TIMEOUT, env=env)
+    except subprocess.TimeoutExpired:
+        return {"check": check, "exit_code": 2, "status": "timed-out", "reports": [],
+                "failures": [f"`slopstopper run {check}` did not finish within {CHECK_TIMEOUT} s"]}
+    try:
+        verdict = json.loads(run.stdout) if run.stdout.strip() else {}
+    except json.JSONDecodeError:
+        verdict = {}
+    if not isinstance(verdict, dict):
+        verdict = {}
+    verdict.setdefault("check", check)
+    verdict.setdefault("exit_code", run.returncode)
+    verdict.setdefault("status", {0: "pass", 1: "fail"}.get(run.returncode, "cannot-run"))
+    verdict.setdefault("failures", [])
+    if verdict["exit_code"] != 0:
+        verdict["stderr_tail"] = "\n".join(run.stderr.strip().splitlines()[-10:])
+    return verdict

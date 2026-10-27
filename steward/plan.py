@@ -85,7 +85,7 @@ def _triage_orders(inv: Inventory) -> list[Order]:
         what = finding.check or finding.workflow or "finding"
         orders.append(Order(
             f"triage-{finding.number}", "triage", inv.repo.full_name,
-            f"fix(slopstopper): {what} (closes #{finding.number})",
+            f"fix(slopstopper): {what} (#{finding.number})",
             f"open issue #{finding.number}: {finding.title}", 2 if finding.security else 3,
             inv.repo.default_branch, inv.repo.pinned, inv.repo.pinned, finding, agentic=True,
         ))

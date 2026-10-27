@@ -9,7 +9,7 @@ GUARDRAILS = """\
 ## Rules
 
 - Read `.claude/skills/slopstopper-triage/SKILL.md` first and follow it; read a reference only when a step needs it.
-- Reproduce with `slopstopper run --json <category>:<check>` (or the `task ss:*` shim) and read `.ss/reports/` before deciding the fix shape.
+- Reproduce with `slopstopper run --json <category>:<check>` and read `.ss/reports/` before deciding the fix shape. The `task ss:*` shims are not available here (they call the same command), and only the hygiene and static security checks run in this clone.
 - A real finding: fix the code. A false positive: the narrowest suppression the skill documents, with a `# why` comment. A threshold: the matching `.slopstopper.yml` knob, with a comment saying why.
 - A slopstopper bug: do not patch around it silently. Describe it in the result file under `upstream` with the reproduction the skill's `references/upstream.md` asks for, and apply the workaround with its `slopstopper-workaround: {slopstopper_repo}#<N>` marker only if an issue number already exists.
 - Never edit `.github/workflows/ss-*.yml`, `.github/actions/ss-*/` or `Taskfile.ss.yml`: the installer rewrites them. Never move the pin in `mise.toml`. Never disable a check to go green.

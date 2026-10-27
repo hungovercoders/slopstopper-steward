@@ -100,20 +100,49 @@ flowchart TB
    summary.
 ## Where the agent is boxed
 
-- It runs inside the clone with `--permission-mode acceptEdits`, an
-  allow-list of tools (file edits, `slopstopper`, `task ss:*`, read-only
-  git, the usual shell readers) and an explicit deny-list (`gh`, `git
-  push`, `git commit`, `curl`, `npx`, `npm`, `pip`, web tools).
-- Its environment is rebuilt from an allow-list: no `GH_TOKEN`, no
-  `GITHUB_TOKEN`, no `STEWARD_*`, nothing else the runner holds. The one
-  secret it gets is the model key, because it is the model. The clone's
-  credential helper reads `GH_TOKEN`, so with none in the environment a
-  `git push` from anything the agent spawns has nothing to authenticate
-  with.
-- The issue body it reads is quoted as data inside the brief, but a brief
-  is still text a model reads: the box above, not the wording, is what
-  stops an instruction planted in an issue from reaching GitHub.
-- `--max-budget-usd` and `--max-turns` come from `budgets.*`.
+The agent edits files, and the steward later runs git, `gh` and the
+pinned CLI on those same files with the push token in its own
+environment. So the box has three layers, and each assumes the one before
+it can fail.
+
+1. **What the agent can do.** It runs inside the clone with
+   `--permission-mode acceptEdits`, file edits, and a short allow-list of
+   commands that execute nothing from the tree: `slopstopper run` for the
+   hygiene and static security checks only (the browser and API checks
+   build or serve the repo), the listing commands, `git status`, and the
+   shell readers. An explicit deny-list names the ways to run an arbitrary
+   command (`find`, `task`, `git grep`, interpreters, shells, `gh`, `curl`,
+   `npm`, `pip`), edits under `.git/`, and edits to the run's venvs.
+2. **What the agent can see.** Its environment is rebuilt from an
+   allow-list (`steward/sandbox.py`): no `GH_TOKEN`, no `GITHUB_TOKEN`, no
+   `STEWARD_*`, and a throwaway `HOME`, so there is no stored `gh` login
+   and no `~/.gitconfig` to use or plant. `PYTHONSAFEPATH` stops a
+   `lizard` module planted in the clone from being imported by `python -m lizard`. The
+   one secret it gets is the model key, because it is the model.
+3. **What the steward does after it.** `.git/config` is restored from a
+   snapshot taken before the agent ran, its hooks are cleared, and every
+   steward git command runs with fsmonitor and hooks off and no global or
+   system config. That matters beyond the agent: `slopstopper install`
+   points `core.hooksPath` at the repo's own `.githooks`, which would
+   otherwise run on the steward's push. Verification runs the pinned CLI
+   from a venv outside the clone, in the same stripped environment as the
+   agent, so even a tampered tree cannot reach the token through it.
+
+What is left: something the agent wrote can still make the steward's own
+verification read green (for instance by overwriting the venv's files
+through a path the deny rules do not cover). That costs a ready PR
+instead of a draft, never the token, and the PR's own `ss-*` workflows
+run every check again on GitHub. Treat the steward's verification as
+advisory and the PR's CI as the gate.
+
+The rest of the brief:
+
+- The issue body is quoted as data inside the brief, but a brief is still
+  text a model reads: the box, not the wording, stops an instruction
+  planted in an issue from reaching GitHub.
+- `--max-budget-usd` and `--max-turns` come from `budgets.*`. The timeout
+  comes from the run: never more than an hour, and never past the push
+  token's deadline less ten minutes for verification and the PR.
 - Its brief (`steward/prompts.py`) names the work and the skill. The
   method is the skill's; the brief only adds the rules a steward needs
   that a human reader would already know: never edit `ss-*.yml`, never
@@ -124,6 +153,10 @@ flowchart TB
   A missing or `skipped` result with a clean tree opens nothing; a
   `partial` or still-red result opens a **draft** PR with the failures in
   the body.
+- A triage PR says `Closes #N` only when the steward re-ran that
+  finding's check green in its own clone. Otherwise it says `Refs #N`
+  with a "Not verified by the steward" section, so merging never closes
+  an issue on the agent's word alone.
 
 ## What never happens
 

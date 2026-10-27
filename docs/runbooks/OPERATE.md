@@ -2,13 +2,15 @@
 
 ## Reading a run
 
-Every run leaves `.steward/reports/run.md` (also the Actions job summary
-and the `steward-run` artifact). Three tables:
+Every run leaves `.steward/reports/run.md` and `.steward/reports/run.json`. On Actions the
+sweep's dry run is the `steward-plan` artifact and job summary, and each
+repo the plan named gets its own job and a `steward-run-<owner>__<repo>`
+artifact. Three tables:
 
 | Section | Holds |
 | ------- | ----- |
 | Adopters | each repo, its pin, PyPI's latest, the CLI that wrote its suite, open findings, the evidence it was found by |
-| Orders | each order worked and its status: `pr`, `draft`, `skipped` (with why), `failed` (with the error), or `planned` in a dry run |
+| Orders | each order worked and its status: `pr`, `draft`, `skipped` (with why), `failed` (with the error), `deferred` (the push token would expire before it finished; the next run picks it up), or `planned` in a dry run |
 | Deferred / Skipped | what the budgets left for next time, orders with an open PR, disabled workflows that need an admin |
 
 Agent cost and turns are on the order's row when one ran.
@@ -25,9 +27,14 @@ Agent cost and turns are on the order's row when one ran.
   Finish it by hand with the `slopstopper-triage` skill, or close it and
   put `steward:ignore` on nothing: the next run will open it again until
   the pin moves, which is the point.
-- **PR `fix(slopstopper): <check> (closes #N)`.** The agent worked an
-  open finding. The body names the category it chose (real finding,
-  false positive, threshold) and what it verified. A `# why` comment
+- **PR `fix(slopstopper): <check> (#N)`.** The agent worked an open
+  finding. The body names the category it chose (real finding, false
+  positive, threshold) and what it verified. It says `Closes #N` only when
+  the steward re-ran that check green in its clone. A `Refs #N` with a
+  "Not verified by the steward" section means it could not (a URL-driven
+  check, a workflow failure with no single check, a scanner missing on the
+  runner): the PR's own checks are the verdict, and the issue stays open
+  until the check passes on the default branch. A `# why` comment
   sits on every suppression or threshold change; if it does not convince
   you, ask for the real fix on the PR.
 - **Draft with "Looks like a slopstopper bug".** The agent judged the

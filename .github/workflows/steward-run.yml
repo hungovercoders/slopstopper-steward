@@ -4,11 +4,16 @@ name: Steward · Run
 # pins that fell behind, work the issues slopstopper raised, one PR each.
 # Docs: docs/runbooks/SETUP.md (tokens and secrets), docs/runbooks/OPERATE.md.
 #
-# Writes to other repos go through a GitHub App token (STEWARD_APP_ID var +
-# STEWARD_APP_PRIVATE_KEY secret) when one is configured, else the
-# STEWARD_TOKEN secret (a fine-grained PAT). GITHUB_TOKEN never leaves this
-# repo, so it is not an option. The agentic orders need ANTHROPIC_API_KEY;
-# without it the upgrades still run and the findings are only reported.
+# Two jobs. `plan` is a dry run over every adopter: its report is the
+# sweep's overview, and it names the repos with work. `steward` then runs
+# once per such repo, each with its own GitHub App token scoped to that one
+# repo. An installation token lives an hour, so each repo job also sets
+# STEWARD_DEADLINE: the steward starts no order it could not finish before
+# the token expires, and caps each agent run to fit. Without an App, the
+# STEWARD_TOKEN secret (a fine-grained PAT) is used and no deadline is set.
+# GITHUB_TOKEN never leaves this repo, so it is not an option. The agentic
+# orders need ANTHROPIC_API_KEY; without it upgrades still run and findings
+# are only reported.
 
 on:
   schedule:
@@ -32,9 +37,69 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  steward:
+  plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 30
+    outputs:
+      repos: ${{ steps.repos.outputs.repos }}
+    steps:
+      - name: Checkout the steward
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install the steward
+        run: pip install -q . && steward --version
+
+      - name: Mint a read token from the GitHub App
+        id: app
+        if: vars.STEWARD_APP_ID != ''
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        with:
+          app-id: ${{ vars.STEWARD_APP_ID }}
+          private-key: ${{ secrets.STEWARD_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Plan (a dry run over every adopter)
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.STEWARD_TOKEN }}
+          REPO: ${{ inputs.repo }}
+        run: |
+          set -- run --dry-run
+          [ -n "$REPO" ] && set -- "$@" --repo "$REPO"
+          steward "$@"
+
+      - name: Repos with work
+        id: repos
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          report = json.load(open(".steward/reports/run.json"))
+          repos = sorted({o["order"]["repo"] for o in report["outcomes"] if o["status"] == "planned"})
+          print("repos=" + json.dumps(repos))
+          PY
+
+      - name: Upload the plan
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: steward-plan
+          path: .steward/reports/
+          retention-days: 30
+
+  steward:
+    needs: plan
+    if: ${{ !inputs.dry_run && needs.plan.outputs.repos != '[]' && needs.plan.outputs.repos != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        repo: ${{ fromJSON(needs.plan.outputs.repos) }}
     steps:
       - name: Checkout the steward
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -54,31 +119,41 @@ jobs:
           steward --version
           claude --version
 
-      - name: Mint the steward's token from the GitHub App
+      - name: Split the target
+        id: target
+        env:
+          REPO: ${{ matrix.repo }}
+        run: |
+          echo "owner=${REPO%%/*}" >> "$GITHUB_OUTPUT"
+          echo "name=${REPO#*/}" >> "$GITHUB_OUTPUT"
+          echo "safe=${REPO//\//__}" >> "$GITHUB_OUTPUT"
+
+      - name: Mint a token for this one repo
         id: app
         if: vars.STEWARD_APP_ID != ''
         uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
         with:
           app-id: ${{ vars.STEWARD_APP_ID }}
           private-key: ${{ secrets.STEWARD_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
+          owner: ${{ steps.target.outputs.owner }}
+          repositories: ${{ steps.target.outputs.name }}
+
+      - name: Set the deadline the token sets
+        if: steps.app.outputs.token != ''
+        # Installation tokens expire after 60 minutes; 55 leaves a margin.
+        run: echo "STEWARD_DEADLINE=$(( $(date +%s) + 3300 ))" >> "$GITHUB_ENV"
 
       - name: Steward run
         env:
           GH_TOKEN: ${{ steps.app.outputs.token || secrets.STEWARD_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          REPO: ${{ inputs.repo }}
-          DRY_RUN: ${{ inputs.dry_run }}
-        run: |
-          set -- run
-          [ -n "$REPO" ] && set -- "$@" --repo "$REPO"
-          [ "$DRY_RUN" = "true" ] && set -- "$@" --dry-run
-          steward "$@"
+          REPO: ${{ matrix.repo }}
+        run: steward run --repo "$REPO"
 
       - name: Upload the run report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: steward-run
+          name: steward-run-${{ steps.target.outputs.safe }}
           path: .steward/reports/
           retention-days: 30

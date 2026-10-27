@@ -35,8 +35,20 @@ repos (or all repos). Then in the steward repo:
 adopter repos, stored as the secret `STEWARD_TOKEN`. The workflow uses it
 only when no App is configured.
 
+An installation token lasts an hour. The run therefore mints one per
+adopter, scoped to that one repo, in its own job, and tells the steward
+when it expires (`STEWARD_DEADLINE`, set to 55 minutes after minting).
+The steward starts no order with less than 20 minutes left and caps
+each agent run to finish 10 minutes before the deadline; what does not
+fit is reported `deferred` and the next run picks it up. A PAT has no
+such limit and sets no deadline. The plan job mints its read token for
+the steward repo's own owner, so stewarding several orgs from one repo
+needs `STEWARD_TOKEN` (or the App installed and a plan job per org).
+
 Labels: the steward creates `slopstopper` and `steward` in a repo when
-they are missing. If it cannot, the PR is still opened, unlabelled.
+they are missing and never alters one that exists, since `slopstopper`
+is the label the adopter's own suite uses. If it cannot add them, the PR
+is still opened, unlabelled.
 
 ## 3. The agent
 
@@ -68,6 +80,7 @@ there once. When the plan looks right, set `mode: pr` and widen
 ## 5. Schedule
 
 `steward-run.yml` runs weekly (Monday 06:17 UTC) and on dispatch; one run
-at a time (`concurrency`). Move the cron to fit the org's review rhythm:
+at a time (`concurrency`). A `plan` job dry-runs every adopter, then one
+job per repo with work runs it, two at a time, each with its own token. Move the cron to fit the org's review rhythm:
 a run that opens PRs nobody reviews only piles up drafts, and the
 per-repo budget then stops it from opening more.

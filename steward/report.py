@@ -11,6 +11,12 @@ from pathlib import Path
 REPORT_DIR = Path(".steward/reports")
 
 
+def _cell(text: object, limit: int = 300) -> str:
+    """One line, pipes escaped, bounded: safe inside a markdown table row."""
+    flat = " ".join(str(text).split()).replace("|", "\\|")
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
 @dataclass
 class Outcome:
     order: dict
@@ -55,14 +61,14 @@ class RunReport:
         else:
             lines += ["| Repo | Order | Status | Result |", "| --- | --- | --- | --- |"]
             for o in self.outcomes:
-                result = o.pr_url or o.detail
+                result = o.pr_url or _cell(o.detail)
                 if o.agent and o.agent.get("cost_usd") is not None:
                     result += f" (agent ${o.agent['cost_usd']:.2f}, {o.agent.get('turns')} turns)"
                 lines.append(f"| {o.order['repo']} | `{o.order['id']}` | {o.status} | {result} |")
         if self.deferred:
-            lines += ["", "## Deferred by budget", ""] + [f"- {d['repo']}: `{d['id']}` ({d['reason']})" for d in self.deferred]
+            lines += ["", "## Deferred by budget", ""] + [f"- {d['repo']}: `{d['id']}` ({_cell(d['reason'])})" for d in self.deferred]
         if self.skipped:
-            lines += ["", "## Skipped", ""] + [f"- {s['repo']}: `{s['order']}`: {s['why']}" + (f" {s['url']}" if s.get('url') else "") for s in self.skipped]
+            lines += ["", "## Skipped", ""] + [f"- {s['repo']}: `{s['order']}`: {_cell(s['why'])}" + (f" {s['url']}" if s.get('url') else "") for s in self.skipped]
         return "\n".join(lines) + "\n"
 
 

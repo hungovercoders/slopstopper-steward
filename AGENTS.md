@@ -50,6 +50,7 @@ steward/               the package: discover → inventory → plan → execute/
 steward/contract.py    the slopstopper surfaces relied on, as data (tests + docs read it)
 steward/prompts.py     the agent brief: names the work and the skill, never the method
 steward/checks.py      what a clone cannot verify (an installed environment); the rest is asked of the pinned CLI
+steward/sandbox.py     the stripped environment the agent and verification share; workspace.py hardens git
 tests/                 pytest; test_contract.py is the sync guard
 steward.yml            this org's config; steward.yml.example is the schema
 .github/workflows/     steward-run.yml (the sweep), steward-ci.yml (pytest + contract), ss-*.yml (slopstopper)

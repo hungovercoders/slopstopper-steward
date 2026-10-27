@@ -15,33 +15,40 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Sequence
 
-from steward import gh
+from steward import gh, sandbox
 from steward.config import Config
 from steward.prompts import RESULT_FILE
-from steward.workspace import Workspace
+from steward.workspace import Workspace, guarded_git_dir
 
 SKILLS = ("slopstopper-triage", "slopstopper-install")
+# Which `slopstopper run` targets the agent may call: the ones that read
+# the tree and execute nothing from it. The browser and API checks build or
+# serve the repo (its package.json scripts), which would hand the agent an
+# arbitrary-exec path, so they are not on the list; the steward does not
+# verify them in a clone either.
+_RUN_TARGETS = ("hygiene:", "security:sast", "security:secrets", "security:vulnerability", "security:licences")
 ALLOWED_TOOLS = (
     "Read", "Edit", "Write", "MultiEdit", "Glob", "Grep",
-    "Bash(slopstopper *)", "Bash(task ss:*)", "Bash(git status*)", "Bash(git diff*)", "Bash(git log*)",
-    "Bash(git grep*)", "Bash(cat *)", "Bash(ls *)", "Bash(grep *)", "Bash(find *)", "Bash(head *)", "Bash(tail *)",
-    "Bash(wc *)", "Bash(python3 -m lizard*)", "Bash(mkdir *)", "Bash(rm .ss/reports*)",
+    *(f"Bash(slopstopper run {t}*)" for t in _RUN_TARGETS),
+    *(f"Bash(slopstopper run --json {t}*)" for t in _RUN_TARGETS),
+    "Bash(slopstopper checks list*)", "Bash(slopstopper doctor*)", "Bash(slopstopper profile *)",
+    "Bash(slopstopper config get*)",
+    "Bash(git status*)", "Bash(cat *)", "Bash(ls *)", "Bash(grep *)", "Bash(head *)", "Bash(tail *)",
+    "Bash(wc *)", "Bash(mkdir *)",
 )
 # Named as well as left off the allow-list, so a permission prompt the
-# headless run would auto-answer never lets one through.
+# headless run would auto-answer never lets one through. `find -exec`,
+# `task` (runs whatever Taskfile.ss.yml says), `git grep -O<cmd>` and the
+# interpreters are all ways to run an arbitrary command.
 DISALLOWED_TOOLS = (
-    "Bash(git push*)", "Bash(git commit*)", "Bash(git remote*)", "Bash(git config*)", "Bash(gh *)",
-    "Bash(curl *)", "Bash(wget *)", "Bash(npx *)", "Bash(npm *)", "Bash(pip *)", "Bash(pipx *)",
+    "Bash(git push*)", "Bash(git commit*)", "Bash(git remote*)", "Bash(git config*)", "Bash(git grep*)",
+    "Bash(gh *)", "Bash(curl *)", "Bash(wget *)", "Bash(npx *)", "Bash(npm *)", "Bash(pip *)", "Bash(pipx *)",
+    "Bash(find *)", "Bash(task *)", "Bash(python*)", "Bash(sh *)", "Bash(bash *)", "Bash(env *)",
+    "Edit(./.git/**)", "Write(./.git/**)", "MultiEdit(./.git/**)",
     "WebFetch", "WebSearch",
 )
-# What the agent's process may see. Everything that can write to GitHub
-# stays with the steward; the model key has to go through, since the
-# agent is the model, and that is the one secret the run grants it.
-ENV_KEEP = ("PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR", "USER", "SHELL", "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
-            "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR",
-            "NODE_OPTIONS", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE",
-            "NODE_EXTRA_CA_CERTS", "CI", "RUNNER_TEMP")
 
 
 @dataclass
@@ -112,23 +119,22 @@ def _fetch_tree(repo: str, path: str, ref: str, into: Path) -> None:
                 target.write_text(text, encoding="utf-8")
 
 
-def environment(cli_bin: Path | None = None, base: dict[str, str] | None = None) -> dict[str, str]:
-    """The agent's environment: the allow-list above, nothing else. GH_TOKEN,
-    GITHUB_TOKEN, STEWARD_* and every other secret the runner holds stay out,
-    so neither the agent nor anything it spawns can reach GitHub as the
-    steward, and the clone's credential helper (which reads GH_TOKEN) has
-    nothing to hand to a `git push`."""
-    source = os.environ if base is None else base
-    env = {k: v for k, v in source.items() if k in ENV_KEEP}
-    if cli_bin:
-        env["PATH"] = f"{cli_bin.parent}{os.pathsep}{env.get('PATH', '')}"
-    return env
+def environment(cli_bin: Path | None = None, base: dict[str, str] | None = None,
+                home: Path | None = None) -> dict[str, str]:
+    """The agent's environment: `sandbox.environment` plus the model key.
+    GH_TOKEN, GITHUB_TOKEN, STEWARD_* and every other secret the runner
+    holds stay out, and HOME is a throwaway directory, so neither the agent
+    nor anything it spawns can reach GitHub as the steward: the clone's
+    credential helper finds no token in the environment and no stored login
+    under HOME."""
+    return sandbox.environment(cli_bin.parent if cli_bin else None, home, model_key=True, base=base)
 
 
-def _command(prompt: str, cfg: Config) -> list[str]:
+def _command(prompt: str, cfg: Config, protect: Sequence[Path] = ()) -> list[str]:
+    deny = [*DISALLOWED_TOOLS, *(f"{tool}(/{p}/**)" for p in protect for tool in ("Edit", "Write", "MultiEdit"))]
     args = [
         "claude", "-p", prompt, "--output-format", "json", "--permission-mode", "acceptEdits",
-        "--allowedTools", *ALLOWED_TOOLS, "--disallowedTools", *DISALLOWED_TOOLS,
+        "--allowedTools", *ALLOWED_TOOLS, "--disallowedTools", *deny,
         "--max-turns", str(cfg.agent_turns), "--max-budget-usd", str(cfg.agent_usd),
     ]
     if cfg.agent_model:
@@ -157,7 +163,11 @@ def _read_result(path: Path, out: AgentResult) -> None:
     out.notes = str(data.get("notes") or "")
 
 
-def run(ws: Workspace, prompt: str, cfg: Config, cli_bin: Path | None = None) -> AgentResult:
+def run(ws: Workspace, prompt: str, cfg: Config, cli_bin: Path | None = None, timeout: int = 3600,
+        protect: Sequence[Path] = ()) -> AgentResult:
+    """One boxed run. `protect` are absolute paths outside the clone the agent
+    must not edit (the run's venvs); `timeout` comes from the run, so an
+    agent never outlives the token the steward will push with."""
     why_not = available()
     if why_not:
         return AgentResult(False, error=why_not)
@@ -165,10 +175,11 @@ def run(ws: Workspace, prompt: str, cfg: Config, cli_bin: Path | None = None) ->
     result_path = ws.path / RESULT_FILE
     result_path.unlink(missing_ok=True)
     try:
-        proc = subprocess.run(_command(prompt, cfg), cwd=ws.path, capture_output=True, text=True,
-                              env=environment(cli_bin), timeout=3600)
+        with guarded_git_dir(ws), sandbox.scratch_home("steward-agent-home-") as home:
+            proc = subprocess.run(_command(prompt, cfg, protect), cwd=ws.path, capture_output=True, text=True,
+                                  env=environment(cli_bin, home=home), timeout=timeout)
     except subprocess.TimeoutExpired:
-        return AgentResult(True, error="agent timed out after an hour")
+        return AgentResult(True, error=f"agent timed out after {timeout} s")
     meta = _meta(proc.stdout)
     out = AgentResult(True, cost_usd=meta.get("total_cost_usd"), turns=meta.get("num_turns"))
     if result_path.is_file():

@@ -7,15 +7,26 @@ old branch, not stack on it or be refused by it."""
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterator
 
 from steward import gh
 
 AUTHOR = ("slopstopper-steward", "steward@slopstopper.dev")
 LOCAL_ONLY = (".steward-result.json", ".steward-release-notes.md", ".steward-prompt.md", ".steward-venv/")
+
+
+# Every git command the steward runs, before or after the agent, ignores
+# the hooks and fsmonitor a repo (or the agent, or `slopstopper install`'s
+# `core.hooksPath .githooks`) configures, and any global or system config:
+# these run in the steward's own environment, which holds the push token.
+GIT_HARDENING = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.devnull)
+GIT_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0"}
 
 
 @dataclass
@@ -30,7 +41,8 @@ class Workspace:
     excluded: list[str] = field(default_factory=list)
 
     def git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-        return subprocess.run(["git", *args], cwd=self.path, capture_output=True, text=True, check=check)
+        return subprocess.run(["git", *GIT_HARDENING, *args], cwd=self.path, capture_output=True, text=True,
+                              check=check, env={**os.environ, **GIT_ENV})
 
     def _pathspec(self) -> list[str]:
         return ["--", ".", *(f":(exclude){p}" for p in self.excluded)]
@@ -88,18 +100,44 @@ def commit(ws: Workspace, message: str) -> bool:
     if not ws.dirty():
         return False
     ws.git("add", "-A", *ws._pathspec())
-    ws.git("commit", "-q", "-m", message)
+    ws.git("commit", "--no-verify", "-q", "-m", message)
     return True
 
 
 def push(ws: Workspace, name: str) -> None:
-    ws.git("push", "--force-with-lease", "-u", "origin", name)
+    ws.git("push", "--no-verify", "--force-with-lease", "-u", "origin", name)
 
 
 def ensure_labels(repo: str, labels: list[str]) -> None:
+    """Create the labels a repo lacks. An existing one is left exactly as
+    the adopter has it (no `--force`): `slopstopper` is the brand label
+    `emit` relies on, and its colour and description are the adopter's."""
     for label in labels:
-        gh.gh("label", "create", label, "-R", repo, "--force", "--color", "6f42c1",
-              "--description", "Opened by slopstopper-steward")
+        gh.gh("label", "create", label, "-R", repo, "--color", "6f42c1", "--description", "Opened by slopstopper-steward")
+
+
+@contextmanager
+def guarded_git_dir(ws: Workspace) -> Iterator[None]:
+    """Put back what the steward's git reads from `.git` once the agent is
+    done: the config as it was (helpers, fsmonitor, includes, remotes), and
+    no hooks. Defence in depth behind the agent's deny rules and
+    GIT_HARDENING, since the agent's tools can still write files."""
+    gitdir = ws.path / ".git"
+    snapshot = (gitdir / "config").read_bytes()
+    try:
+        yield
+    finally:
+        config = gitdir / "config"
+        if config.is_symlink() or config.exists():
+            config.unlink()
+        config.write_bytes(snapshot)
+        hooks = gitdir / "hooks"
+        if hooks.is_symlink():
+            hooks.unlink()
+        elif hooks.exists():
+            shutil.rmtree(hooks)
+        hooks.mkdir()
+        (gitdir / "info" / "attributes").unlink(missing_ok=True)
 
 
 def open_pr(ws: Workspace, title: str, body: str, labels: list[str], draft: bool) -> str:

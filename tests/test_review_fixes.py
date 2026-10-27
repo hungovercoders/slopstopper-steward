@@ -7,6 +7,7 @@ import pytest
 
 from steward import yamlish, workspace
 from steward.config import from_dict
+from steward import sandbox
 from steward.execute import agent
 
 
@@ -35,7 +36,7 @@ def test_agent_environment_drops_github_credentials(tmp_path):
     env = agent.environment(tmp_path / "bin" / "slopstopper", base={
         "PATH": "/usr/bin", "HOME": "/h", "GH_TOKEN": "ghs_x", "GITHUB_TOKEN": "ghp_y", "STEWARD_TOKEN": "z",
         "STEWARD_APP_PRIVATE_KEY": "pem", "ANTHROPIC_API_KEY": "sk", "AWS_SECRET_ACCESS_KEY": "no"})
-    assert set(env) == {"PATH", "HOME", "ANTHROPIC_API_KEY"}
+    assert set(env) - set(sandbox.HARDENING) == {"PATH", "HOME", "ANTHROPIC_API_KEY"}
     assert env["PATH"].startswith(str(tmp_path / "bin"))
 
 

@@ -12,21 +12,14 @@ each, so a repo whose topic never landed is still found.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 
 from steward import gh
+from steward.pin import PIN_KEY, PIN_LINE, read_pin  # noqa: F401  (re-exported)
 from steward.config import Config
 
 TOPIC = "slopstopper"
-PIN_KEY = "pipx:slopstopper-cli"
 INSTALLED_FROM = ".ss/.installed-from"
-# The one pattern for the pin line: group 1 is everything up to the value,
-# group 2 the value. `execute/refresh.set_pin` rewrites with it, so the two
-# cannot drift.
-PIN_LINE = re.compile(rf'^(\s*"?{re.escape(PIN_KEY)}"?\s*=\s*)"([^"]*)"', re.M)
-
-
 @dataclass
 class Repo:
     full_name: str
@@ -49,13 +42,6 @@ class Repo:
             "repo": self.full_name, "default_branch": self.default_branch, "topics": self.topics,
             "pinned": self.pinned, "installed_from": self.installed_from, "evidence": self.evidence,
         }
-
-
-def read_pin(mise_toml: str | None) -> str | None:
-    if not mise_toml:
-        return None
-    match = PIN_LINE.search(mise_toml)
-    return match.group(2).strip() or None if match else None
 
 
 def org_repos(org: str) -> list[dict]:
