@@ -1,0 +1,43 @@
+name: Set up slopstopper
+description: >-
+  Installs Python and the mise-pinned toolchain (task and node, plus the
+  pinned slopstopper-cli in adopter repos). In the slopstopper repo itself it
+  installs the CLI from source. Every ss-* workflow starts with this step.
+
+# One local composite action rather than the same three steps copied into
+# every workflow. `uses: ./.github/actions/ss-setup` needs no publishing and
+# no versioning: install.sh copies this directory into adopter repos next to
+# the workflows, so everything a workflow does is still visible and diffable
+# in the adopter's own tree.
+#
+# The workflow must have checked out the repo before this runs, because a
+# local action is resolved from the checkout.
+
+inputs:
+  python-version:
+    description: Python to put on PATH (mise's pipx backend needs one)
+    required: false
+    default: '3.11'
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Set up the mise-pinned toolchain
+      # Installs task, node and (in adopter repos) the pinned slopstopper-cli
+      # from mise.toml and puts them on PATH for later steps. The pins live in
+      # mise.toml ([tools]); mise resolves them per-repo, so CI and local runs
+      # share one version.
+      uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
+
+    - name: Install slopstopper-cli from source (slopstopper.dev only)
+      # In the slopstopper repo the CLI runs from source (HEAD) and mise.toml
+      # carries no slopstopper-cli pin, so this step installs it editable.
+      # Adopter repos skip it (no cli/ source) and use the mise-pinned wheel.
+      if: ${{ hashFiles('cli/pyproject.toml') != '' }}
+      shell: bash
+      run: pip install -e ./cli

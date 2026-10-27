@@ -1,0 +1,191 @@
+name: Resolve the URL a check audits
+description: >-
+  Turns the triggering event into the URL a URL-driven check should audit,
+  validated to http(s). Two modes: `local` for the browser checks, which
+  build and serve the repo on pull requests and pushes; `skip` for the API
+  checks, which audit a deployed environment or skip when none is configured.
+
+# Twelve workflows carried a copy of this logic, each with its own
+# `validate_url()`. The two shapes, exactly as those copies behaved:
+#
+#   mode skip (the API checks, which audit a deployed environment or nothing)
+#     workflow_dispatch   → the `url` input (prod=true when it is urls.production)
+#     deployment_status   → the deployment's URL (prod=true when it is
+#                           urls.production; a preview deploy is not)
+#     pull_request        → urls.preview
+#     schedule / push     → urls.production                     (prod=true)
+#     … and when that comes out empty: a notice and skip=true. An API
+#     check with no URLs configured is inert, never red.
+#
+#   mode local (the browser checks, which build and serve the repo itself)
+#     workflow_dispatch   → the `url` input (prod=true when it is
+#                           urls.production). If blank, a local build, or
+#                           urls.production when dispatch-fallback is
+#                           production (prod=true; an error if unset)
+#     deployment_status   → the deployment's URL (prod=true when it is
+#                           urls.production; a preview deploy is not)
+#     schedule            → urls.production (an error if unset) (prod=true)
+#     pull_request / push → http://localhost:8080, use_local=true
+#
+# The deployment's URL is its environment_url, falling back to target_url
+# (the workflows pass `environment_url || target_url`). Some providers,
+# GitHub Pages among them, put the deployment's *log* in target_url, so a
+# github.com/<owner>/<repo>/actions/ link is never audited as the site:
+# it is replaced by urls.production, and with that unset the API checks
+# skip and the browser checks build and serve the repo, each with a
+# notice.
+#
+# Every URL is validated to http(s); an invalid one fails the step. A
+# failing `slopstopper config get` fails the step too, so a broken CLI is
+# never mistaken for an unset key.
+#
+# CUSTOMISE FOR YOUR APP: `urls.production` and `urls.preview` live in
+# .slopstopper.yml. Point `urls.preview` at the environment your PRs
+# deploy to and the API checks cover it; with neither set, the API checks
+# skip with a notice on every event.
+
+inputs:
+  mode:
+    description: "`local` (build and serve on PR/push) or `skip` (audit a deployed URL or skip)"
+    required: false
+    default: local
+  url:
+    description: The workflow_dispatch `url` input, if any
+    required: false
+    default: ''
+  deployment-url:
+    description: "The deployment_status URL, if any: `environment_url || target_url`"
+    required: false
+    default: ''
+  dispatch-fallback:
+    description: "Mode local only: where a blank dispatch goes (`local` or `production`)"
+    required: false
+    default: local
+  check:
+    description: Human name of the check, for the skip notice
+    required: false
+    default: this check
+
+outputs:
+  url:
+    description: The URL to audit (empty when skip=true)
+    value: ${{ steps.resolve.outputs.url }}
+  skip:
+    description: "`true` when no URL could be resolved for this event (mode skip)"
+    value: ${{ steps.resolve.outputs.skip }}
+  use_local:
+    description: "`true` when the workflow should build and serve the repo itself (mode local)"
+    value: ${{ steps.resolve.outputs.use_local }}
+  prod:
+    description: "`true` for a scheduled / main-branch run against urls.production, or a deployment or dispatch whose url is urls.production (CWV: the stricter Lighthouse config). A preview deploy is never prod"
+    value: ${{ steps.resolve.outputs.prod }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve
+      id: resolve
+      shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        MODE: ${{ inputs.mode }}
+        INPUT_URL: ${{ inputs.url }}
+        DEPLOYMENT_URL: ${{ inputs.deployment-url }}
+        DISPATCH_FALLBACK: ${{ inputs.dispatch-fallback }}
+        CHECK: ${{ inputs.check }}
+      run: |
+        set -eo pipefail
+        fail() { echo "::error::$1" >&2; exit 1; }
+        # Called directly (never inside `$(...)` or left of `||`), so a
+        # failure here ends the step rather than a subshell. Consumers pass
+        # the output through env and quote it at shell sinks.
+        require_http() {
+          if ! python -c 'import sys; from urllib.parse import urlsplit; value=sys.argv[1]; parsed=urlsplit(value); parsed.port; sys.exit(not (parsed.scheme in ("http", "https") and parsed.hostname and not any(char.isspace() for char in value)))' "$1" 2>/dev/null
+          then
+            fail "Invalid URL format"
+          fi
+        }
+        emit() { # url skip use_local prod
+          {
+            echo "url=$1"
+            echo "skip=$2"
+            echo "use_local=$3"
+            echo "prod=$4"
+          } >> "$GITHUB_OUTPUT"
+        }
+        audit() { require_http "$1"; emit "$1" false false "$2"; }
+        local_build() { emit "http://localhost:8080" false true false; }
+        # A dispatched or deployed URL is production when it is
+        # urls.production (the Cloudflare trigger dispatches the live site
+        # that way). A preview deploy is not: CWV's prod config asserts
+        # is-crawlable, and previews answer noindex by design.
+        # Runs inside `$(...)`, where bash drops `set -e`, so a failed
+        # lookup is passed up explicitly: the caller's assignment then
+        # fails, and that one is under `set -e`.
+        is_production_url() {
+          local production
+          production="$(config_get urls.production)" || exit 1
+          if [ -n "$production" ] && [ "${1%/}" = "${production%/}" ]; then echo true; else echo false; fi
+        }
+        # `slopstopper config get` prints "" for an unset key; a non-zero
+        # exit is a broken CLI or config, and stops the step here.
+        config_get() {
+          slopstopper config get "$1" || fail "slopstopper config get $1 failed. See the error above."
+        }
+        # A deployment's log link (GitHub Pages sets target_url to the
+        # Actions job) is not the site, so it is never audited.
+        if [ "$EVENT_NAME" = "deployment_status" ] &&
+           [[ "$DEPLOYMENT_URL" =~ ^https://github\.com/[^/]+/[^/]+/actions/ ]]; then
+          echo "::notice::The deployment URL is a GitHub Actions log ($DEPLOYMENT_URL), not the site, so ${CHECK} uses urls.production instead."
+          DEPLOYMENT_URL="$(config_get urls.production)"
+          deployment_log=true
+        fi
+
+        if [ "$MODE" = "skip" ]; then
+          prod=false
+          case "$EVENT_NAME" in
+            workflow_dispatch) candidate="$INPUT_URL"; [ -z "$candidate" ] || prod="$(is_production_url "$candidate")" ;;
+            deployment_status) candidate="$DEPLOYMENT_URL"; [ -z "$candidate" ] || prod="$(is_production_url "$candidate")" ;;
+            pull_request)      candidate="$(config_get urls.preview)" ;;
+            *)                 candidate="$(config_get urls.production)"; prod=true ;;
+          esac
+          if [ -z "$candidate" ]; then
+            echo "::notice::No URL resolved for this event. Set urls.preview / urls.production in .slopstopper.yml to enable ${CHECK} here."
+            emit "" true false false
+          else
+            audit "$candidate" "$prod"
+          fi
+          exit 0
+        fi
+
+        case "$EVENT_NAME" in
+          workflow_dispatch)
+            if [ -n "$INPUT_URL" ]; then
+              prod="$(is_production_url "$INPUT_URL")"
+              audit "$INPUT_URL" "$prod"
+            elif [ "$DISPATCH_FALLBACK" = "production" ]; then
+              production="$(config_get urls.production)"
+              [ -n "$production" ] || fail "No url input given and urls.production is unset in .slopstopper.yml"
+              audit "$production" true
+            else
+              local_build
+            fi
+            ;;
+          deployment_status)
+            if [ -z "$DEPLOYMENT_URL" ] && [ -n "${deployment_log:-}" ]; then
+              echo "::notice::urls.production is unset, so ${CHECK} builds and serves the repo instead."
+              local_build
+            else
+              prod="$(is_production_url "$DEPLOYMENT_URL")"
+              audit "$DEPLOYMENT_URL" "$prod"
+            fi
+            ;;
+          schedule)
+            production="$(config_get urls.production)"
+            [ -n "$production" ] || fail "Scheduled run requires urls.production in .slopstopper.yml"
+            audit "$production" true
+            ;;
+          *)
+            local_build
+            ;;
+        esac

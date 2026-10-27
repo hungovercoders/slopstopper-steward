@@ -1,0 +1,60 @@
+# Root Taskfile for slopstopper-steward.
+#
+# Two surfaces: `task steward:*` is this repo's own loop (tests, a plan, a
+# run, the contract check), and `task ss:*` is the slopstopper suite this
+# repo installs on itself like any adopter. See `task --list-all`.
+
+version: '3'
+
+includes:
+  ss:
+    taskfile: ./Taskfile.ss.yml
+
+vars:
+  PYTHON: '{{.ROOT_DIR}}/.venv/bin/python'
+  STEWARD: '{{.ROOT_DIR}}/.venv/bin/steward'
+
+tasks:
+  steward:setup:
+    desc: Create .venv with the steward installed editable plus pytest
+    cmds:
+      - python3 -m venv .venv
+      - .venv/bin/pip install -q -e ".[test]"
+
+  steward:test:
+    desc: Run the pytest suite (tests/); `-- -k <expr>` filters. The contract test reads $SLOPSTOPPER_SRC, ../slopstopper or a fresh clone
+    deps: [steward:setup]
+    cmds:
+      - .venv/bin/pytest {{.CLI_ARGS}}
+
+  steward:discover:
+    desc: List the adopters across the orgs in steward.yml (needs gh auth)
+    deps: [steward:setup]
+    cmds:
+      - '"{{.STEWARD}}" discover {{.CLI_ARGS}}'
+
+  steward:plan:
+    desc: The orders a run would open, nothing written (needs gh auth); `-- --repo owner/name` for one
+    deps: [steward:setup]
+    cmds:
+      - '"{{.STEWARD}}" plan {{.CLI_ARGS}}'
+
+  steward:run:
+    desc: Work the plan and open PRs (needs gh auth + ANTHROPIC_API_KEY for the agentic orders); `-- --dry-run` plans only
+    deps: [steward:setup]
+    cmds:
+      - '"{{.STEWARD}}" run {{.CLI_ARGS}}'
+
+  steward:contract:
+    desc: Check a slopstopper checkout still carries every surface the steward relies on (SRC=path, default ../slopstopper)
+    deps: [steward:setup]
+    vars:
+      SRC: '{{.SRC | default "../slopstopper"}}'
+    cmds:
+      - '"{{.STEWARD}}" contract {{.SRC}}'
+
+  steward:contract-doc:
+    desc: Regenerate the surface table in docs/architecture/CONTRACT.md from steward/contract.py (`-- --check` only reports)
+    deps: [steward:setup]
+    cmds:
+      - '"{{.PYTHON}}" scripts/contract_doc.py {{.CLI_ARGS}}'

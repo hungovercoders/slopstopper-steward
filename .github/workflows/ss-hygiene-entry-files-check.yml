@@ -1,0 +1,66 @@
+name: SlopStopper · Hygiene - Entry-File Budget Check
+
+# Enforces token budgets and explicit routes on the agent entry files
+# (README.md, AGENTS.md, CLAUDE.md) and the docs map (docs/README.md).
+# Triggers: PR, push to main. Emits a rolling PR comment. The workflow
+# fails when a file is over budget. There is no separate main-branch
+# issue because the exit code is the signal.
+# Docs: docs/hygiene/README.md.
+
+on:
+  pull_request:
+    paths:
+      - 'README.md'
+      - 'AGENTS.md'
+      - 'CLAUDE.md'
+      - 'docs/README.md'
+      - '.slopstopper.yml'
+      - '.github/workflows/ss-hygiene-entry-files-check.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'README.md'
+      - 'AGENTS.md'
+      - 'CLAUDE.md'
+      - 'docs/README.md'
+      - '.slopstopper.yml'
+      - '.github/workflows/ss-hygiene-entry-files-check.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  check-entry-files:
+    name: Entry-File Budget Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up slopstopper
+        # Python, the mise-pinned toolchain (task, node, slopstopper-cli) and,
+        # in the slopstopper repo only, the CLI from source. One local
+        # composite action; install.sh copies it in next to the workflows.
+        uses: ./.github/actions/ss-setup
+
+      - name: Run entry-file budget check
+        id: check
+        run: task ss:hygiene:entry-files
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: entry-files-report-${{ github.run_id }}
+          path: .ss/reports/entry-files/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Emit PR comment
+        if: github.event_name == 'pull_request' && always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: slopstopper emit hygiene:entry-files --target pr-comment --status ${{ steps.check.outcome == 'success' && 'pass' || 'fail' }} --on-pass=delete

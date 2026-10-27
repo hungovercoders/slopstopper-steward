@@ -1,0 +1,84 @@
+name: Steward · Run
+
+# The scheduled sweep: discover every adopter in the configured orgs, move
+# pins that fell behind, work the issues slopstopper raised, one PR each.
+# Docs: docs/runbooks/SETUP.md (tokens and secrets), docs/runbooks/OPERATE.md.
+#
+# Writes to other repos go through a GitHub App token (STEWARD_APP_ID var +
+# STEWARD_APP_PRIVATE_KEY secret) when one is configured, else the
+# STEWARD_TOKEN secret (a fine-grained PAT). GITHUB_TOKEN never leaves this
+# repo, so it is not an option. The agentic orders need ANTHROPIC_API_KEY;
+# without it the upgrades still run and the findings are only reported.
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: One owner/name to steward (empty for every adopter)
+        required: false
+        default: ''
+      dry_run:
+        description: Plan only; open nothing
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: steward-run
+  cancel-in-progress: false
+
+jobs:
+  steward:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout the steward
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Set up the mise-pinned toolchain (task, node)
+        uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
+
+      - name: Install the steward and the agent CLI
+        run: |
+          pip install -q .
+          npm install -g @anthropic-ai/claude-code
+          steward --version
+          claude --version
+
+      - name: Mint the steward's token from the GitHub App
+        id: app
+        if: vars.STEWARD_APP_ID != ''
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        with:
+          app-id: ${{ vars.STEWARD_APP_ID }}
+          private-key: ${{ secrets.STEWARD_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Steward run
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.STEWARD_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          REPO: ${{ inputs.repo }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -- run
+          [ -n "$REPO" ] && set -- "$@" --repo "$REPO"
+          [ "$DRY_RUN" = "true" ] && set -- "$@" --dry-run
+          steward "$@"
+
+      - name: Upload the run report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: steward-run
+          path: .steward/reports/
+          retention-days: 30

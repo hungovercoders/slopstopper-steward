@@ -1,0 +1,144 @@
+"""Inventory in, work orders out. Pure: nothing here touches GitHub.
+
+Order kinds, in the priority they are worked:
+  upgrade   the pin is behind the policy's target: move it and rewrite the suite
+  refresh   the pin is current but the suite on disk was written by an older CLI
+  triage    an open finding slopstopper raised, security ones first
+
+A repo gets at most `budgets.prs_per_repo` open steward PRs; an order whose
+id already has an open PR is dropped, so a re-run is idempotent. Orders a
+budget leaves out are kept as `deferred`, so the report says what waits.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from steward.config import Config
+from steward.inventory import Finding, Inventory
+from steward.versions import MIN_INSTALL_VERSION, behind, parse
+
+STATIC_CHECKS = (
+    "hygiene:complexity", "hygiene:docs-accuracy", "hygiene:docs-size", "hygiene:docs-structure",
+    "hygiene:entry-files", "hygiene:csp-exceptions", "hygiene:privacy",
+    "security:licences",
+)
+
+
+@dataclass
+class Order:
+    id: str
+    kind: str
+    repo: str
+    title: str
+    reason: str
+    priority: int
+    default_branch: str = "main"
+    target: str | None = None
+    pinned: str | None = None
+    finding: Finding | None = None
+    agentic: bool = False
+    details: dict = field(default_factory=dict)
+
+    @property
+    def branch(self) -> str:
+        return f"steward/{self.id}"
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id, "kind": self.kind, "repo": self.repo, "title": self.title, "reason": self.reason,
+            "priority": self.priority, "branch": self.branch, "target": self.target, "pinned": self.pinned,
+            "finding": self.finding.to_dict() if self.finding else None, "agentic": self.agentic, **self.details,
+        }
+
+
+@dataclass
+class Plan:
+    orders: list[Order] = field(default_factory=list)
+    deferred: list[Order] = field(default_factory=list)
+    skipped: list[dict] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {"orders": [o.to_dict() for o in self.orders], "deferred": [o.to_dict() for o in self.deferred],
+                "skipped": self.skipped}
+
+
+def _upgrade_order(inv: Inventory, target: str | None) -> Order | None:
+    repo = inv.repo
+    if target and behind(target, MIN_INSTALL_VERSION):
+        return None  # plan_repo records why
+    if target and behind(repo.pinned, target):
+        reason = (f"pin {repo.pinned} is behind {target}" if repo.pinned
+                  else f"no pipx:slopstopper-cli pin in mise.toml; {target} is the target")
+        return Order(f"upgrade-{target}", "upgrade", repo.full_name,
+                     f"chore(slopstopper): move the CLI pin to {target}", reason, 0,
+                     repo.default_branch, target, repo.pinned)
+    if repo.pinned and repo.installed_from and parse(repo.installed_from) and parse(repo.pinned) \
+            and parse(repo.installed_from) < parse(repo.pinned):  # type: ignore[operator]
+        return Order(f"refresh-{repo.pinned}", "refresh", repo.full_name,
+                     f"chore(slopstopper): refresh the suite from slopstopper-cli {repo.pinned}",
+                     f"the suite was written by {repo.installed_from} but the pin is {repo.pinned}", 1,
+                     repo.default_branch, repo.pinned, repo.pinned)
+    return None
+
+
+def _triage_orders(inv: Inventory) -> list[Order]:
+    orders = []
+    for finding in sorted(inv.findings, key=lambda f: (not f.security, f.number)):
+        what = finding.check or finding.workflow or "finding"
+        orders.append(Order(
+            f"triage-{finding.number}", "triage", inv.repo.full_name,
+            f"fix(slopstopper): {what} (closes #{finding.number})",
+            f"open issue #{finding.number}: {finding.title}", 2 if finding.security else 3,
+            inv.repo.default_branch, inv.repo.pinned, inv.repo.pinned, finding, agentic=True,
+            details={"static": finding.check in STATIC_CHECKS},
+        ))
+    return orders
+
+
+def plan_repo(inv: Inventory, target: str | None, cfg: Config) -> Plan:
+    plan = Plan()
+    candidates: list[Order] = []
+    if target and behind(target, MIN_INSTALL_VERSION):
+        plan.skipped.append({"repo": inv.repo.full_name, "order": f"upgrade-{target}",
+                             "why": f"{target} predates `slopstopper install` ({MIN_INSTALL_VERSION}+); nothing to move to yet"})
+    upgrade = _upgrade_order(inv, target)
+    if upgrade:
+        candidates.append(upgrade)
+    candidates += _triage_orders(inv)
+    budget = max(0, cfg.prs_per_repo - len(inv.open_orders))
+    for order in sorted(candidates, key=lambda o: o.priority):
+        if order.id in inv.open_orders:
+            plan.skipped.append({"repo": order.repo, "order": order.id, "why": "open PR", **inv.open_orders[order.id]})
+            continue
+        if order.agentic and not cfg.agent_enabled:
+            plan.skipped.append({"repo": order.repo, "order": order.id, "why": "agent disabled"})
+            continue
+        if budget <= 0:
+            plan.deferred.append(order)
+            continue
+        plan.orders.append(order)
+        budget -= 1
+    for w in inv.disabled_workflows:
+        plan.skipped.append({"repo": inv.repo.full_name, "order": f"enable-{w['path'].rsplit('/', 1)[-1]}",
+                             "why": f"workflow {w['state']}: needs `gh workflow enable` by an admin"})
+    return plan
+
+
+def plan_all(inventories: list[Inventory], targets: dict[str, str | None], cfg: Config) -> Plan:
+    """Across repos, worst-off first: security findings, then furthest behind."""
+    merged = Plan()
+    per_repo = []
+    for inv in inventories:
+        p = plan_repo(inv, targets.get(inv.repo.full_name), cfg)
+        merged.skipped += p.skipped
+        merged.deferred += p.deferred
+        if p.orders:
+            per_repo.append((min(o.priority for o in p.orders), inv.repo.full_name, p.orders))
+    per_repo.sort(key=lambda t: (t[0], t[1]))
+    for i, (_, _, orders) in enumerate(per_repo):
+        if i < cfg.repos_per_run:
+            merged.orders += orders
+        else:
+            merged.deferred += orders
+    return merged

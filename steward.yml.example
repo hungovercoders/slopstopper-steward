@@ -1,0 +1,33 @@
+# slopstopper-steward configuration. Copy to steward.yml at the repo root.
+# Keys and defaults are documented in steward/config.py.
+
+orgs:                      # organisations (or users) to steward
+  - your-org
+
+repos:
+  include: []              # only these owner/name repos when non-empty
+  exclude: []              # never these
+
+mode: pr                   # plan | pr. `plan` reads and reports; `pr` also opens pull requests
+
+upgrade:
+  policy: latest           # latest | minor | patch: how far one PR may move the pin
+  min_age_days: 2          # a release younger than this is not a target yet
+
+budgets:
+  repos_per_run: 5         # repos worked per run; the plan still covers every adopter
+  prs_per_repo: 2          # open steward PRs per repo, upgrades included
+  agent_usd: 5             # dollar cap per agent invocation
+  agent_turns: 60          # turn cap per agent invocation
+
+agent:
+  enabled: true            # false: upgrades still run, findings are reported not worked
+  model: ""                # handed to `claude --model`; empty uses the CLI default
+
+labels:
+  pr: [slopstopper, steward]
+  ignore: steward:ignore   # put this label on an issue to keep the steward off it
+
+slopstopper:
+  repo: hungovercoders/slopstopper
+  package: slopstopper-cli

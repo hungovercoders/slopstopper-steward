@@ -1,0 +1,42 @@
+name: Steward · CI
+
+# pytest plus the contract check against slopstopper's main. The nightly
+# schedule is the sync guard: a slopstopper change that moves a surface the
+# steward relies on fails here within a day, whichever side forgot the
+# other. Docs: docs/architecture/CONTRACT.md.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: '41 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest + contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install -q -e ".[test]"
+      - name: Fetch slopstopper main for the contract test
+        run: git clone --depth 1 https://github.com/hungovercoders/slopstopper "$RUNNER_TEMP/slopstopper"
+      - name: pytest (unit + contract + the executor end to end from slopstopper's main)
+        env:
+          SLOPSTOPPER_SRC: ${{ runner.temp }}/slopstopper
+          STEWARD_E2E: '1'
+          STEWARD_E2E_SOURCE: ${{ runner.temp }}/slopstopper/cli
+        run: pytest
+      - name: Contract table in the docs is current
+        run: python scripts/contract_doc.py --check
+      - name: steward contract
+        run: steward contract "$RUNNER_TEMP/slopstopper"

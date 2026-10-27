@@ -1,0 +1,95 @@
+name: SlopStopper · Licence Inventory
+
+# Judges every resolved dependency's licence against the repo's allowlist
+# (.github/dependency-review-config.yml, the same file the dependency
+# review reads for each PR's diff). npm comes from package-lock.json, so
+# no install is needed; Python from `pip inspect` of the interpreter the
+# project is installed into. Triggers: PR, push to main. Emits a rolling
+# PR comment and a main-branch tracking issue on a denied licence.
+#
+# The workflow filename, the Taskfile shim and the CLI check all use the
+# same identifier, `security:licences`.
+# Docs: docs/security/LICENCES.md.
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  licences:
+    name: Judge dependency licences
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up slopstopper
+        # Python, the mise-pinned toolchain (task, node, slopstopper-cli) and,
+        # in the slopstopper repo only, the CLI from source. One local
+        # composite action; install.sh copies it in next to the workflows.
+        uses: ./.github/actions/ss-setup
+
+      - name: Install the project's Python dependencies
+        # The Python inventory reads what is installed in python3's
+        # environment, so a root-level Python project is installed into it
+        # first. A project one directory down (like slopstopper's own cli/)
+        # adds its own install step here; the check exits 2 with that
+        # instruction while the declared dependencies are absent.
+        if: hashFiles('requirements.txt', 'pyproject.toml') != ''
+        run: |
+          if [ -f requirements.txt ]; then python3 -m pip install -q -r requirements.txt; fi
+          # Only a pyproject that declares a build backend is installable;
+          # a tool-config-only one (ruff, black) is left alone.
+          if [ -f pyproject.toml ] && grep -q '^\[build-system\]' pyproject.toml; then python3 -m pip install -q .; fi
+
+      - name: Judge dependency licences
+        id: licences
+        # `task -x` passes the CLI's exit code through (plain `task` maps
+        # every failure to 201). The code is kept as an output so later
+        # steps can tell findings (1) from could-not-run (2).
+        shell: bash
+        run: |
+          set +e
+          task -x ss:security:licences
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit $rc
+
+      - name: Upload licence reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: licences-reports
+          path: |
+            .ss/reports/licences/licences-report.md
+            .ss/reports/licences/licences-report.json
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Emit PR comment
+        if: always() && github.event_name == 'pull_request' && steps.licences.outcome != 'skipped'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: slopstopper emit security:licences --target pr-comment --status ${{ steps.licences.outcome == 'success' && 'pass' || 'fail' }} --on-pass=delete
+
+      - name: Emit issue on main (if a licence is denied)
+        # Only rc 1 is a finding. Exit 2 means the inventory didn't run.
+        if: always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && steps.licences.outputs.rc == '1'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: slopstopper emit security:licences --target issue
+
+      - name: Close issue on main when clean
+        if: always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && steps.licences.outcome == 'success'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: slopstopper emit security:licences --target issue --on-pass=close

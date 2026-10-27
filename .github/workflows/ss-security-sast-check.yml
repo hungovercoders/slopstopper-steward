@@ -1,0 +1,87 @@
+name: SlopStopper · SAST Analysis
+
+# Runs Semgrep static analysis. The check itself is the gate: it exits 1
+# when a finding is at or above `security.sast.fail_on` (default: error)
+# and 2 when the scan couldn't run; findings below the threshold are
+# reported but non-blocking. Triggers: PR, push to main. Emits a rolling
+# PR comment with all findings and a main-branch tracking issue when
+# blocking findings land (exit 1 only).
+# Docs: docs/security/README.md.
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  sast:
+    name: Static Application Security Testing with Semgrep
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up slopstopper
+        # Python, the mise-pinned toolchain (task, node, slopstopper-cli) and,
+        # in the slopstopper repo only, the CLI from source. One local
+        # composite action; install.sh copies it in next to the workflows.
+        uses: ./.github/actions/ss-setup
+
+      - name: Install Semgrep
+        run: |
+          pip install --upgrade pip
+          pip install semgrep
+
+      # The check itself is the gate: it exits 1 on blocking findings, so
+      # this step's outcome IS the verdict. No separate detect / fail-job
+      # steps, and the local `task ss:security:sast` agrees with CI.
+      - name: Run SAST analysis
+        id: sast
+        # `task -x` passes the CLI's exit code through (plain `task` maps
+        # every failure to 201). The code is kept as an output so later
+        # steps can tell findings (1) from could-not-run (2).
+        shell: bash
+        run: |
+          set +e
+          task -x ss:security:sast
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit $rc
+
+      - name: Upload SAST reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sast-reports
+          path: |
+            .ss/reports/sast/sast-report.md
+            .ss/reports/sast/sast-report.json
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Emit PR comment
+        if: always() && github.event_name == 'pull_request' && steps.sast.outcome != 'skipped'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: slopstopper emit security:sast --target pr-comment --status ${{ steps.sast.outcome == 'success' && 'pass' || 'fail' }} --on-pass=delete
+
+      - name: Emit issue on main (if error-severity findings)
+        # Only rc 1 is a finding. Exit 2 means the scan didn't run.
+        if: always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && steps.sast.outputs.rc == '1'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: slopstopper emit security:sast --target issue
+
+      - name: Close issue on main when clean
+        if: always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && steps.sast.outcome == 'success'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: slopstopper emit security:sast --target issue --on-pass=close

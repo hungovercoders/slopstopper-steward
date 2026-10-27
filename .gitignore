@@ -1,0 +1,34 @@
+__pycache__/
+*.egg-info/
+.venv/
+.pytest_cache/
+build/
+dist/
+.task/
+# steward run output
+.steward/
+
+# slopstopper begin
+# Generated outputs from slopstopper checks. Safe to delete locally.
+# .ss/.workflows-installed is the source of truth for what install.sh
+# deployed last; it MUST be committed so that re-runs (CI or fresh
+# checkout) can respect adopter deletions. Don't add it here.
+# Unanchored: checks write relative to CWD, so a monorepo package or a
+# run from a subdirectory would otherwise leave an untracked .ss/reports/.
+**/.ss/reports/
+.ss/scripts/**/__pycache__/
+.ss/tests/**/__pycache__/
+# Run-time copies of the Playwright config + specs (they also self-ignore).
+.ss/.run/
+playwright-report/
+test-results/
+.lighthouseci/
+# npm installs slopstopper's Playwright and Lighthouse devDependencies here.
+node_modules/
+# slopstopper's Claude Code skills are installed at project level so every
+# contributor benefits. If you've added .claude/* to .gitignore above,
+# these negations keep the skills tracked.
+!.claude/
+!.claude/skills/
+!.claude/skills/**
+# slopstopper end

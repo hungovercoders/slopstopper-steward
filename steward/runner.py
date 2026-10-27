@@ -1,0 +1,192 @@
+"""The run: discover, inventory, plan, then work each order in a clone."""
+
+from __future__ import annotations
+
+import json
+import tempfile
+from pathlib import Path
+
+from steward import discover, gh, inventory, prompts, versions, workspace
+from steward.config import Config
+from steward.execute import agent, refresh
+from steward.execute.agent import AgentResult
+from steward.plan import Order, Plan, plan_all
+from steward.report import Outcome, RunReport
+
+STEWARD_URL = "https://github.com/hungovercoders/slopstopper-steward"
+
+
+def gather(cfg: Config, only: str | None = None) -> tuple[list[inventory.Inventory], dict[str, str | None], str | None]:
+    releases = versions.pypi_releases(cfg.package)
+    latest = max(releases, key=lambda v: versions.parse(v)) if releases else None  # type: ignore[arg-type]
+    repos = discover.discover(cfg, only)
+    invs = [inventory.take(r, latest, cfg) for r in repos]
+    targets = {inv.repo.full_name: versions.target_version(inv.repo.pinned, releases, cfg.policy, cfg.min_age_days)
+               for inv in invs}
+    return invs, targets, latest
+
+
+def release_notes(cfg: Config, pinned: str | None, target: str) -> str:
+    rows = gh.api(f"repos/{cfg.slopstopper_repo}/releases?per_page=100", paginate=True) or []
+    lo, hi = versions.parse(pinned), versions.parse(target)
+    picked = []
+    for r in rows:
+        v = versions.parse((r.get("tag_name") or "").lstrip("v"))
+        if v and hi and v <= hi and (lo is None or v > lo):
+            picked.append((v, r))
+    picked.sort(reverse=True)
+    out = [f"## {r.get('name') or r.get('tag_name')}\n\n{(r.get('body') or '').strip()}\n" for _, r in picked]
+    return "\n".join(out) or f"No release notes found between {pinned} and {target}."
+
+
+def _pr_body(order: Order, cfg: Config, summary: str, extra: str = "") -> str:
+    closes = f"Closes #{order.finding.number}\n\n" if order.finding else ""
+    return (
+        f"{closes}{summary}\n\n{extra}"
+        f"\n---\nOpened by [slopstopper-steward]({STEWARD_URL}) for `{order.repo}`. Order `{order.id}`; "
+        f"a label `{cfg.ignore_label}` on an issue keeps the steward off it.\n"
+        f"<!-- steward:order={order.id} -->\n"
+    )
+
+
+def _red_section(heading: str, red: list[dict], tail: str = "") -> str:
+    if not red:
+        return ""
+    rows = [f"- `{r['check']}` ({r['status']})" + "".join(f"\n  - {f}" for f in r.get("failures", [])[:10]) for r in red]
+    return f"### {heading}\n\n" + "\n".join(rows) + f"\n\n{tail}"
+
+
+def _agent_section(result: AgentResult | None) -> str:
+    if not result or not result.ran:
+        return ""
+    text = f"\n**Agent ({result.outcome}, {result.category or 'n/a'}):** {result.summary}"
+    return text + (f"\n\nNotes: {result.notes}" if result.notes else "")
+
+
+def _upstream_section(result: AgentResult, cfg: Config) -> str:
+    if not result.upstream:
+        return ""
+    return ("### Looks like a slopstopper bug\n\nThe agent judged the fault to be slopstopper's. Raise it on "
+            f"`{cfg.slopstopper_repo}` with the form below, then mark the workaround with the issue number.\n\n"
+            f"<details><summary>{result.upstream.get('title', 'adopter report')}</summary>\n\n"
+            f"{result.upstream.get('body', '')}\n</details>\n\n")
+
+
+# ── upgrade / refresh ────────────────────────────────────────────────
+
+def _refresh_summary(order: Order, inv: inventory.Inventory, moved: str) -> str:
+    if order.kind == "refresh":
+        return (f"The suite on `{order.default_branch}` was written by slopstopper-cli {inv.repo.installed_from}; "
+                f"this rewrites it from the pinned {order.target}.")
+    return (f"`mise.toml` pin {moved}: `{order.pinned or 'none'}` → `{order.target}`, and `slopstopper install` "
+            f"from {order.target} rewrote the suite (workflows, shims, composite actions, skills).")
+
+
+def _settle_red(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, cli: Path,
+                red: list[dict]) -> tuple[list[dict], AgentResult | None]:
+    """Hand a red verification to the agent, then verify again."""
+    if not red or not cfg.agent_enabled:
+        return red, None
+    agent.ensure_skills(ws, order.target, cfg.slopstopper_repo)
+    result = agent.run(ws, prompts.verify(order, inv, red, cfg.slopstopper_repo), cfg, cli)
+    return (refresh.verify(ws, cli) if result.ran else red), result
+
+
+def work_refresh(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace) -> Outcome:
+    assert order.target
+    moved = refresh.set_pin(ws.path / "mise.toml", order.target)
+    cli = refresh.cli_for(order.target, ws.path / ".steward-venv", cfg.package)
+    installed = refresh.install_suite(ws, cli)
+    if installed.returncode != 0:
+        return Outcome(order.to_dict(), "failed",
+                       detail=f"slopstopper install exited {installed.returncode}: {installed.stderr.strip()[-400:]}")
+    notes = release_notes(cfg, order.pinned, order.target) if order.kind == "upgrade" else ""
+    (ws.path / ".steward-release-notes.md").write_text(notes, encoding="utf-8")
+    red, result = _settle_red(order, inv, cfg, ws, cli, refresh.verify(ws, cli))
+    if not workspace.commit(ws, f"{order.title}\n\n{order.reason}."):
+        return Outcome(order.to_dict(), "skipped", detail="nothing changed after the refresh")
+    workspace.push(ws, order.branch)
+    summary = _refresh_summary(order, inv, moved) + _agent_section(result)
+    extra = _red_section("Still red after the refresh", red, "Opened as a draft: settle these before merging.\n\n")
+    if notes:
+        extra += f"<details><summary>Release notes between the two pins</summary>\n\n{notes}\n</details>\n"
+    url = workspace.open_pr(ws, order.title, _pr_body(order, cfg, summary, extra), cfg.pr_labels, draft=bool(red))
+    return Outcome(order.to_dict(), "draft" if red else "pr", pr_url=url, red=red, agent=result.to_dict() if result else None)
+
+
+# ── triage ───────────────────────────────────────────────────────────
+
+def _triage_summary(result: AgentResult) -> str:
+    summary = f"**{result.category or 'fix'}** · {result.summary}"
+    if result.verified:
+        summary += "\n\nVerified: " + ", ".join(f"`{v}`" for v in result.verified)
+    return summary
+
+
+def _recheck(order: Order, ws: workspace.Workspace, cli: Path | None) -> list[dict]:
+    """The steward's own gate on a static finding: the named check, re-run."""
+    if not (cli and order.finding and order.finding.check and order.details.get("static")):
+        return []
+    return [r for r in refresh.verify(ws, cli) if r["check"] == order.finding.check]
+
+
+def work_triage(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace) -> Outcome:
+    assert order.finding
+    issue = gh.api(f"repos/{order.repo}/issues/{order.finding.number}") or {}
+    pinned = order.pinned or inv.latest
+    cli = refresh.cli_for(pinned, ws.path / ".steward-venv", cfg.package) if pinned else None
+    agent.ensure_skills(ws, pinned, cfg.slopstopper_repo)
+    result = agent.run(ws, prompts.triage(order, inv, issue.get("body") or "", cfg.slopstopper_repo), cfg, cli)
+    if not result.ran:
+        return Outcome(order.to_dict(), "skipped", detail=result.error, agent=result.to_dict())
+    red = _recheck(order, ws, cli)
+    if result.outcome == "skipped" or not workspace.commit(ws, f"{order.title}\n\n{result.summary or order.reason}"):
+        return Outcome(order.to_dict(), "skipped", detail=result.summary or result.error or "agent changed nothing",
+                       agent=result.to_dict())
+    workspace.push(ws, order.branch)
+    extra = _red_section(f"`{order.finding.check}` is still red on this branch", red) + _upstream_section(result, cfg)
+    if result.notes:
+        extra += f"Notes: {result.notes}\n\n"
+    draft = bool(red) or result.outcome != "fixed"
+    url = workspace.open_pr(ws, order.title, _pr_body(order, cfg, _triage_summary(result), extra), cfg.pr_labels, draft=draft)
+    return Outcome(order.to_dict(), "draft" if draft else "pr", pr_url=url, red=red, agent=result.to_dict())
+
+
+# ── the run ──────────────────────────────────────────────────────────
+
+def execute(plan: Plan, invs: list[inventory.Inventory], cfg: Config, workdir: Path | None) -> list[Outcome]:
+    by_repo = {inv.repo.full_name: inv for inv in invs}
+    base = workdir or Path(tempfile.mkdtemp(prefix="steward-"))
+    outcomes = []
+    for order in plan.orders:
+        inv = by_repo[order.repo]
+        try:
+            ws = workspace.clone(order.repo, order.default_branch, base / order.repo.replace("/", "__") / order.id)
+            workspace.branch(ws, order.branch)
+            work = work_refresh if order.kind in ("upgrade", "refresh") else work_triage
+            outcome = work(order, inv, cfg, ws)
+        except Exception as exc:  # one order's failure must not stop the run
+            outcome = Outcome(order.to_dict(), "failed", detail=f"{type(exc).__name__}: {exc}"[:600])
+        outcomes.append(outcome)
+    return outcomes
+
+
+def run(cfg: Config, only: str | None, dry_run: bool, workdir: Path | None) -> RunReport:
+    invs, targets, _ = gather(cfg, only)
+    plan = plan_all(invs, targets, cfg)
+    mode = "plan" if dry_run or cfg.mode == "plan" else "pr"
+    report = RunReport(mode, repos=[inv.to_dict() for inv in invs], deferred=[o.to_dict() for o in plan.deferred],
+                       skipped=plan.skipped)
+    if mode == "plan":
+        report.outcomes = [Outcome(o.to_dict(), "planned", detail=o.reason) for o in plan.orders]
+        return report
+    why_not = agent.available()
+    if why_not and any(o.agentic for o in plan.orders):
+        report.skipped.append({"repo": "*", "order": "agentic orders", "why": why_not})
+        plan.orders = [o for o in plan.orders if not o.agentic]
+    report.outcomes = execute(plan, invs, cfg, workdir)
+    return report
+
+
+def dumps(obj) -> str:
+    return json.dumps(obj, indent=2, default=str)

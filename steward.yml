@@ -1,0 +1,18 @@
+# What this repo's own steward run covers. Schema: steward.yml.example.
+orgs:
+  - hungovercoders
+
+mode: pr
+
+upgrade:
+  policy: latest
+  min_age_days: 2
+
+budgets:
+  repos_per_run: 5
+  prs_per_repo: 2
+  agent_usd: 5
+  agent_turns: 60
+
+agent:
+  enabled: true

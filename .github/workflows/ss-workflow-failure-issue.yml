@@ -1,0 +1,188 @@
+name: SlopStopper · Raise Issue on Workflow Failure
+
+on:
+  workflow_run:
+    workflows:
+      # This lists every check workflow plus the doc updater and the
+      # Cloudflare deploy trigger. workflow_run
+      # can't glob, so a name left out here fails on main with no issue
+      # raised. cli/tests/test_workflow_triggers.py keeps this list in step
+      # with ss-pr-summary.yml.
+      - "SlopStopper · Code Complexity Check"
+      - "SlopStopper · Hygiene - CSP Exceptions Drift Check"
+      - "SlopStopper · Hygiene - Documentation Accuracy Check"
+      - "SlopStopper · Documentation Size Monitor"
+      - "SlopStopper · Hygiene - Documentation Structure Check"
+      - "SlopStopper · Hygiene - Entry-File Budget Check"
+      - "SlopStopper · Hygiene - Privacy Statement Check"
+      - "SlopStopper · OpenAPI Drift Check"
+      - "SlopStopper · Hygiene - Auto Label PRs"
+      - "SlopStopper · Accessibility Check"
+      - "SlopStopper · API Health Check"
+      - "SlopStopper · API Latency Check"
+      - "SlopStopper · Broken Links Check"
+      - "SlopStopper · Core Web Vitals"
+      - "SlopStopper · llms.txt Check"
+      - "SlopStopper · robots.txt Check"
+      - "SlopStopper · SEO Metatag Check"
+      - "SlopStopper · sitemap Check"
+      - "SlopStopper · Reliability Smoke Tests"
+      - "SlopStopper · E2E Check"
+      - "SlopStopper · API Headers Check"
+      - "SlopStopper · DAST Analysis"
+      - "SlopStopper · SAST Analysis"
+      - "SlopStopper · Secrets Detection"
+      - "SlopStopper · Dependency Vulnerability Scan"
+      - "SlopStopper · Licence Inventory"
+      - "SlopStopper · Dependency review"
+      - "SlopStopper · Hygiene - Documentation Updater"
+      - "SlopStopper · Cloudflare Deployed Checks"
+    types:
+      - completed
+
+permissions:
+  issues: write
+
+jobs:
+  raise-issue:
+    # Only act on workflow runs that failed on main
+    if: >
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create or update issue for failed workflow run
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const workflowName = context.payload.workflow_run.name;
+            const runId = context.payload.workflow_run.id;
+            const runUrl = context.payload.workflow_run.html_url;
+            const sha = context.payload.workflow_run.head_sha;
+            const branch = context.payload.workflow_run.head_branch;
+            const label = 'workflow-failure';
+            const title = `❌ Workflow Failure: ${workflowName}`;
+
+            // Skip only if THIS workflow has already raised its own
+            // domain-specific issue. `slopstopper emit --target issue` writes
+            // `<!-- slopstopper:workflow=<file>.yml -->` into every issue body
+            // it raises in Actions, so an open Core Web Vitals issue never
+            // silences a failing Smoke Tests run, and a workflow that raises
+            // no issue of its own (the doc updater) is never silenced.
+            //
+            // An issue that links this exact run is skipped too, as a
+            // defensive fallback for bodies written without the marker.
+            //
+            // Use direct listing instead of the search API to avoid indexing
+            // delays. per_page=100 is sufficient for a template repo; add
+            // pagination if open-issue volume grows.
+            const { data: openIssues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100
+            });
+            const workflowFile = (context.payload.workflow_run.path || '').split('@')[0].split('/').pop();
+            const hasOwnMarker = (body) =>
+              Boolean(workflowFile) && Boolean(body) &&
+              body.includes(`<!-- slopstopper:workflow=${workflowFile} -->`);
+            const hasRunUrlFallback = (body) =>
+              Boolean(body) && body.includes(runUrl);
+            if (openIssues.some(issue =>
+              hasOwnMarker(issue.body) || hasRunUrlFallback(issue.body)
+            )) {
+              return;
+            }
+
+            const body = [
+              `## Workflow Failure Detected`,
+              ``,
+              `**Workflow:** ${workflowName}`,
+              `**Branch:** ${branch}`,
+              `**Commit:** [\`${sha.substring(0, 7)}\`](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/commit/${sha})`,
+              `**Run:** [#${runId}](${runUrl})`,
+              ``,
+              `The **${workflowName}** workflow failed on the \`main\` branch.`,
+              ``,
+              `[View the failed workflow run](${runUrl})`,
+              ``,
+              `---`,
+              `*This issue was automatically created by the Raise Issue on Workflow Failure workflow.*`
+            ].join('\n');
+
+            // Check for an existing open workflow-failure issue for this workflow
+            const existingIssue = openIssues.find(issue =>
+              issue.title === title && issue.labels.some(l => l.name === label)
+            );
+
+            if (existingIssue) {
+              // Issues opened before the label existed get it here, so the
+              // long-lived ones are the ones `--label slopstopper` finds too.
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existingIssue.number,
+                labels: ['slopstopper']
+              });
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existingIssue.number,
+                body: [
+                  `## New Failure`,
+                  ``,
+                  `**Time:** ${new Date().toISOString()}`,
+                  `**Commit:** [\`${sha.substring(0, 7)}\`](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/commit/${sha})`,
+                  `**Run:** [#${runId}](${runUrl})`
+                ].join('\n')
+              });
+            } else {
+              // `workflow-failure` is what this workflow finds its own issues
+              // by; `slopstopper` is what everything the suite raises carries,
+              // so `gh issue list --label slopstopper` finds these too.
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: [label, 'slopstopper']
+              });
+            }
+
+  close-issue:
+    # Close any open workflow-failure issue when the workflow passes on main
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Close issue for recovered workflow
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const workflowName = context.payload.workflow_run.name;
+            const label = 'workflow-failure';
+            const title = `❌ Workflow Failure: ${workflowName}`;
+
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: [label]
+            });
+
+            const matchingIssues = issues.filter(issue => issue.title === title);
+            for (const issue of matchingIssues) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `✅ The **${workflowName}** workflow is now passing on the \`main\` branch. Closing this issue automatically.`
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed'
+              });
+            }
