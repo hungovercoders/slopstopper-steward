@@ -14,6 +14,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from steward.checks import NEEDS_ENVIRONMENT
+
 
 @dataclass(frozen=True)
 class Surface:
@@ -56,6 +58,15 @@ SURFACES: tuple[Surface, ...] = (
             "the check listing with its `disabled` flag and workflow"),
     Surface("docs/contributing/README.md", "`profile expand <n> --json`", "execute.refresh.static_checks",
             "the workflows a profile drops: `library` is slopstopper's own list of URL-driven checks"),
+    Surface("docs/contributing/README.md", "`doctor --json`", "execute.refresh.static_checks",
+            "which external tools are missing on the runner"),
+    Surface("docs/contributing/README.md", "`needed_by`", "execute.refresh.static_checks",
+            "the check each missing tool belongs to, so that check is reported unverified instead of red"),
+    *(Surface("cli/slopstopper/checks/__init__.py", f'"{name}"', "checks.NEEDS_ENVIRONMENT",
+              "a registered check that needs the project's installed environment, which a clone lacks")
+      for name in NEEDS_ENVIRONMENT),
+    Surface("cli/slopstopper/checks/licences.py", "pip inspect", "checks.NEEDS_ENVIRONMENT",
+            "why security:licences needs an installed environment: it inventories the interpreter's packages"),
     Surface("release-please-config.json", '"include-v-in-tag": true', "execute.agent.ensure_skills",
             "release tags are v<version>, so skills can be fetched at the pinned tag"),
 )

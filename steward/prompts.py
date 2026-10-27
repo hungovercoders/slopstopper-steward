@@ -91,6 +91,8 @@ def verify(order, inv, failures: list[dict], slopstopper_repo: str) -> str:
         lines.append(f"- `{row['check']}` exit {row['exit_code']} ({row['status']})")
         for item in row.get("failures", [])[:15]:
             lines.append(f"  - {item}")
+        if not row.get("failures"):
+            lines += [f"  - report: `{path}`" for path in row.get("reports", [])]
     return VERIFY.format(
         repo=order.repo, default_branch=order.default_branch, profile=inv.profile or "ui (default)",
         branch=order.branch, pinned=order.pinned or "unpinned", target=order.target, failures="\n".join(lines),

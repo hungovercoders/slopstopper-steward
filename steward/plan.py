@@ -112,21 +112,31 @@ def _stale_suite_below_floor(inv: Inventory) -> bool:
     return behind(repo.pinned, MIN_INSTALL_VERSION) and parse(repo.installed_from) < parse(repo.pinned)  # type: ignore[operator]
 
 
-def plan_repo(inv: Inventory, target: str | None, cfg: Config) -> Plan:
-    plan = Plan()
-    candidates: list[Order] = []
+def _unworkable(inv: Inventory, target: str | None) -> list[dict]:
+    """What the repo needs that no order can do, as report rows."""
+    repo, rows = inv.repo, []
     if target and behind(target, MIN_INSTALL_VERSION):
-        plan.skipped.append({"repo": inv.repo.full_name, "order": f"upgrade-{target}",
-                             "why": f"{target} predates `slopstopper install` ({MIN_INSTALL_VERSION}+); nothing to move to yet"})
+        rows.append({"repo": repo.full_name, "order": f"upgrade-{target}",
+                     "why": f"{target} predates `slopstopper install` ({MIN_INSTALL_VERSION}+); nothing to move to yet"})
     elif _stale_suite_below_floor(inv):
-        plan.skipped.append({"repo": inv.repo.full_name, "order": f"refresh-{inv.repo.pinned}",
-                             "why": f"suite written by {inv.repo.installed_from}, but {inv.repo.pinned} has no "
-                                    f"`slopstopper install` to rewrite it ({MIN_INSTALL_VERSION}+)"})
-    for finding in inv.findings:
-        if finding.kind == "other":
-            plan.skipped.append({"repo": inv.repo.full_name, "order": f"triage-{finding.number}",
-                                 "why": f"#{finding.number} carries the label but names no check or workflow; nothing to reproduce",
-                                 "url": finding.url})
+        rows.append({"repo": repo.full_name, "order": f"refresh-{repo.pinned}",
+                     "why": f"suite written by {repo.installed_from}, but {repo.pinned} has no "
+                            f"`slopstopper install` to rewrite it ({MIN_INSTALL_VERSION}+)"})
+    for finding in inv.untrusted:
+        rows.append({"repo": repo.full_name, "order": f"triage-{finding.number}",
+                     "why": f"#{finding.number} carries a slopstopper marker but no label, and {finding.author or 'a person'} "
+                            "opened it, not a bot; add the `slopstopper` label to have it worked",
+                     "url": finding.url})
+    for finding in (f for f in inv.findings if f.kind == "other"):
+        rows.append({"repo": repo.full_name, "order": f"triage-{finding.number}",
+                     "why": f"#{finding.number} carries the label but names no check or workflow; nothing to reproduce",
+                     "url": finding.url})
+    return rows
+
+
+def plan_repo(inv: Inventory, target: str | None, cfg: Config) -> Plan:
+    plan = Plan(skipped=_unworkable(inv, target))
+    candidates: list[Order] = []
     upgrade = _upgrade_order(inv, target)
     if upgrade:
         candidates.append(upgrade)

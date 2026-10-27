@@ -1,23 +1,12 @@
-"""Which checks the steward can verify inside a clone.
+"""What a clone cannot verify, beyond what the pinned CLI reports.
 
-The set is asked of the pinned CLI, not written here: `slopstopper profile
-expand library --json` names every workflow the `library` profile drops,
-which is slopstopper's own definition of "needs a deployed surface", and
-`checks list --json` says which of the rest this repo keeps. Two things
-the steward does know about its own situation live here: a clone has no
-installed project environment, so a check that inventories one cannot run
-(the workflow for it installs the project first); and an older CLI without
-`profile expand` gets the hygiene set as a fallback.
+Everything else is asked of the pinned CLI at run time (`checks list`,
+`profile expand library`, `doctor`; see `execute/refresh.static_checks`).
+The one thing the CLI does not say is which checks inventory the project's
+*installed* dependency environment, which a fresh clone does not have
+(their workflows install the project first). Each name here is a row in
+`steward/contract.py`, so the contract test fails the day slopstopper
+renames one or changes why it needs an environment.
 """
 
-# Checks that need the project's resolved dependency environment, which CI
-# builds and a bare clone has not. `security:licences` reads `pip inspect`
-# of an interpreter holding the project's dependencies.
 NEEDS_ENVIRONMENT = ("security:licences",)
-
-# When the pinned CLI cannot say (no `profile expand --json`): the checks
-# that read the tree alone and apply to every repo shape.
-FALLBACK_STATIC = (
-    "hygiene:complexity", "hygiene:docs-accuracy", "hygiene:docs-size", "hygiene:docs-structure",
-    "hygiene:entry-files", "hygiene:csp-exceptions", "hygiene:privacy",
-)

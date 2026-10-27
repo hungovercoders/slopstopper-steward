@@ -55,6 +55,7 @@ class Inventory:
     latest: str | None
     profile: str | None = None
     findings: list[Finding] = field(default_factory=list)
+    untrusted: list[Finding] = field(default_factory=list)  # marker, no label, a person opened it
     disabled_workflows: list[dict] = field(default_factory=list)
     open_orders: dict[str, dict] = field(default_factory=dict)  # order id -> {number, url}
     skills_present: bool = False
@@ -63,6 +64,7 @@ class Inventory:
         return {
             **self.repo.to_dict(), "latest": self.latest, "profile": self.profile,
             "findings": [f.to_dict() for f in self.findings],
+            "untrusted": [f.to_dict() for f in self.untrusted],
             "disabled_workflows": self.disabled_workflows, "open_orders": self.open_orders,
             "skills_present": self.skills_present,
         }
@@ -107,18 +109,26 @@ def read_profile(slopstopper_yml: str | None) -> str | None:
     return match.group(1) if match else None
 
 
-def _findings(repo: Repo, cfg: Config) -> list[Finding]:
-    """Every open issue, not only the labelled ones: `emit` falls back to an
-    unlabelled issue when a repo refuses labels, and the body marker is
-    then the only thing that says it is slopstopper's."""
-    out = []
+def _findings(repo: Repo, cfg: Config) -> tuple[list[Finding], list[Finding]]:
+    """(findings, untrusted). Every open issue is read, not only the labelled
+    ones: `emit` falls back to an unlabelled issue when a repo refuses labels,
+    and the body marker is then the only thing that says it is slopstopper's.
+    A marker on an unlabelled issue a person opened (a workflow running `emit`
+    under a PAT, or anyone typing the marker) is kept apart as untrusted: the
+    report lists it, the agent never reads it."""
+    out: list[Finding] = []
+    untrusted: list[Finding] = []
     for issue in gh.api(f"repos/{repo.full_name}/issues?state=open&per_page=100", paginate=True) or []:
         if "pull_request" in issue:
             continue
         finding = classify(issue)
-        if cfg.ignore_label not in finding.labels and _is_slopstoppers(finding):
+        if cfg.ignore_label in finding.labels:
+            continue
+        if _is_slopstoppers(finding):
             out.append(finding)
-    return out
+        elif finding.kind in ("check", "workflow-failure"):
+            untrusted.append(finding)
+    return out, untrusted
 
 
 def _disabled_workflows(repo: Repo) -> list[dict]:
@@ -142,7 +152,7 @@ def take(repo: Repo, latest: str | None, cfg: Config) -> Inventory:
     inv = Inventory(repo, latest)
     inv.profile = read_profile(gh.contents(repo.full_name, ".slopstopper.yml", repo.default_branch))
     inv.skills_present = gh.contents(repo.full_name, TRIAGE_SKILL, repo.default_branch) is not None
-    inv.findings = _findings(repo, cfg)
+    inv.findings, inv.untrusted = _findings(repo, cfg)
     inv.disabled_workflows = _disabled_workflows(repo)
     inv.open_orders = _open_orders(repo)
     return inv

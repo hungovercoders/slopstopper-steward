@@ -19,10 +19,11 @@ class Outcome:
     detail: str = ""
     agent: dict | None = None
     red: list[dict] = field(default_factory=list)
+    unverified: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {"order": self.order, "status": self.status, "pr_url": self.pr_url, "detail": self.detail,
-                "agent": self.agent, "red": self.red}
+                "agent": self.agent, "red": self.red, "unverified": self.unverified}
 
 
 @dataclass

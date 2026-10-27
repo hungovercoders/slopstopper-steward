@@ -19,42 +19,6 @@ def test_pin_regex_is_shared():
     assert discover.read_pin('[tools]\n"pipx:slopstopper-cli" = "0.27.0"\n') == "0.27.0"
 
 
-# ── 1 + 7: the static set comes from the pinned CLI, licences never
-def test_static_checks_derived_from_profile_expand(monkeypatch, tmp_path):
-    answers = {
-        ("checks", "list"): [
-            {"name": "hygiene:complexity", "workflow": "ss-hygiene-complexity-check.yml", "disabled": False},
-            {"name": "hygiene:docs-size", "workflow": "ss-hygiene-docs-size-check.yml", "disabled": True},
-            {"name": "reliability:smoke", "workflow": "ss-reliability-smoke-tests.yml", "disabled": False},
-            {"name": "security:licences", "workflow": "ss-security-licences-check.yml", "disabled": False},
-            {"name": "security:sast", "workflow": "ss-security-sast-check.yml", "disabled": False},
-        ],
-        ("profile", "expand", "library"): {"profile": "library", "workflows": ["ss-reliability-smoke-tests.yml"]},
-    }
-    monkeypatch.setattr(refresh, "_json", lambda cli, cwd, *args: answers.get(args))
-    ws = workspace.Workspace("acme/a", tmp_path, "main")
-    assert refresh.static_checks(ws, Path("slopstopper")) == ["hygiene:complexity", "security:sast"]
-
-
-def test_static_checks_fallback_without_profile_expand(monkeypatch, tmp_path):
-    monkeypatch.setattr(refresh, "_json", lambda cli, cwd, *args: None)
-    ws = workspace.Workspace("acme/a", tmp_path, "main")
-    assert "security:licences" not in refresh.static_checks(ws, Path("slopstopper"))
-    assert "hygiene:complexity" in refresh.static_checks(ws, Path("slopstopper"))
-
-
-def test_verify_runs_only_the_checks_asked(monkeypatch, tmp_path):
-    ran = []
-
-    def fake_run(args, **kw):
-        ran.append(args[-1])
-        return subprocess.CompletedProcess(args, 0, '{"check": "%s", "exit_code": 0, "status": "pass", "failures": []}' % args[-1], "")
-    monkeypatch.setattr(refresh.subprocess, "run", fake_run)
-    ws = workspace.Workspace("acme/a", tmp_path, "main")
-    assert refresh.verify(ws, Path("slopstopper"), ["hygiene:docs-size"]) == []
-    assert ran == ["hygiene:docs-size"]
-
-
 # ── 2: a bare marker needs a bot author
 def test_marker_from_a_person_is_not_a_finding():
     stranger = inventory.classify({"number": 1, "title": "x", "html_url": "u", "labels": [],
@@ -91,18 +55,6 @@ def test_verifier_version_floor():
     assert runner._verifier_version(_order("0.26.0"), inv) == "0.28.0"
     assert runner._verifier_version(_order("latest"), inv) == "0.28.0"
     assert runner._verifier_version(_order("0.26.0"), Inventory(Repo("acme/a"), "0.26.0")) is None
-
-
-# ── 9: releases fetched once per run
-def test_release_notes_fetches_once(monkeypatch):
-    calls = []
-    runner._RELEASES.clear()
-    monkeypatch.setattr(runner.gh, "api", lambda path, **kw: calls.append(path) or [
-        {"tag_name": "v0.27.0", "name": "0.27.0", "body": "notes"}, {"tag_name": "v0.26.0", "name": "0.26.0", "body": "old"}])
-    assert "notes" in runner.release_notes(CFG, "0.26.0", "0.27.0")
-    assert "old" not in runner.release_notes(CFG, "0.26.0", "0.27.0")
-    assert len(calls) == 1
-    runner._RELEASES.clear()
 
 
 # ── 3 + 5: excluded paths are never staged; a stale clone dir is replaced

@@ -17,6 +17,14 @@ def test_triage_prompt_names_skill_issue_and_result_file():
         assert needle in text
 
 
+def test_verify_prompt_points_at_reports_when_no_bullets():
+    order, inv = _order()
+    order.kind, order.target, order.pinned = "upgrade", "0.27.0", "0.24.0"
+    text = prompts.verify(order, inv, [{"check": "hygiene:entry-files", "exit_code": 1, "status": "fail", "failures": [],
+                                        "reports": [".ss/reports/entry-files/entry-file-size-report.md"]}], "hungovercoders/slopstopper")
+    assert "report: `.ss/reports/entry-files/entry-file-size-report.md`" in text
+
+
 def test_verify_prompt_lists_failures():
     order, inv = _order()
     order.kind, order.target, order.pinned = "upgrade", "0.26.0", "0.24.0"

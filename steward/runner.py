@@ -27,18 +27,13 @@ def gather(cfg: Config, only: str | None = None) -> tuple[list[inventory.Invento
     return invs, targets, latest
 
 
-_RELEASES: dict[str, list] = {}
-
-
-def _releases(repo: str) -> list:
-    """slopstopper's release list, fetched once per run."""
-    if repo not in _RELEASES:
-        _RELEASES[repo] = gh.api(f"repos/{repo}/releases?per_page=100", paginate=True) or []
-    return _RELEASES[repo]
-
-
-def release_notes(cfg: Config, pinned: str | None, target: str) -> str:
-    rows = _releases(cfg.slopstopper_repo)
+def release_notes(cfg: Config, pinned: str | None, target: str, cache: dict) -> str:
+    """The notes between two pins. `cache` belongs to one run (`execute`
+    creates it), so the release list is fetched once per run and never
+    outlives it."""
+    if cfg.slopstopper_repo not in cache:
+        cache[cfg.slopstopper_repo] = gh.api(f"repos/{cfg.slopstopper_repo}/releases?per_page=100", paginate=True) or []
+    rows = cache[cfg.slopstopper_repo]
     lo, hi = versions.parse(pinned), versions.parse(target)
     picked = []
     for r in rows:
@@ -60,10 +55,16 @@ def _pr_body(order: Order, cfg: Config, summary: str, extra: str = "") -> str:
     )
 
 
+def _evidence(verdict: dict) -> list[str]:
+    """The verdict's failure bullets, or the reports it wrote when the check
+    lists none (some reports carry their findings under headings instead)."""
+    return list(verdict.get("failures") or []) or [f"report: `{p}`" for p in verdict.get("reports") or []]
+
+
 def _red_section(heading: str, red: list[dict], tail: str = "") -> str:
     if not red:
         return ""
-    rows = [f"- `{r['check']}` ({r['status']})" + "".join(f"\n  - {f}" for f in r.get("failures", [])[:10]) for r in red]
+    rows = [f"- `{r['check']}` ({r['status']})" + "".join(f"\n  - {f}" for f in _evidence(r)[:10]) for r in red]
     return f"### {heading}\n\n" + "\n".join(rows) + f"\n\n{tail}"
 
 
@@ -93,17 +94,36 @@ def _refresh_summary(order: Order, inv: inventory.Inventory, moved: str) -> str:
             f"from {order.target} rewrote the suite (workflows, shims, composite actions, skills).")
 
 
+def _verify_pass(ws: workspace.Workspace, cli: Path) -> tuple[list[dict], list[dict]]:
+    """One verification pass: list once, run what is runnable. Returns (red, unverified)."""
+    checks = refresh.static_checks(ws, cli)
+    return refresh.verify(ws, cli, checks.runnable), checks.unverified
+
+
 def _settle_red(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, cli: Path,
-                red: list[dict]) -> tuple[list[dict], AgentResult | None]:
-    """Hand a red verification to the agent, then verify again."""
+                red: list[dict], unverified: list[dict]) -> tuple[list[dict], list[dict], AgentResult | None]:
+    """Hand a red verification to the agent, then verify again. The second
+    pass lists the checks again on purpose: the verify brief allows the
+    agent to switch a check off through `workflows.disabled`, which changes
+    what the repo keeps."""
     if not red or not cfg.agent_enabled:
-        return red, None
+        return red, unverified, None
     agent.ensure_skills(ws, order.target, cfg.slopstopper_repo)
     result = agent.run(ws, prompts.verify(order, inv, red, cfg.slopstopper_repo), cfg, cli)
-    return (refresh.verify(ws, cli) if result.ran else red), result
+    if not result.ran:
+        return red, unverified, result
+    red, unverified = _verify_pass(ws, cli)
+    return red, unverified, result
 
 
-def work_refresh(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace) -> Outcome:
+def _unverified_section(unverified: list[dict]) -> str:
+    if not unverified:
+        return ""
+    rows = "\n".join(f"- `{u['check']}`: {u['why']}" for u in unverified)
+    return f"### Not verified by the steward\n\n{rows}\n\nThis PR's own `ss-*` workflows run them.\n\n"
+
+
+def work_refresh(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, cache: dict) -> Outcome:
     assert order.target
     moved = refresh.set_pin(ws.path / "mise.toml", order.target)
     cli = refresh.cli_for(order.target, ws.path / ".steward-venv", cfg.package)
@@ -111,18 +131,20 @@ def work_refresh(order: Order, inv: inventory.Inventory, cfg: Config, ws: worksp
     if installed.returncode != 0:
         return Outcome(order.to_dict(), "failed",
                        detail=f"slopstopper install exited {installed.returncode}: {installed.stderr.strip()[-400:]}")
-    notes = release_notes(cfg, order.pinned, order.target) if order.kind == "upgrade" else ""
+    notes = release_notes(cfg, order.pinned, order.target, cache) if order.kind == "upgrade" else ""
     (ws.path / ".steward-release-notes.md").write_text(notes, encoding="utf-8")
-    red, result = _settle_red(order, inv, cfg, ws, cli, refresh.verify(ws, cli))
+    red, unverified, result = _settle_red(order, inv, cfg, ws, cli, *_verify_pass(ws, cli))
     if not workspace.commit(ws, f"{order.title}\n\n{order.reason}."):
         return Outcome(order.to_dict(), "skipped", detail="nothing changed after the refresh")
     workspace.push(ws, order.branch)
     summary = _refresh_summary(order, inv, moved) + _agent_section(result)
     extra = _red_section("Still red after the refresh", red, "Opened as a draft: settle these before merging.\n\n")
+    extra += _unverified_section(unverified)
     if notes:
         extra += f"<details><summary>Release notes between the two pins</summary>\n\n{notes}\n</details>\n"
     url = workspace.open_pr(ws, order.title, _pr_body(order, cfg, summary, extra), cfg.pr_labels, draft=bool(red))
-    return Outcome(order.to_dict(), "draft" if red else "pr", pr_url=url, red=red, agent=result.to_dict() if result else None)
+    return Outcome(order.to_dict(), "draft" if red else "pr", pr_url=url, red=red, unverified=unverified,
+                   agent=result.to_dict() if result else None)
 
 
 # ── triage ───────────────────────────────────────────────────────────
@@ -134,13 +156,16 @@ def _triage_summary(result: AgentResult) -> str:
     return summary
 
 
-def _recheck(order: Order, ws: workspace.Workspace, cli: Path) -> list[dict]:
-    """The steward's own gate on a finding: the named check, re-run, when it
-    is one a clone can run at all."""
+def _recheck(order: Order, ws: workspace.Workspace, cli: Path) -> tuple[list[dict], list[dict]]:
+    """The steward's own gate on a finding: the named check, re-run when a
+    clone can run it, else reported as unverified. Returns (red, unverified)."""
     check = order.finding.check if order.finding else None
-    if not check or check not in refresh.static_checks(ws, cli):
-        return []
-    return refresh.verify(ws, cli, [check])
+    if not check:
+        return [], []
+    checks = refresh.static_checks(ws, cli)
+    if check in checks.runnable:
+        return refresh.verify(ws, cli, [check]), []
+    return [], [u for u in checks.unverified if u["check"] == check]
 
 
 def _verifier_version(order: Order, inv: inventory.Inventory) -> str | None:
@@ -153,7 +178,7 @@ def _verifier_version(order: Order, inv: inventory.Inventory) -> str | None:
     return None
 
 
-def work_triage(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace) -> Outcome:
+def work_triage(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, cache: dict) -> Outcome:
     assert order.finding
     version = _verifier_version(order, inv)
     if not version:
@@ -165,17 +190,19 @@ def work_triage(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspa
     result = agent.run(ws, prompts.triage(order, inv, issue.get("body") or "", cfg.slopstopper_repo), cfg, cli)
     if not result.ran:
         return Outcome(order.to_dict(), "skipped", detail=result.error, agent=result.to_dict())
-    red = _recheck(order, ws, cli)
+    red, unverified = _recheck(order, ws, cli)
     if result.outcome == "skipped" or not workspace.commit(ws, f"{order.title}\n\n{result.summary or order.reason}"):
         return Outcome(order.to_dict(), "skipped", detail=result.summary or result.error or "agent changed nothing",
                        agent=result.to_dict())
     workspace.push(ws, order.branch)
     extra = _red_section(f"`{order.finding.check}` is still red on this branch", red) + _upstream_section(result, cfg)
+    extra += _unverified_section(unverified)
     if result.notes:
         extra += f"Notes: {result.notes}\n\n"
     draft = bool(red) or result.outcome != "fixed"
     url = workspace.open_pr(ws, order.title, _pr_body(order, cfg, _triage_summary(result), extra), cfg.pr_labels, draft=draft)
-    return Outcome(order.to_dict(), "draft" if draft else "pr", pr_url=url, red=red, agent=result.to_dict())
+    return Outcome(order.to_dict(), "draft" if draft else "pr", pr_url=url, red=red, unverified=unverified,
+                   agent=result.to_dict())
 
 
 # ── the run ──────────────────────────────────────────────────────────
@@ -183,6 +210,7 @@ def work_triage(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspa
 def execute(plan: Plan, invs: list[inventory.Inventory], cfg: Config, workdir: Path | None) -> list[Outcome]:
     by_repo = {inv.repo.full_name: inv for inv in invs}
     base = workdir or Path(tempfile.mkdtemp(prefix="steward-"))
+    cache: dict = {}  # this run's lookups shared across orders (the release list)
     outcomes = []
     for order in plan.orders:
         inv = by_repo[order.repo]
@@ -190,7 +218,7 @@ def execute(plan: Plan, invs: list[inventory.Inventory], cfg: Config, workdir: P
             ws = workspace.clone(order.repo, order.default_branch, base / order.repo.replace("/", "__") / order.id)
             workspace.branch(ws, order.branch)
             work = work_refresh if order.kind in ("upgrade", "refresh") else work_triage
-            outcome = work(order, inv, cfg, ws)
+            outcome = work(order, inv, cfg, ws, cache)
         except Exception as exc:  # one order's failure must not stop the run
             outcome = Outcome(order.to_dict(), "failed", detail=f"{type(exc).__name__}: {exc}"[:600])
         outcomes.append(outcome)

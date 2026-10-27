@@ -47,6 +47,10 @@ this table is stale.
 | `docs/contributing/README.md` | `\`run --json <check>\`` | `execute.refresh.verify` | the machine-readable run verdict: {check, exit_code, status, failures, reports} |
 | `docs/contributing/README.md` | `\`checks list --json\`` | `execute.refresh.static_checks` | the check listing with its `disabled` flag and workflow |
 | `docs/contributing/README.md` | `\`profile expand <n> --json\`` | `execute.refresh.static_checks` | the workflows a profile drops: `library` is slopstopper's own list of URL-driven checks |
+| `docs/contributing/README.md` | `\`doctor --json\`` | `execute.refresh.static_checks` | which external tools are missing on the runner |
+| `docs/contributing/README.md` | `\`needed_by\`` | `execute.refresh.static_checks` | the check each missing tool belongs to, so that check is reported unverified instead of red |
+| `cli/slopstopper/checks/__init__.py` | `"security:licences"` | `checks.NEEDS_ENVIRONMENT` | a registered check that needs the project's installed environment, which a clone lacks |
+| `cli/slopstopper/checks/licences.py` | `pip inspect` | `checks.NEEDS_ENVIRONMENT` | why security:licences needs an installed environment: it inventories the interpreter's packages |
 | `release-please-config.json` | `"include-v-in-tag": true` | `execute.agent.ensure_skills` | release tags are v<version>, so skills can be fetched at the pinned tag |
 <!-- contract:end -->
 

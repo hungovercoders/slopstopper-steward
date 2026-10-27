@@ -90,9 +90,12 @@ flowchart TB
    to merge or close rather than opening a second one beside it.
 5. **verify** asks the pinned CLI which checks a clone can run: what
    `checks list --json` says the repo keeps, minus what `profile expand
-   library --json` says needs a deployed surface, minus `security:licences`,
-   which inventories an installed environment the clone does not have (its
-   workflow installs the project first). Exit 2 counts as red.
+   library --json` says needs a deployed surface. A check whose tool
+   `doctor --json` reports missing on the steward's runner, or one listed
+   in `steward/checks.py` as needing an installed environment (each pinned
+   by a contract row), is reported in the PR as "not verified by the
+   steward" rather than run, since its exit 2 would say nothing about the
+   change; the PR's own `ss-*` workflows run it. Any other exit 2 is red.
 6. **report** writes `.steward/reports/run.{md,json}` and the Actions job
    summary.
 ## Where the agent is boxed
