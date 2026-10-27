@@ -118,7 +118,7 @@ def test_excluded_paths_survive_a_gitignore_negation(tmp_path):
     (repo / "README.md").write_text("# r\n")
     _git(repo, "add", "-A")
     _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init")
-    ws = workspace.Workspace("acme/r", repo, "main")
+    ws = workspace.prepare(workspace.Workspace("acme/r", repo, "main"))  # the identity a clone gets
     ws.excluded.append(".claude/skills/slopstopper-triage")
     skill = repo / ".claude" / "skills" / "slopstopper-triage"
     skill.mkdir(parents=True)
