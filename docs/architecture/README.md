@@ -128,12 +128,23 @@ it can fail.
    from a venv outside the clone, in the same stripped environment as the
    agent, so even a tampered tree cannot reach the token through it.
 
-What is left: something the agent wrote can still make the steward's own
-verification read green (for instance by overwriting the venv's files
-through a path the deny rules do not cover). That costs a ready PR
-instead of a draft, never the token, and the PR's own `ss-*` workflows
-run every check again on GitHub. Treat the steward's verification as
-advisory and the PR's CI as the gate.
+4. **Who the agent is.** With `STEWARD_AGENT_USER` set (the run workflow
+   creates `steward-agent` and sets it), the agent runs as that OS user in
+   its own copy of the clone (`steward/isolation.py`). The steward's
+   clone, `.git` and venvs are not writable by it and the steward's
+   process environment is not readable by it, so nothing it executes can
+   fake the steward's verification or reach the token. Afterwards the
+   steward copies back regular files and symlinks that stay inside the
+   repo; a symlink pointing out of it (which the steward's own check runs
+   would follow, for instance to another process's `/proc` environment), a
+   FIFO or a device is refused and named in the PR.
+
+Without `STEWARD_AGENT_USER` (a local run, typically) layers 1 to 3 still
+hold, and the agent shares the steward's OS user. Something it writes
+could then make the steward's own verification read green: that costs a
+ready PR instead of a draft, never the token, and the PR's own `ss-*`
+workflows run every check again on GitHub. Set the variable wherever the
+steward runs unattended.
 
 The rest of the brief:
 

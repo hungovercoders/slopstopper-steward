@@ -52,6 +52,16 @@ is still opened, unlabelled.
 
 ## 3. The agent
 
+On Actions the agent runs as its own OS user: the run workflow creates
+`steward-agent` and sets `STEWARD_AGENT_USER`, so it cannot touch the
+steward's clone, venvs or token. Running the steward unattended anywhere
+else, do the same: create an unprivileged user, give the steward's
+account passwordless `sudo -u` to it, install the `claude` CLI where that
+user can run it (`/usr/local/bin`), and export `STEWARD_AGENT_USER`. A
+`--workdir` must then be traversable by that user. With the variable set
+but `sudo` refused, agentic orders are skipped with the reason rather
+than run unisolated.
+
 The agentic orders (a finding to triage, a red check after an upgrade)
 run Claude Code headless. Add the secret `ANTHROPIC_API_KEY` (or a
 `CLAUDE_CODE_OAUTH_TOKEN`). Without it, upgrades still run and findings

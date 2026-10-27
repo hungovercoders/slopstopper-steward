@@ -30,11 +30,14 @@ jobs:
         run: pip install -q -e ".[test]"
       - name: Fetch slopstopper main for the contract test
         run: git clone --depth 1 https://github.com/hungovercoders/slopstopper "$RUNNER_TEMP/slopstopper"
-      - name: pytest (unit + contract + the executor end to end from slopstopper's main)
+      - name: A separate user for the agent-isolation test
+        run: sudo useradd --system --no-create-home --shell /usr/sbin/nologin steward-agent
+      - name: pytest (unit + contract + the executor end to end + the agent as its own user)
         env:
           SLOPSTOPPER_SRC: ${{ runner.temp }}/slopstopper
           STEWARD_E2E: '1'
           STEWARD_E2E_SOURCE: ${{ runner.temp }}/slopstopper/cli
+          STEWARD_TEST_AGENT_USER: steward-agent
         run: pytest
       - name: Contract table in the docs is current
         run: python scripts/contract_doc.py --check

@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
-from steward import gh, sandbox
+from steward import gh, isolation, sandbox
 from steward.config import Config
 from steward.prompts import RESULT_FILE
 from steward.workspace import Workspace, guarded_git_dir
@@ -74,7 +74,8 @@ def available() -> str | None:
         return "claude CLI not on PATH"
     if not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")):
         return "no ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN"
-    return None
+    user = isolation.agent_user()
+    return isolation.unavailable(user) if user else None
 
 
 def ensure_skills(ws: Workspace, pinned: str | None, slopstopper_repo: str) -> str:
@@ -174,12 +175,17 @@ def run(ws: Workspace, prompt: str, cfg: Config, cli_bin: Path | None = None, ti
     (ws.path / ".steward-prompt.md").write_text(prompt, encoding="utf-8")
     result_path = ws.path / RESULT_FILE
     result_path.unlink(missing_ok=True)
+    argv, user, rejected = _command(prompt, cfg, protect), isolation.agent_user(), []
     try:
-        with guarded_git_dir(ws), sandbox.scratch_home("steward-agent-home-") as home:
-            proc = subprocess.run(_command(prompt, cfg, protect), cwd=ws.path, capture_output=True, text=True,
-                                  env=environment(cli_bin, home=home), timeout=timeout)
+        with guarded_git_dir(ws):
+            if user:
+                proc = _run_isolated(user, ws, argv, cli_bin, timeout, rejected)
+            else:
+                with sandbox.scratch_home("steward-agent-home-") as home:
+                    proc = subprocess.run(argv, cwd=ws.path, capture_output=True, text=True,
+                                          env=environment(cli_bin, home=home), timeout=timeout)
     except subprocess.TimeoutExpired:
-        return AgentResult(True, error=f"agent timed out after {timeout} s")
+        return AgentResult(True, error=f"agent timed out after {timeout} s", notes=_rejected_note(rejected))
     meta = _meta(proc.stdout)
     out = AgentResult(True, cost_usd=meta.get("total_cost_usd"), turns=meta.get("num_turns"))
     if result_path.is_file():
@@ -188,4 +194,32 @@ def run(ws: Workspace, prompt: str, cfg: Config, cli_bin: Path | None = None, ti
     else:
         out.outcome = "partial" if ws.dirty() else "skipped"
         out.error = (meta.get("result") or proc.stderr.strip()[-500:] or "agent left no result file")[:500]
+    out.notes = " ".join(n for n in (out.notes, _rejected_note(rejected)) if n)
     return out
+
+
+# What the steward keeps for itself in the clone: never copied back from the
+# agent's tree, never removed because the agent's tree lacks it.
+STEWARD_FILES = (".steward-prompt.md", RESULT_FILE, ".steward-release-notes.md")
+
+
+def _run_isolated(user: str, ws: Workspace, argv: list[str], cli_bin: Path | None, timeout: int,
+                  rejected: list[str]) -> subprocess.CompletedProcess:
+    """The agent as `user`, in its own copy of the clone. Whatever happens,
+    its work is copied back before the copy is removed, so a timeout keeps
+    what it did the same way an in-place run does."""
+    with isolation.copy_for(user, ws.path) as iso:
+        env = environment(None, home=iso.home)
+        try:
+            return subprocess.run(isolation.command(iso, argv, env, cli_bin.parent if cli_bin else None),
+                                  cwd=ws.path, capture_output=True, text=True, env=env, timeout=timeout)
+        finally:
+            synced = isolation.sync_back(iso.tree, ws.path, skip=(*STEWARD_FILES, *ws.excluded))
+            rejected += synced.rejected
+            result = iso.tree / RESULT_FILE
+            if result.is_file() and not result.is_symlink():
+                shutil.copyfile(result, ws.path / RESULT_FILE)
+
+
+def _rejected_note(rejected: list[str]) -> str:
+    return ("The steward did not copy back from the agent's tree: " + "; ".join(rejected) + ".") if rejected else ""

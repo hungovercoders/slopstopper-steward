@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from steward import discover, gh, inventory, prompts, versions, workspace
+from steward import discover, gh, inventory, isolation, prompts, versions, workspace
 from steward.config import Config
 from steward.execute import agent, refresh
 from steward.execute.agent import AgentResult
@@ -273,6 +273,8 @@ def execute(plan: Plan, invs: list[inventory.Inventory], cfg: Config, workdir: P
     by_repo = {inv.repo.full_name: inv for inv in invs}
     own_base = workdir is None
     ctx = RunContext(base=workdir or Path(tempfile.mkdtemp(prefix="steward-")), deadline=_deadline())
+    if own_base and isolation.agent_user():
+        ctx.base.chmod(0o755)  # mkdtemp is 0700; the agent user reads the venvs and copies its clone from here
     outcomes = []
     try:
         for order in plan.orders:

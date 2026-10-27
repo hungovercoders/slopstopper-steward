@@ -45,6 +45,8 @@ jobs:
     steps:
       - name: Checkout the steward
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -103,6 +105,8 @@ jobs:
     steps:
       - name: Checkout the steward
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -112,10 +116,17 @@ jobs:
       - name: Set up the mise-pinned toolchain (task, node)
         uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
 
-      - name: Install the steward and the agent CLI
+      - name: Install the steward, the agent CLI, and the agent's own user
+        # The agent runs as `steward-agent`, which cannot write the steward's
+        # clone, .git or venvs, nor read its environment (the push token).
+        # Its CLI is installed system-wide (sudo's PATH, the system node) so
+        # that user can run it; the steward finds it in /usr/local/bin too.
+        # Docs: docs/architecture/README.md, "Where the agent is boxed".
         run: |
           pip install -q .
-          npm install -g @anthropic-ai/claude-code
+          sudo npm install -g @anthropic-ai/claude-code
+          sudo useradd --system --no-create-home --shell /usr/sbin/nologin steward-agent
+          echo "STEWARD_AGENT_USER=steward-agent" >> "$GITHUB_ENV"
           steward --version
           claude --version
 
