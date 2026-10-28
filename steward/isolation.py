@@ -262,7 +262,9 @@ def _unpack(stream, into: Path) -> list[str]:
             rejected.append(f"{member.name}: {exc}")
             return None
 
-    with tarfile.open(fileobj=stream, mode="r|") as archive:
+    # Every member passes `keep`, tarfile's `data` filter (no absolute paths, nothing outside
+    # `into`, no special files); the rule does not see `filter=`.
+    with tarfile.open(fileobj=stream, mode="r|") as archive:  # nosemgrep: trailofbits.python.tarfile-extractall-traversal.tarfile-extractall-traversal
         archive.extractall(into, filter=keep)
     return rejected
 
