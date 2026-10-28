@@ -156,16 +156,23 @@ def _meta(stdout: str) -> dict:
 
 
 def _read_result(raw: bytes, out: AgentResult) -> None:
+    """The agent's result, which is the agent's to write: anything but the
+    shape the brief asks for reads as partial, never as a crash."""
     try:
         data = json.loads(raw.decode("utf-8"))
     except ValueError as exc:
         out.outcome, out.error = "partial", f"result file unreadable: {exc}"
         return
+    if not isinstance(data, dict):
+        out.outcome, out.error = "partial", f"result file holds a JSON {type(data).__name__}, not an object"
+        return
     out.outcome = str(data.get("outcome") or "partial")
     out.summary = str(data.get("summary") or "")
     out.category = str(data.get("category") or "")
-    out.verified = [str(v) for v in data.get("verified") or []]
-    out.upstream = data.get("upstream") or None
+    verified = data.get("verified") or []
+    out.verified = [str(v) for v in verified] if isinstance(verified, list) else [str(verified)]
+    upstream = data.get("upstream")
+    out.upstream = upstream if isinstance(upstream, dict) and upstream else None
     out.notes = str(data.get("notes") or "")
 
 
@@ -184,14 +191,9 @@ def run(ws: Workspace, prompt: str, cfg: Config, cli_bin: Path | None = None, ti
     (ws.path / ".steward-prompt.md").write_text(prompt, encoding="utf-8")
     result_path = ws.path / RESULT_FILE
     result_path.unlink(missing_ok=True)
-    argv, user, rejected = _command(prompt, cfg, protect), isolation.agent_user(), []
+    argv, rejected = _command(prompt, cfg, protect), []
     try:
-        with guarded_git_dir(ws):
-            if user:
-                proc = _run_isolated(user, ws, argv, cli_bin, timeout, rejected, checked)
-            else:
-                with sandbox.scratch_home("steward-agent-home-") as home:
-                    proc = _run_to_files(argv, ws.path, environment(cli_bin, home=home), timeout, own_group=True)
+        proc, raw = _launch(ws, argv, cli_bin, timeout, rejected, checked)
     except subprocess.TimeoutExpired:
         return AgentResult(True, error=f"agent timed out after {timeout} s", notes=_rejected_note(rejected))
     except isolation.SetupError as exc:
@@ -203,10 +205,8 @@ def run(ws: Workspace, prompt: str, cfg: Config, cli_bin: Path | None = None, ti
                            notes=_rejected_note(rejected))
     meta = _meta(proc.stdout)
     out = AgentResult(True, cost_usd=meta.get("total_cost_usd"), turns=meta.get("num_turns"))
-    raw = _result_bytes(ws.path, rejected)
     if raw is not None:
         _read_result(raw, out)
-        result_path.unlink()
     else:
         out.outcome = "partial" if ws.dirty() else "skipped"
         out.error = (meta.get("result") or proc.stderr.strip()[-500:] or "agent left no result file")[:500]
@@ -216,6 +216,23 @@ def run(ws: Workspace, prompt: str, cfg: Config, cli_bin: Path | None = None, ti
     return out
 
 
+def _launch(ws: Workspace, argv: list[str], cli_bin: Path | None, timeout: int, rejected: list[str],
+            checked: set[Path] | None) -> tuple[subprocess.CompletedProcess, bytes | None]:
+    """Run the agent, isolated or in place, and return its process and its
+    result file's bytes (None without a regular one). In place, the result
+    file is read and removed from the clone; isolated, it never lands there."""
+    user = isolation.agent_user()
+    with guarded_git_dir(ws):
+        if user:
+            return _run_isolated(user, ws, argv, cli_bin, timeout, rejected, checked)
+        with sandbox.scratch_home("steward-agent-home-") as home:
+            proc = _run_to_files(argv, ws.path, environment(cli_bin, home=home), timeout, own_group=True)
+    raw = _result_bytes(ws.path, rejected)
+    if raw is not None:
+        (ws.path / RESULT_FILE).unlink()
+    return proc, raw
+
+
 # What the steward keeps for itself in the clone: never copied back from the
 # agent's tree, never removed because the agent's tree lacks it. One list,
 # the one the clone's `.git/info/exclude` is written from.
@@ -223,7 +240,8 @@ STEWARD_FILES = LOCAL_ONLY
 
 
 def _run_isolated(user: str, ws: Workspace, argv: list[str], cli_bin: Path | None, timeout: int,
-                  rejected: list[str], checked: set[Path] | None = None) -> subprocess.CompletedProcess:
+                  rejected: list[str], checked: set[Path] | None = None
+                  ) -> tuple[subprocess.CompletedProcess, bytes | None]:
     """The agent as `user`, in its own copy of the clone. The time limit is
     enforced inside, by `timeout` running as that user. Finished or timed
     out, the agent's work is then brought back before the copy is removed;
@@ -246,19 +264,21 @@ def _run_isolated(user: str, ws: Workspace, argv: list[str], cli_bin: Path | Non
             proc = None
         late = proc is None or isolation.timed_out(proc.returncode, time.monotonic() - started, timeout)
         try:
-            _bring_back(iso, ws, rejected)
+            raw = _bring_back(iso, ws, rejected)
         except isolation.IsolationError as exc:
             if late:
                 raise isolation.IsolationError(f"the agent timed out after {timeout} s, and {exc}") from exc
             raise
     if late:
         raise subprocess.TimeoutExpired(cmd, timeout)
-    return proc
+    return proc, raw
 
 
-def _bring_back(iso: isolation.Isolated, ws: Workspace, rejected: list[str]) -> None:
+def _bring_back(iso: isolation.Isolated, ws: Workspace, rejected: list[str]) -> bytes | None:
     """Stop every process of the agent user, export its tree into a
-    directory only the steward can write, and copy back from there."""
+    directory only the steward can write, and copy back from there.
+    Returns the result file's bytes, read from the export: it is never
+    written into the clone, so nothing can fail or be left behind there."""
     isolation.stop_all(iso.user)
     isolation.open_up(iso)
     staging = Path(tempfile.mkdtemp(prefix=".steward-export-", dir=ws.path.parent))
@@ -268,7 +288,7 @@ def _bring_back(iso: isolation.Isolated, ws: Workspace, rejected: list[str]) -> 
         # A path the export could not carry is kept as the clone has it, never read as deleted.
         skip = (*STEWARD_FILES, *ws.excluded, *(r.rel for r in refused))
         rejected += isolation.sync_back(staging, ws.path, skip=skip).rejected
-        _take_result(staging, ws.path, rejected)
+        return _result_bytes(staging, rejected)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
@@ -285,14 +305,6 @@ def _result_bytes(root: Path, rejected: list[str]) -> bytes | None:
     except (OSError, isolation.IsolationError) as exc:
         rejected.append(f"{RESULT_FILE}: not a regular file ({getattr(exc, 'strerror', None) or exc})")
         return None
-
-
-def _take_result(tree: Path, clone: Path, rejected: list[str]) -> None:
-    """Copy the agent's result file into the clone. The copy-back has
-    already happened, so a bad one must never read as a failed copy-back."""
-    content = _result_bytes(tree, rejected)
-    if content is not None:
-        (clone / RESULT_FILE).write_bytes(content)
 
 
 def _run_to_files(cmd: list[str], cwd: Path, env: dict, timeout: float, own_group: bool = False,

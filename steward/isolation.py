@@ -50,6 +50,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import threading
@@ -192,13 +193,15 @@ def copy_for(user: str, clone: Path) -> Iterator[Isolated]:
             raise SetupError(str(exc)) from exc
         yield iso
     finally:
-        # Best effort: by now the agent's work is in the clone, or the run
-        # has already said why not; a slow removal must not undo that report.
+        # By now the agent's work is in the clone, or the run has said why
+        # not; a slow removal must not undo that, but a copy of the repo
+        # left behind is said, not swallowed.
         for cleanup in (lambda: stop_all(user), lambda: _sudo(user, "rm", "-rf", str(root), check=False)):
             try:
                 cleanup()
-            except IsolationError:
-                pass
+            except IsolationError as exc:
+                print(f"steward: warning: cleaning up the agent's copy {root} failed; it may be left behind: {exc}",
+                      file=sys.stderr)
 
 
 def _alive(user: str) -> bool:
@@ -259,6 +262,23 @@ class Refused:
     link: str | None = None   # its target, when it is a symlink
 
 
+# What each refusal of the `data` filter means. The filter's own messages
+# name the steward's staging directory, which has no place in a PR body.
+_REFUSALS = {
+    "AbsolutePathError": "an absolute path",
+    "OutsideDestinationError": "a path outside the repository",
+    "SpecialFileError": "a device, FIFO or other special file",
+    "AbsoluteLinkError": "a symlink to an absolute path",
+    "LinkOutsideDestinationError": "a symlink leading outside the repository",
+}
+
+
+def _refused(member: tarfile.TarInfo, exc: Exception) -> Refused:
+    link = member.linkname if member.issym() else None
+    why = _REFUSALS.get(type(exc).__name__, "refused by the extraction filter")
+    return Refused(os.path.normpath(member.name), why + (f" (`{link}`)" if link is not None else ""), link)
+
+
 def _unpack(stream, into: Path) -> list[Refused]:
     """Unpack a tar stream into `into` as untrusted data, and return what was
     left out and why. Python's `data` filter refuses absolute paths,
@@ -271,8 +291,7 @@ def _unpack(stream, into: Path) -> list[Refused]:
         try:
             return tarfile.data_filter(member, dest)
         except tarfile.FilterError as exc:
-            rejected.append(Refused(os.path.normpath(member.name), str(exc),
-                                    member.linkname if member.issym() else None))
+            rejected.append(_refused(member, exc))
             return None
 
     # Every member passes `keep`, tarfile's `data` filter (no absolute paths, nothing outside
@@ -454,52 +473,64 @@ class _Plan:
     removals: list[str] = field(default_factory=list)
 
 
-def _differs(tree: Path, rel: str, clone: Path, st: os.stat_result) -> bool:
-    """Whether the copy-back must write `rel`. Both sides are opened without
-    following a symlink at any step: a clone file reached only through a
-    link (a directory the agent turned from a link into a real one, say) is
-    not the clone's file at `rel`, so it is written. Cheap checks first:
-    another kind, size or executable bit settles it; the same mtime means
-    the agent left it alone (the agent's copy and the export both keep
-    timestamps). Only then are the contents compared, a chunk at a time."""
+def _differs(tree: Path, rel: str, clone: Path, st: os.stat_result, ds: os.stat_result | None) -> bool:
+    """Whether the copy-back must write `rel`. `ds` is the clone's entry at
+    `rel` from a walk that follows no link, so None means missing or only
+    reachable through a link (a directory the agent turned from a link into
+    a real one, say): not the clone's file at `rel`, so it is written.
+    Cheap checks first: another kind, size or executable bit settles it;
+    the same mtime means the agent left it alone (the agent's copy and the
+    export both keep timestamps). Only then are the contents compared, a
+    chunk at a time, through no-follow descriptors."""
+    if (ds is None or not stat.S_ISREG(ds.st_mode) or ds.st_size != st.st_size
+            or (ds.st_mode & stat.S_IXUSR) != (st.st_mode & stat.S_IXUSR)):
+        return True
+    if abs(ds.st_mtime_ns - st.st_mtime_ns) < MTIME_SLACK_NS:
+        return False
+    return _contents_differ(tree, rel, clone)
+
+
+def _clone_read(fd: int, rel: str) -> bytes:
+    try:
+        return os.read(fd, 1 << 20)
+    except OSError as exc:
+        raise IsolationError(f"cannot read `{rel}` in the clone: {exc.strerror}") from exc
+
+
+def _contents_differ(tree: Path, rel: str, clone: Path) -> bool:
+    """A read that fails on the clone's side is named as the clone's, not
+    blamed on the agent's tree."""
     try:
         ours = _open_in(clone, rel)
-    except OSError:
-        return True   # missing, a link, or under one
+    except OSError as exc:
+        raise IsolationError(f"cannot read `{rel}` in the clone: {exc.strerror}") from exc
     try:
-        ds = os.fstat(ours)
-        if (not stat.S_ISREG(ds.st_mode) or ds.st_size != st.st_size
-                or (ds.st_mode & stat.S_IXUSR) != (st.st_mode & stat.S_IXUSR)):
-            return True
-        if abs(ds.st_mtime_ns - st.st_mtime_ns) < MTIME_SLACK_NS:
-            return False
-        return _contents_differ(tree, rel, ours)
+        src = _regular_fd(tree, rel)
+        try:
+            while True:
+                a, b = os.read(src, 1 << 20), _clone_read(ours, rel)
+                if a != b:
+                    return True
+                if not a:
+                    return False
+        finally:
+            os.close(src)
     finally:
         os.close(ours)
 
 
-def _contents_differ(tree: Path, rel: str, ours: int) -> bool:
-    src = _regular_fd(tree, rel)
-    try:
-        while True:
-            a, b = os.read(src, 1 << 20), os.read(ours, 1 << 20)
-            if a != b:
-                return True
-            if not a:
-                return False
-    finally:
-        os.close(src)
-
-
-def _plan_entry(plan: _Plan, rejected: list[str], rel: str, st: os.stat_result, tree: Path, clone: Path) -> None:
+def _plan_entry(plan: _Plan, rejected: list[str], rel: str, st: os.stat_result, ds: os.stat_result | None,
+                tree: Path, clone: Path) -> None:
+    """`ds` is the clone's entry at `rel`, from the same no-follow walk: its
+    parents are real directories, so `clone / rel` reaches it directly."""
     if stat.S_ISLNK(st.st_mode):
         target = os.readlink(tree / rel)
         if _lexically_escapes(rel, target):
             rejected.append(f"{rel}: a symlink to `{target}`, outside the repository")
-        elif not _same_link(clone, rel, target):
+        elif not (ds is not None and stat.S_ISLNK(ds.st_mode) and os.readlink(clone / rel) == target):
             plan.links[rel] = target
     elif stat.S_ISREG(st.st_mode):
-        if _differs(tree, rel, clone, st):
+        if _differs(tree, rel, clone, st, ds):
             plan.files.append(rel)
     else:
         rejected.append(f"{rel}: not a regular file or symlink")
@@ -515,7 +546,7 @@ def _plan(tree: Path, clone: Path, owned) -> tuple[_Plan, list[str], dict[str, o
         if owned(rel):
             continue
         try:
-            _plan_entry(plan, rejected, rel, st, tree, clone)
+            _plan_entry(plan, rejected, rel, st, ours.get(rel), tree, clone)
         except OSError as exc:
             raise IsolationError(f"cannot read `{rel}` in the agent's tree: {exc.strerror}") from exc
     return plan, rejected, ours
@@ -636,6 +667,18 @@ def _escaping(clone: Path, rels: Iterable[str]) -> set[str]:
     return {rel for rel in rels if not _inside(clone, clone / rel)}
 
 
+def _owner(skip: Iterable[str]):
+    """Whether a path is `skip`ped: one of them, or under one. A set lookup
+    per ancestor, so a long skip list (every refused link of a big tree)
+    costs the path's depth, not the list's length."""
+    skipped = {s.rstrip("/") for s in skip}
+
+    def owned(rel: str) -> bool:
+        parts = rel.split("/")
+        return any("/".join(parts[:i]) in skipped for i in range(1, len(parts) + 1))
+    return owned
+
+
 def sync_back(tree: Path, clone: Path, skip: Iterable[str] = ()) -> Synced:
     """Make the clone's working tree match the agent's, outside `.git`.
 
@@ -644,12 +687,7 @@ def sync_back(tree: Path, clone: Path, skip: Iterable[str] = ()) -> Synced:
     export, which only the steward can write. Fail-closed: a read that
     fails while planning raises IsolationError before the clone is
     touched, and any failure after that rolls the clone back exactly."""
-    skipped = tuple(s.rstrip("/") for s in skip)
-
-    def owned(rel: str) -> bool:
-        return any(rel == s or rel.startswith(s + "/") for s in skipped)
-
-    plan, rejected, ours = _plan(tree, clone, owned)
+    plan, rejected, ours = _plan(tree, clone, _owner(skip))
     out = Synced(rejected=rejected)
     links_before = {rel for rel, st in ours.items() if stat.S_ISLNK(st.st_mode)}
     already_out = _escaping(clone, links_before)   # repo links that pointed out before the agent ran are the repo's

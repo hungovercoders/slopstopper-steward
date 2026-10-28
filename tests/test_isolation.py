@@ -509,7 +509,7 @@ def test_a_bad_result_file_is_no_result_not_a_failed_copy_back(tmp_path, make):
     {"dir": lambda: target.mkdir(), "fifo": lambda: os.mkfifo(target),
      "symlink": lambda: os.symlink("summary.json", target)}[make]()
     rejected = []
-    agent._take_result(tree, clone, rejected)          # must not raise
+    assert agent._result_bytes(tree, rejected) is None   # must not raise
     assert not (clone / agent.RESULT_FILE).exists() and rejected and agent.RESULT_FILE in rejected[0]
 
 
@@ -578,8 +578,8 @@ def test_differs_reads_only_same_sized_files(tmp_path, monkeypatch):
     opened = []
     real = isolation._regular_fd
     monkeypatch.setattr(isolation, "_regular_fd", lambda root, rel: opened.append(rel) or real(root, rel))
-    assert isolation._differs(tree, "a.md", clone, os.lstat(tree / "a.md"))
-    assert isolation._differs(tree, "b.md", clone, os.lstat(tree / "b.md"))
+    assert isolation._differs(tree, "a.md", clone, os.lstat(tree / "a.md"), os.lstat(clone / "a.md"))
+    assert isolation._differs(tree, "b.md", clone, os.lstat(tree / "b.md"), os.lstat(clone / "b.md"))
     assert opened == ["b.md"]                              # the size difference settled a.md unread
 
 
@@ -690,7 +690,7 @@ def test_the_pinned_cli_is_checked_once_per_run(monkeypatch, tmp_path):
     monkeypatch.setattr(isolation, "check_cli", lambda user, cli: calls.append(cli))
     monkeypatch.setattr(agent, "_run_to_files",
                         lambda cmd, *a, **k: subprocess.CompletedProcess(cmd, 0, "{}", ""))
-    monkeypatch.setattr(agent, "_bring_back", lambda iso, ws_, rejected: None)
+    monkeypatch.setattr(agent, "_bring_back", lambda iso, ws_, rejected: b'{"outcome": "fixed"}')
     checked = set()
     for _ in range(3):
         agent.run(ws, "brief", CFG, cli_bin=tmp_path / "venv" / "bin" / "slopstopper", preflight=lambda: None,
@@ -795,3 +795,102 @@ def test_an_in_place_result_file_link_is_not_followed(monkeypatch, tmp_path):
     result = agent.run(workspace.Workspace("acme/a", clone, "main"), "brief", CFG, preflight=lambda: None)
     assert "steward-only text" not in json.dumps(result.to_dict())
     assert agent.RESULT_FILE in result.notes
+
+
+# ── tenth review ─────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("raw, why", [
+    (b"[]", "JSON list"), (b'"done"', "JSON str"), (b"5", "JSON int"),
+])
+def test_a_result_that_is_not_an_object_is_partial(raw, why):
+    out = agent.AgentResult(True)
+    agent._read_result(raw, out)
+    assert out.outcome == "partial" and why in out.error
+
+
+def test_wrong_typed_result_fields_are_coerced():
+    out = agent.AgentResult(True)
+    agent._read_result(b'{"outcome": "fixed", "upstream": "x", "verified": 5}', out)
+    assert out.outcome == "fixed" and out.upstream is None and out.verified == ["5"]
+
+
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_the_isolated_result_is_never_written_into_the_clone(monkeypatch, tmp_path, timed_out):
+    ws = _isolated_without_sudo(monkeypatch, tmp_path)
+
+    def agent_run(cmd, *a, **k):
+        if timed_out:
+            raise subprocess.TimeoutExpired(cmd, 5)
+        return subprocess.CompletedProcess(cmd, 0, "{}", "")
+
+    def export(iso, into):
+        shutil.copytree(ws.path, into, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".git"))
+        (into / agent.RESULT_FILE).write_text('{"outcome": "fixed", "summary": "s"}')
+        return []
+    monkeypatch.setattr(agent, "_run_to_files", agent_run)
+    monkeypatch.setattr(isolation, "stop_all", lambda user: None)
+    monkeypatch.setattr(isolation, "open_up", lambda iso: None)
+    monkeypatch.setattr(isolation, "export", export)
+    result = agent.run(ws, "brief", CFG, timeout=5, preflight=lambda: None)
+    assert not os.path.lexists(ws.path / agent.RESULT_FILE)     # not left behind, timed out or not
+    if timed_out:
+        assert "timed out" in result.error
+    else:
+        assert result.outcome == "fixed" and result.summary == "s"
+
+
+def test_refusal_notes_name_no_steward_path(tmp_path):
+    clone = _tree(tmp_path / "clone", {"README.md": "x"})
+    tree = _tree(tmp_path / "tree", {"README.md": "x", "sub/a.md": "a"})
+    os.symlink("../../x", tree / "sub" / "up")
+    os.symlink("/etc/shadow", tree / "abs")
+    staging = tmp_path / "staging-only-the-steward-knows"
+    staging.mkdir()
+    notes = isolation.refusal_notes(_export_of(tree, staging), clone)
+    assert sorted(notes) == ["abs: a symlink to an absolute path (`/etc/shadow`)",
+                             "sub/up: a symlink leading outside the repository (`../../x`)"]
+    assert not any(str(tmp_path) in n for n in notes)
+
+
+def test_a_long_skip_list_costs_depth_not_length():
+    owned = isolation._owner([*(f"links/l{i}" for i in range(50_000)), "keep/", ".steward-prompt.md"])
+    assert owned("keep") and owned("keep/a/b") and owned("links/l49999") and owned(".steward-prompt.md")
+    assert not owned("keeper") and not owned("links/l50000") and not owned("links")
+    started = time.monotonic()
+    for i in range(50_000):
+        owned(f"src/pkg/mod{i}/file.py")
+    assert time.monotonic() - started < 5
+
+
+def test_the_cheap_checks_use_the_walk_not_an_open(tmp_path, monkeypatch):
+    clone = _tree(tmp_path / "clone", {"a.md": "same"})
+    tree = _tree(tmp_path / "tree", {"a.md": "same"})
+    st = os.stat(clone / "a.md")
+    os.utime(tree / "a.md", ns=(st.st_atime_ns, st.st_mtime_ns))
+    monkeypatch.setattr(isolation, "_open_in", lambda *a, **k: pytest.fail("opened an untouched file"))
+    assert isolation.sync_back(tree, clone).changed == []
+
+
+def test_a_clone_side_read_error_names_the_clone(tmp_path, monkeypatch):
+    clone = _tree(tmp_path / "clone", {"a.md": "aaaa"})
+    tree = _tree(tmp_path / "tree", {"a.md": "bbbb"})
+    os.utime(tree / "a.md", ns=(0, 10**9))
+    monkeypatch.setattr(isolation, "_clone_read", lambda fd, rel: (_ for _ in ()).throw(
+        isolation.IsolationError(f"cannot read `{rel}` in the clone: Input/output error")))
+    with pytest.raises(isolation.IsolationError, match="in the clone"):
+        isolation.sync_back(tree, clone)
+
+
+def test_a_failed_cleanup_is_said(monkeypatch, tmp_path, capsys):
+    def fake(user, *cmd, check=True, timeout=600):
+        if cmd[0] == "mktemp":
+            return subprocess.CompletedProcess(cmd, 0, str(tmp_path / "root") + "\n", "")
+        if cmd[0] == "rm":
+            raise isolation.IsolationError("`rm -rf` as steward-agent did not finish within 600 s")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    monkeypatch.setattr(isolation, "_sudo", fake)
+    monkeypatch.setattr(isolation, "stop_all", lambda user: None)
+    with isolation.copy_for("steward-agent", tmp_path):
+        pass
+    err = capsys.readouterr().err
+    assert "warning" in err and str(tmp_path / "root") in err and "did not finish" in err
