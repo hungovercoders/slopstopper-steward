@@ -262,6 +262,7 @@ def world(monkeypatch):
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=clone, check=True, env=env)
     (clone / "README.md").write_text("# a\n")
     (clone / "gone.txt").write_text("bye\n")
+    os.symlink("/usr/share/doc", clone / "ext")          # the repo's own link out, which the export refuses
     subprocess.run(["git", "add", "-A"], cwd=clone, check=True, env=env)
     subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"],
                    cwd=clone, check=True, env=env)
@@ -295,6 +296,7 @@ def test_the_agent_as_its_own_user(world):
     assert (clone / "private" / "notes.md").read_text() == "private\n"            # a 0700 directory, opened up
     assert (clone / "secret.md").read_text() == "only mine\n"                     # a 0600 file, opened up
     assert not os.path.lexists(clone / "leak.md") and "leak.md" in result.notes  # the escape was refused, and said
+    assert os.readlink(clone / "ext") == "/usr/share/doc" and "ext:" not in result.notes   # the repo's own, kept quietly
     assert (clone / ".git" / "config").read_bytes() == git_config
     assert (venv_bin / "slopstopper").read_text() == "#!/bin/sh\nexit 0\n"
     assert (clone / "vendored" / "kept.md").read_text() == "kept\n"
@@ -576,8 +578,8 @@ def test_differs_reads_only_same_sized_files(tmp_path, monkeypatch):
     opened = []
     real = isolation._regular_fd
     monkeypatch.setattr(isolation, "_regular_fd", lambda root, rel: opened.append(rel) or real(root, rel))
-    assert isolation._differs(tree, "a.md", clone / "a.md", os.lstat(tree / "a.md"))
-    assert isolation._differs(tree, "b.md", clone / "b.md", os.lstat(tree / "b.md"))
+    assert isolation._differs(tree, "a.md", clone, os.lstat(tree / "a.md"))
+    assert isolation._differs(tree, "b.md", clone, os.lstat(tree / "b.md"))
     assert opened == ["b.md"]                              # the size difference settled a.md unread
 
 
@@ -611,7 +613,8 @@ def test_the_export_is_unpacked_as_untrusted_data(tmp_path):
     assert sorted(p.name for p in into.iterdir()) == ["ok.md", "rel.md"]
     assert (into / "ok.md").read_text() == "ok\n" and os.readlink(into / "rel.md") == "ok.md"
     assert not (tmp_path / "work" / "escaped.md").exists()
-    assert {r.split(":")[0] for r in rejected} == {"abs.md", "up.md", "../escaped.md", "pipe", "tty"}
+    assert {r.rel for r in rejected} == {"abs.md", "up.md", "../escaped.md", "pipe", "tty"}
+    assert {r.rel: r.link for r in rejected}["abs.md"] == "/etc/passwd"
 
 
 @needs_agent_user
@@ -709,3 +712,86 @@ def test_the_workdir_is_probed_only_when_an_order_needs_the_agent(monkeypatch, t
     order = Order("upgrade-1", "upgrade", "acme/a", "t", "r", 1, "main", "0.26.0", "0.27.0", None, False)
     outcomes = runner.execute(Plan(orders=[order]), [Inventory(Repo("acme/a"), "0.27.0")], CFG, tmp_path)
     assert outcomes[0].status == "skipped"
+
+
+# ── ninth review ─────────────────────────────────────────────────────
+
+def _export_of(tree: Path, into: Path) -> list:
+    """What `export` does, without sudo: tar the tree, unpack it as data."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as archive:
+        archive.add(tree, arcname=".", filter=lambda m: None if m.name.split("/")[-1] == ".git" else m)
+    buf.seek(0)
+    return isolation._unpack(buf, into)
+
+
+def test_links_the_export_refuses_are_kept_not_deleted(tmp_path):
+    clone = _tree(tmp_path / "clone", {"README.md": "x", "sub/a.md": "a"})
+    os.symlink("/usr/share/foo", clone / "ext")
+    os.symlink("../../outside", clone / "sub" / "up")
+    tree = tmp_path / "tree"
+    shutil.copytree(clone, tree, symlinks=True)
+    (tree / "README.md").write_text("changed\n")
+    os.symlink("/etc/shadow", tree / "new-out")            # a link the agent added that leads out
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    refused = _export_of(tree, staging)
+    skip = [r.rel for r in refused]
+    out = isolation.sync_back(staging, clone, skip=skip)
+    assert out.removed == [] and out.changed == ["README.md"]
+    assert os.readlink(clone / "ext") == "/usr/share/foo" and os.readlink(clone / "sub" / "up") == "../../outside"
+    assert not os.path.lexists(clone / "new-out")
+    notes = isolation.refusal_notes(refused, clone)
+    assert [n.split(":")[0] for n in notes] == ["new-out"]   # the repo's own links are not the agent's doing
+
+
+def test_a_directory_link_made_real_brings_its_files(tmp_path):
+    clone = _tree(tmp_path / "clone", {"real/f": "same\n"})
+    os.symlink("real", clone / "d")
+    tree = _tree(tmp_path / "tree", {"real/f": "same\n", "d/f": "same\n"})
+    st = os.stat(clone / "real" / "f")
+    for f in (tree / "real" / "f", tree / "d" / "f"):
+        os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns))   # what cp -p leaves
+    out = isolation.sync_back(tree, clone)
+    assert "d/f" in out.changed and "d" in out.removed
+    assert (clone / "d").is_dir() and not (clone / "d").is_symlink() and (clone / "d" / "f").read_text() == "same\n"
+
+
+def test_a_link_under_a_clone_link_is_written_not_assumed(tmp_path):
+    clone = _tree(tmp_path / "clone", {"real/x": "x"})
+    os.symlink("x", clone / "real" / "l")
+    os.symlink("real", clone / "d")
+    tree = _tree(tmp_path / "tree", {"real/x": "x", "d/x": "x"})
+    os.symlink("x", tree / "real" / "l")
+    os.symlink("x", tree / "d" / "l")                       # same target as real/l, seen through the clone's d
+    out = isolation.sync_back(tree, clone)
+    assert "d/l" in out.changed and os.readlink(clone / "d" / "l") == "x" and not (clone / "d").is_symlink()
+
+
+def test_a_slow_cleanup_does_not_undo_a_copy_back(monkeypatch, tmp_path):
+    def fake(user, *cmd, check=True, timeout=600):
+        if cmd[0] == "mktemp":
+            return subprocess.CompletedProcess(cmd, 0, str(tmp_path / "root") + "\n", "")
+        if cmd[0] == "rm":
+            raise isolation.IsolationError(f"`rm -rf` as {user} did not finish within {timeout} s")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    monkeypatch.setattr(isolation, "_sudo", fake)
+    monkeypatch.setattr(isolation, "stop_all", lambda user: None)
+    with isolation.copy_for("steward-agent", tmp_path) as iso:
+        assert iso.tree == tmp_path / "root" / "tree"         # leaves without raising
+
+
+def test_an_in_place_result_file_link_is_not_followed(monkeypatch, tmp_path):
+    clone = _tree(tmp_path / "clone", {"README.md": "x"})
+    subprocess.run(["git", "init", "-q"], cwd=clone, check=True)
+    private = tmp_path / "steward-private.json"
+    private.write_text(json.dumps({"outcome": "fixed", "summary": "steward-only text"}))
+    monkeypatch.delenv(isolation.AGENT_USER_ENV, raising=False)
+
+    def agent_links(cmd, cwd, env, timeout, **k):
+        os.symlink(str(private), Path(cwd) / agent.RESULT_FILE)
+        return subprocess.CompletedProcess(cmd, 0, "{}", "")
+    monkeypatch.setattr(agent, "_run_to_files", agent_links)
+    result = agent.run(workspace.Workspace("acme/a", clone, "main"), "brief", CFG, preflight=lambda: None)
+    assert "steward-only text" not in json.dumps(result.to_dict())
+    assert agent.RESULT_FILE in result.notes

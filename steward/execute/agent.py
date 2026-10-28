@@ -155,10 +155,10 @@ def _meta(stdout: str) -> dict:
         return {}
 
 
-def _read_result(path: Path, out: AgentResult) -> None:
+def _read_result(raw: bytes, out: AgentResult) -> None:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
+        data = json.loads(raw.decode("utf-8"))
+    except ValueError as exc:
         out.outcome, out.error = "partial", f"result file unreadable: {exc}"
         return
     out.outcome = str(data.get("outcome") or "partial")
@@ -203,8 +203,9 @@ def run(ws: Workspace, prompt: str, cfg: Config, cli_bin: Path | None = None, ti
                            notes=_rejected_note(rejected))
     meta = _meta(proc.stdout)
     out = AgentResult(True, cost_usd=meta.get("total_cost_usd"), turns=meta.get("num_turns"))
-    if result_path.is_file():
-        _read_result(result_path, out)
+    raw = _result_bytes(ws.path, rejected)
+    if raw is not None:
+        _read_result(raw, out)
         result_path.unlink()
     else:
         out.outcome = "partial" if ws.dirty() else "skipped"
@@ -262,26 +263,36 @@ def _bring_back(iso: isolation.Isolated, ws: Workspace, rejected: list[str]) -> 
     isolation.open_up(iso)
     staging = Path(tempfile.mkdtemp(prefix=".steward-export-", dir=ws.path.parent))
     try:
-        rejected += isolation.export(iso, staging)
-        rejected += isolation.sync_back(staging, ws.path, skip=(*STEWARD_FILES, *ws.excluded)).rejected
+        refused = isolation.export(iso, staging)
+        rejected += isolation.refusal_notes(refused, ws.path)
+        # A path the export could not carry is kept as the clone has it, never read as deleted.
+        skip = (*STEWARD_FILES, *ws.excluded, *(r.rel for r in refused))
+        rejected += isolation.sync_back(staging, ws.path, skip=skip).rejected
         _take_result(staging, ws.path, rejected)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
 
-def _take_result(tree: Path, clone: Path, rejected: list[str]) -> None:
-    """Copy the agent's result file, if it is a regular file. Anything else
-    (a link, a directory, a FIFO) is noted and treated as no result file:
-    the copy-back has already happened, so this must never read as one
-    that failed."""
-    if not os.path.lexists(tree / RESULT_FILE):
-        return
+def _result_bytes(root: Path, rejected: list[str]) -> bytes | None:
+    """The agent's result file under `root`, if it is a regular file, read
+    without following a link. Anything else (a link to a file of the
+    steward's, a directory, a FIFO) is noted and treated as no result file:
+    its fields go into a public PR body."""
+    if not os.path.lexists(root / RESULT_FILE):
+        return None
     try:
-        content, _ = isolation.read_regular(tree, RESULT_FILE)
+        return isolation.read_regular(root, RESULT_FILE)[0]
     except (OSError, isolation.IsolationError) as exc:
         rejected.append(f"{RESULT_FILE}: not a regular file ({getattr(exc, 'strerror', None) or exc})")
-        return
-    (clone / RESULT_FILE).write_bytes(content)
+        return None
+
+
+def _take_result(tree: Path, clone: Path, rejected: list[str]) -> None:
+    """Copy the agent's result file into the clone. The copy-back has
+    already happened, so a bad one must never read as a failed copy-back."""
+    content = _result_bytes(tree, rejected)
+    if content is not None:
+        (clone / RESULT_FILE).write_bytes(content)
 
 
 def _run_to_files(cmd: list[str], cwd: Path, env: dict, timeout: float, own_group: bool = False,
@@ -344,4 +355,4 @@ def _kill(proc: subprocess.Popen, group: bool) -> None:
 
 
 def _rejected_note(rejected: list[str]) -> str:
-    return ("The steward did not copy back from the agent's tree: " + "; ".join(rejected) + ".") if rejected else ""
+    return ("The steward left out of the agent's work: " + "; ".join(rejected) + ".") if rejected else ""

@@ -121,10 +121,15 @@ jobs:
         # clone, .git or venvs, nor read its environment (the push token).
         # Its CLI is installed system-wide (sudo's PATH, the system node) so
         # that user can run it; the steward finds it in /usr/local/bin too.
+        # The CLI is pinned like the actions are: its flags are the agent's
+        # box (`steward/execute/agent.py` `_command`), so a bump is a commit
+        # that checks them, never whatever npm has today.
         # Docs: docs/architecture/README.md, "Where the agent is boxed".
+        env:
+          CLAUDE_CODE_VERSION: "2.1.296"
         run: |
           pip install -q .
-          sudo npm install -g @anthropic-ai/claude-code
+          sudo npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
           sudo useradd --system --no-create-home --shell /usr/sbin/nologin steward-agent
           # Nothing may start the agent user again once the steward stops it.
           echo steward-agent | sudo tee -a /etc/cron.deny /etc/at.deny > /dev/null

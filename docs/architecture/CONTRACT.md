@@ -4,8 +4,9 @@ The steward re-implements nothing: it reads files slopstopper's installer
 leaves behind, parses markers slopstopper's `emit` writes, runs the
 pinned CLI's own commands and hands the agent the skills the install
 ships. That holds only while those surfaces hold, so they are written
-down as data in [`steward/contract.py`](../../steward/contract.py) and
-checked from both sides.
+down as data in [`steward/contract.py`](../../steward/contract.py),
+checked by this repo's CI and named, for contributors, in slopstopper's
+change map. slopstopper's own CI does not run the check.
 
 ## How sync is kept
 

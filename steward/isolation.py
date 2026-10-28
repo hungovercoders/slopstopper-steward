@@ -23,11 +23,13 @@ From that copy the steward copies back what changed: regular files, and
 symlinks that, once in place, still resolve inside the repo and outside
 `.git`. Nothing named `.git` is exported or copied, and nothing is
 followed. Anything else (a symlink that leads out, even through a chain
-of links; a FIFO; a device) is refused and reported. The copy-back is
-fail-closed: a failed export, or a read that fails while planning,
-stops it with the clone exactly as it was, never half-synced and never
-with content mistaken for deleted, and the copy into the clone is a
-transaction: an error part-way rolls every change back.
+of links; a FIFO; a device) is refused and reported, and whatever the
+clone has at that path is kept as it is: refused is never read as
+deleted. The copy-back is fail-closed: a failed export, or a read that
+fails while planning, stops it with the clone exactly as it was, never
+half-synced and never with content mistaken for deleted, and the copy
+into the clone is a transaction: an error part-way rolls every change
+back.
 
 The steward reaches the user through `sudo -n -u <user>` with
 `--preserve-env`, so the account running the steward needs passwordless
@@ -190,11 +192,13 @@ def copy_for(user: str, clone: Path) -> Iterator[Isolated]:
             raise SetupError(str(exc)) from exc
         yield iso
     finally:
-        try:
-            stop_all(user)
-        except IsolationError:
-            pass  # removal below is best effort; the run already reported what mattered
-        _sudo(user, "rm", "-rf", str(root), check=False)
+        # Best effort: by now the agent's work is in the clone, or the run
+        # has already said why not; a slow removal must not undo that report.
+        for cleanup in (lambda: stop_all(user), lambda: _sudo(user, "rm", "-rf", str(root), check=False)):
+            try:
+                cleanup()
+            except IsolationError:
+                pass
 
 
 def _alive(user: str) -> bool:
@@ -247,19 +251,28 @@ def open_up(iso: Isolated) -> None:
     _sudo(iso.user, "chmod", "-R", "u+rwX", str(iso.tree), check=False, timeout=1800)
 
 
-def _unpack(stream, into: Path) -> list[str]:
+@dataclass
+class Refused:
+    """A member of the export the unpacking left out."""
+    rel: str
+    why: str
+    link: str | None = None   # its target, when it is a symlink
+
+
+def _unpack(stream, into: Path) -> list[Refused]:
     """Unpack a tar stream into `into` as untrusted data, and return what was
     left out and why. Python's `data` filter refuses absolute paths,
     anything that would land outside `into` (through `..` or a link), links
     that lead out, devices and FIFOs, and drops owners and setuid bits; a
     member it refuses is left out, not fatal."""
-    rejected: list[str] = []
+    rejected: list[Refused] = []
 
     def keep(member: tarfile.TarInfo, dest: str) -> tarfile.TarInfo | None:
         try:
             return tarfile.data_filter(member, dest)
         except tarfile.FilterError as exc:
-            rejected.append(f"{member.name}: {exc}")
+            rejected.append(Refused(os.path.normpath(member.name), str(exc),
+                                    member.linkname if member.issym() else None))
             return None
 
     # Every member passes `keep`, tarfile's `data` filter (no absolute paths, nothing outside
@@ -269,13 +282,14 @@ def _unpack(stream, into: Path) -> list[str]:
     return rejected
 
 
-def export(iso: Isolated, into: Path, timeout: int = 1800) -> list[str]:
+def export(iso: Isolated, into: Path, timeout: int = 1800) -> list[Refused]:
     """Copy the agent's tree into `into`, a fresh directory only the steward
     can write, without the steward reading the tree: `tar` runs as the agent
     user, `.git` entries at any depth left out, hard links as plain files.
-    Returns what the unpacking refused. A tar that fails, or a stream that
-    does not parse, raises IsolationError: half an export would read as
-    deletions."""
+    Returns what the unpacking refused: the copy-back must keep those paths
+    as the clone has them (see `refusal_notes`). A tar that fails, or a
+    stream that does not parse, raises IsolationError: half an export would
+    read as deletions."""
     cmd = ["sudo", "-n", "-u", iso.user, "--", "tar", "-C", str(iso.tree), f"--exclude={GIT}",
            "--hard-dereference", "--format=posix", "-cf", "-", "."]
     with tempfile.TemporaryFile() as err:
@@ -298,21 +312,54 @@ def export(iso: Isolated, into: Path, timeout: int = 1800) -> list[str]:
     return rejected
 
 
+def refusal_notes(refused: Iterable[Refused], clone: Path) -> list[str]:
+    """What to report of `refused`: a link the clone already has, with the
+    same target (a repo's own link to `/usr/share/...`, say), is the repo's
+    and says nothing about the agent's work."""
+    return [f"{r.rel}: {r.why}" for r in refused if r.link is None or not _same_link(clone, r.rel, r.link)]
+
+
 _READ = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
 
 
-def _open_in(root: Path, rel: str, flags: int = _READ) -> int:
-    """Open `rel` under `root` one component at a time, refusing a symlink at
-    every step: O_NOFOLLOW alone covers only the last component, and a
-    directory on the way swapped for a link would otherwise be followed."""
+def _parent_fd(root: Path, rel: str) -> tuple[int, str]:
+    """The directory holding `rel` under `root`, opened one component at a
+    time and refusing a symlink at every step, and `rel`'s last component.
+    O_NOFOLLOW alone covers only the last component: a directory on the way
+    swapped for a link, or a repo link to elsewhere, would be followed."""
+    parts = Path(rel).parts
     fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        parts = Path(rel).parts
         for part in parts[:-1]:
             nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             os.close(fd)
             fd = nxt
-        return os.open(parts[-1], flags, dir_fd=fd)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, parts[-1]
+
+
+def _open_in(root: Path, rel: str, flags: int = _READ) -> int:
+    """Open `rel` under `root` without following a symlink at any step."""
+    fd, name = _parent_fd(root, rel)
+    try:
+        return os.open(name, flags, dir_fd=fd)
+    finally:
+        os.close(fd)
+
+
+def _same_link(root: Path, rel: str, target: str) -> bool:
+    """Whether `rel` under `root`, reached through real directories only, is
+    a symlink to `target`."""
+    try:
+        fd, name = _parent_fd(root, rel)
+    except OSError:
+        return False
+    try:
+        return os.readlink(name, dir_fd=fd) == target
+    except OSError:
+        return False
     finally:
         os.close(fd)
 
@@ -407,44 +454,52 @@ class _Plan:
     removals: list[str] = field(default_factory=list)
 
 
-def _differs(tree: Path, rel: str, dst: Path, st: os.stat_result) -> bool:
-    """Whether the copy-back must write `rel`. Cheap checks first, on one
-    lstat of the clone's file: another kind, size or executable bit settles
-    it; the same mtime means the agent left it alone (the agent's copy and
-    the export both keep timestamps). Only then are the contents compared,
-    a chunk at a time, through no-follow descriptors."""
+def _differs(tree: Path, rel: str, clone: Path, st: os.stat_result) -> bool:
+    """Whether the copy-back must write `rel`. Both sides are opened without
+    following a symlink at any step: a clone file reached only through a
+    link (a directory the agent turned from a link into a real one, say) is
+    not the clone's file at `rel`, so it is written. Cheap checks first:
+    another kind, size or executable bit settles it; the same mtime means
+    the agent left it alone (the agent's copy and the export both keep
+    timestamps). Only then are the contents compared, a chunk at a time."""
     try:
-        ds = os.lstat(dst)
-    except FileNotFoundError:
-        return True
-    if (not stat.S_ISREG(ds.st_mode) or ds.st_size != st.st_size
-            or (ds.st_mode & stat.S_IXUSR) != (st.st_mode & stat.S_IXUSR)):
-        return True
-    if abs(ds.st_mtime_ns - st.st_mtime_ns) < MTIME_SLACK_NS:
-        return False
+        ours = _open_in(clone, rel)
+    except OSError:
+        return True   # missing, a link, or under one
+    try:
+        ds = os.fstat(ours)
+        if (not stat.S_ISREG(ds.st_mode) or ds.st_size != st.st_size
+                or (ds.st_mode & stat.S_IXUSR) != (st.st_mode & stat.S_IXUSR)):
+            return True
+        if abs(ds.st_mtime_ns - st.st_mtime_ns) < MTIME_SLACK_NS:
+            return False
+        return _contents_differ(tree, rel, ours)
+    finally:
+        os.close(ours)
+
+
+def _contents_differ(tree: Path, rel: str, ours: int) -> bool:
     src = _regular_fd(tree, rel)
     try:
-        with open(dst, "rb") as theirs_copy:
-            while True:
-                a, b = os.read(src, 1 << 20), theirs_copy.read(1 << 20)
-                if a != b:
-                    return True
-                if not a:
-                    return False
+        while True:
+            a, b = os.read(src, 1 << 20), os.read(ours, 1 << 20)
+            if a != b:
+                return True
+            if not a:
+                return False
     finally:
         os.close(src)
 
 
 def _plan_entry(plan: _Plan, rejected: list[str], rel: str, st: os.stat_result, tree: Path, clone: Path) -> None:
-    src, dst = tree / rel, clone / rel
     if stat.S_ISLNK(st.st_mode):
-        target = os.readlink(src)
+        target = os.readlink(tree / rel)
         if _lexically_escapes(rel, target):
             rejected.append(f"{rel}: a symlink to `{target}`, outside the repository")
-        elif not (dst.is_symlink() and os.readlink(dst) == target):
+        elif not _same_link(clone, rel, target):
             plan.links[rel] = target
     elif stat.S_ISREG(st.st_mode):
-        if _differs(tree, rel, dst, st):
+        if _differs(tree, rel, clone, st):
             plan.files.append(rel)
     else:
         rejected.append(f"{rel}: not a regular file or symlink")

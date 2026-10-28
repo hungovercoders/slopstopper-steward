@@ -58,7 +58,8 @@ steward's clone, venvs or token. Running the steward unattended anywhere
 else, do the same: create an unprivileged user, give the steward's
 account passwordless `sudo -u` to it with environment passing allowed
 (`--preserve-env`, which a rule for `ALL` commands implies; a narrower
-rule needs `SETENV`), install the `claude` CLI and the `node` it runs on
+rule needs `SETENV`), install the `claude` CLI at the version
+`steward-run.yml` pins (its flags are the box) and the `node` it runs on
 where that user finds them (`/usr/local/bin`, `/usr/bin` or `/bin`), and
 export `STEWARD_AGENT_USER`. Dedicate that user to the steward, one run
 at a time: after each agent run the steward stops every process running
