@@ -32,6 +32,12 @@ class RunContext:
     base: Path
     deadline: float | None = None  # epoch seconds the push token is good until (STEWARD_DEADLINE)
     releases: dict = field(default_factory=dict)
+    agent_check: object = agent.PROBE  # agent.available(), asked at most once per run
+
+    def agent_unavailable(self) -> str | None:
+        if self.agent_check is agent.PROBE:
+            self.agent_check = agent.available()
+        return self.agent_check  # type: ignore[return-value]
 
     def venv(self, version: str) -> Path:
         """One venv per version per run, outside every clone (the agent's
@@ -158,7 +164,7 @@ def _settle_red(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspa
         return red, unverified, None
     agent.ensure_skills(ws, order.target, cfg.slopstopper_repo)
     result = agent.run(ws, prompts.verify(order, inv, red, cfg.slopstopper_repo), cfg, cli,
-                       timeout=ctx.agent_timeout(), protect=ctx.protected())
+                       timeout=ctx.agent_timeout(), protect=ctx.protected(), why_not=ctx.agent_unavailable())
     if not result.ran:
         return red, unverified, result
     red, unverified = _verify_pass(ws, cli)
@@ -240,7 +246,7 @@ def work_triage(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspa
     cli = refresh.cli_for(version, ctx.venv(version), cfg.package)
     agent.ensure_skills(ws, version, cfg.slopstopper_repo)
     result = agent.run(ws, prompts.triage(order, inv, issue.get("body") or "", cfg.slopstopper_repo), cfg, cli,
-                       timeout=ctx.agent_timeout(), protect=ctx.protected())
+                       timeout=ctx.agent_timeout(), protect=ctx.protected(), why_not=ctx.agent_unavailable())
     if not result.ran:
         return Outcome(order.to_dict(), "skipped", detail=result.error, agent=result.to_dict())
     red, unverified = _recheck(order, ws, cli)
@@ -269,10 +275,12 @@ def _triage_pr(order: Order, cfg: Config, ws: workspace.Workspace, result: Agent
 
 # ── the run ──────────────────────────────────────────────────────────
 
-def execute(plan: Plan, invs: list[inventory.Inventory], cfg: Config, workdir: Path | None) -> list[Outcome]:
+def execute(plan: Plan, invs: list[inventory.Inventory], cfg: Config, workdir: Path | None,
+            agent_check: object = agent.PROBE) -> list[Outcome]:
     by_repo = {inv.repo.full_name: inv for inv in invs}
     own_base = workdir is None
-    ctx = RunContext(base=workdir or Path(tempfile.mkdtemp(prefix="steward-")), deadline=_deadline())
+    ctx = RunContext(base=workdir or Path(tempfile.mkdtemp(prefix="steward-")), deadline=_deadline(),
+                     agent_check=agent_check)
     if own_base and isolation.agent_user():
         ctx.base.chmod(0o755)  # mkdtemp is 0700; the agent user reads the venvs and copies its clone from here
     outcomes = []
@@ -310,11 +318,12 @@ def run(cfg: Config, only: str | None, dry_run: bool, workdir: Path | None) -> R
     if mode == "plan":
         report.outcomes = [Outcome(o.to_dict(), "planned", detail=o.reason) for o in plan.orders]
         return report
-    why_not = agent.available()
-    if why_not and any(o.agentic for o in plan.orders):
+    # Probe only when an order needs the agent; the answer then serves the run.
+    why_not = agent.available() if any(o.agentic for o in plan.orders) else agent.PROBE
+    if why_not and why_not is not agent.PROBE:
         report.skipped.append({"repo": "*", "order": "agentic orders", "why": why_not})
         plan.orders = [o for o in plan.orders if not o.agentic]
-    report.outcomes = execute(plan, invs, cfg, workdir)
+    report.outcomes = execute(plan, invs, cfg, workdir, agent_check=why_not)
     return report
 
 

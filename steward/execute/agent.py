@@ -13,6 +13,8 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
@@ -166,14 +168,19 @@ def _read_result(path: Path, out: AgentResult) -> None:
     out.notes = str(data.get("notes") or "")
 
 
+PROBE = object()  # `run(why_not=...)` default: probe here
+
+
 def run(ws: Workspace, prompt: str, cfg: Config, cli_bin: Path | None = None, timeout: int = 3600,
-        protect: Sequence[Path] = ()) -> AgentResult:
+        protect: Sequence[Path] = (), why_not: object = PROBE) -> AgentResult:
     """One boxed run. `protect` are absolute paths outside the clone the agent
     must not edit (the run's venvs); `timeout` comes from the run, so an
-    agent never outlives the token the steward will push with."""
-    why_not = available()
+    agent never outlives the token the steward will push with. `why_not` is
+    the run's cached `available()` answer, so the probe runs once per run,
+    not once per order."""
+    why_not = available() if why_not is PROBE else why_not
     if why_not:
-        return AgentResult(False, error=why_not)
+        return AgentResult(False, error=str(why_not))
     (ws.path / ".steward-prompt.md").write_text(prompt, encoding="utf-8")
     result_path = ws.path / RESULT_FILE
     result_path.unlink(missing_ok=True)
@@ -184,10 +191,11 @@ def run(ws: Workspace, prompt: str, cfg: Config, cli_bin: Path | None = None, ti
                 proc = _run_isolated(user, ws, argv, cli_bin, timeout, rejected)
             else:
                 with sandbox.scratch_home("steward-agent-home-") as home:
-                    proc = subprocess.run(argv, cwd=ws.path, capture_output=True, text=True,
-                                          env=environment(cli_bin, home=home), timeout=timeout)
+                    proc = _run_to_files(argv, ws.path, environment(cli_bin, home=home), timeout)
     except subprocess.TimeoutExpired:
         return AgentResult(True, error=f"agent timed out after {timeout} s", notes=_rejected_note(rejected))
+    except isolation.SetupError as exc:
+        return AgentResult(False, error=f"the agent could not be started in isolation: {exc}"[:500])
     except isolation.IsolationError as exc:
         # The clone is as it was (the copy-back is fail-closed): nothing from
         # this run lands, and the order says why instead of failing outright.
@@ -201,6 +209,8 @@ def run(ws: Workspace, prompt: str, cfg: Config, cli_bin: Path | None = None, ti
     else:
         out.outcome = "partial" if ws.dirty() else "skipped"
         out.error = (meta.get("result") or proc.stderr.strip()[-500:] or "agent left no result file")[:500]
+        if proc.returncode < 0 or proc.returncode >= 128:
+            out.error = f"the agent was killed by a signal (exit {proc.returncode}; out of memory?). {out.error}"[:500]
     out.notes = " ".join(n for n in (out.notes, _rejected_note(rejected)) if n)
     return out
 
@@ -214,26 +224,43 @@ STEWARD_FILES = LOCAL_ONLY
 def _run_isolated(user: str, ws: Workspace, argv: list[str], cli_bin: Path | None, timeout: int,
                   rejected: list[str]) -> subprocess.CompletedProcess:
     """The agent as `user`, in its own copy of the clone. The time limit is
-    enforced inside, by `timeout` running as that user, so the agent's whole
-    process group is stopped before the steward copies its tree back; the
-    outer limit is only a backstop. A timed-out run raises TimeoutExpired
-    after its work has been copied back, the same as an in-place run."""
+    enforced inside, by `timeout` running as that user. Whatever happens,
+    every process of the agent user is then stopped, the tree opened for
+    reading and copied back, before the copy is removed; a timed-out run
+    raises TimeoutExpired after that, the same as an in-place run."""
     with isolation.copy_for(user, ws.path) as iso:
         env = environment(None, home=iso.home)
         cmd = isolation.command(iso, argv, env, cli_bin.parent if cli_bin else None, timeout=timeout)
+        started = time.monotonic()
         try:
-            proc = subprocess.run(cmd, cwd=ws.path, capture_output=True, text=True, env=env,
-                                  timeout=timeout + isolation.KILL_AFTER + 60)
+            proc = _run_to_files(cmd, ws.path, env, timeout + isolation.KILL_AFTER + 60)
         finally:
+            elapsed = time.monotonic() - started
+            isolation.stop_all(user)
             isolation.open_up(iso)
             synced = isolation.sync_back(iso.tree, ws.path, skip=(*STEWARD_FILES, *ws.excluded))
             rejected += synced.rejected
             result = iso.tree / RESULT_FILE
-            if result.is_file() and not result.is_symlink():
-                shutil.copyfile(result, ws.path / RESULT_FILE)
-    if proc.returncode in isolation.TIMED_OUT:
+            if os.path.lexists(result):
+                content, _ = isolation.read_regular(result)
+                (ws.path / RESULT_FILE).write_bytes(content)
+    if isolation.timed_out(proc.returncode, elapsed, timeout):
         raise subprocess.TimeoutExpired(cmd, timeout)
     return proc
+
+
+def _run_to_files(cmd: list[str], cwd: Path, env: dict, timeout: int) -> subprocess.CompletedProcess:
+    """Run `cmd` and wait for it, not for its output pipes. A process the
+    agent detached inherits its stdout and stderr; with pipes the steward
+    would wait for that process to close them, which it never has to, and
+    the run would stall until the limit. Into files the steward owns, the
+    wait ends when the agent itself exits."""
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        done = subprocess.run(cmd, cwd=cwd, stdout=out, stderr=err, env=env, timeout=timeout)
+        out.seek(0)
+        err.seek(0)
+        return subprocess.CompletedProcess(cmd, done.returncode, out.read().decode("utf-8", "replace"),
+                                           err.read().decode("utf-8", "replace"))
 
 
 def _rejected_note(rejected: list[str]) -> str:

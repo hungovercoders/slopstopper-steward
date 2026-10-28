@@ -134,17 +134,20 @@ it can fail.
    clone, `.git` and venvs are not writable by it and the steward's
    process environment is not readable by it, so nothing it executes can
    fake the steward's verification or reach the token. Its time limit is
-   enforced by `timeout` running as that same user, which stops the
-   agent's whole process group: the steward cannot signal a process it
-   does not own. Afterwards the steward copies back regular files and
-   symlinks that, once in place and with every link resolved, still lead
-   inside the repo and outside `.git`. A symlink leading out (which the
-   steward's own check runs would follow, for instance to another
-   process's `/proc` environment), a FIFO or a device is refused and named
-   in the PR. The copy-back is fail-closed: it reads everything before it
-   touches the clone, so content the steward cannot read stops the copy
-   with the clone unchanged and the order skipped with the reason, never
-   half-synced and never mistaken for deleted.
+   enforced by `timeout` running as that same user, and when the agent is
+   done, timed out or not, every process of that user is stopped and
+   confirmed gone, so nothing it detached can change its tree while the
+   steward reads it. The steward then copies back regular files, read
+   through descriptors that refuse to follow a symlink, and symlinks that,
+   once in place and with every link resolved, still lead inside the repo
+   and outside `.git`. A symlink leading out (which the steward's own check
+   runs would follow, for instance to another process's `/proc`
+   environment), a FIFO or a device is refused and named in the PR, and
+   whatever it replaced is put back. The copy-back is a transaction: a
+   read that fails stops it before the clone is touched, a write that
+   fails rolls every change back, and so does a link the agent left alone
+   that an agent change now leads out of the repo. The order is then
+   skipped with the reason, the clone exactly as it was.
 
 Without `STEWARD_AGENT_USER` (a local run, typically) layers 1 to 3 still
 hold, and the agent shares the steward's OS user. Something it writes

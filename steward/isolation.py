@@ -18,11 +18,20 @@ read happens before the clone is touched, so a file the steward cannot
 read aborts the copy with the clone exactly as it was, never half-synced
 and never with content mistaken for deleted.
 
+Before anything is read back, every process running as the agent user
+is stopped and confirmed gone, so nothing the agent left behind (a
+detached child, a `setsid` loop) can change its tree while the steward
+reads it. Files are read through a descriptor opened without following
+symlinks and checked to be regular, and the copy into the clone is a
+transaction: an error part-way rolls every change back.
+
 The steward reaches the user through `sudo -n -u <user>` with
 `--preserve-env`, so the account running the steward needs passwordless
 sudo to that user with environment passing allowed (a GitHub runner has
-it). The base directory the run works in must be traversable by the agent
-user, so the venvs and the clone it copies can be read.
+it). Because the run stops every process of that user, the user must be
+dedicated to one steward run at a time. The base directory the run works
+in must be traversable by the agent user, so the venvs and the clone it
+copies can be read.
 """
 
 from __future__ import annotations
@@ -31,6 +40,8 @@ import os
 import shutil
 import stat
 import subprocess
+import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,13 +56,23 @@ SYSTEM_PATH = ("/usr/local/bin", "/usr/bin", "/bin")
 PER_USER = ("PATH", "HOME", "TMPDIR", "USER", "LOGNAME", "RUNNER_TEMP")
 # `timeout` runs as the agent user and kills the agent's whole process
 # group when time is up: a signal to `sudo` would not reach a process the
-# steward does not own. Exit 124 is the timeout, 137 the forced kill.
+# steward does not own.
 KILL_AFTER = 30
-TIMED_OUT = (124, 137)
+
+
+def timed_out(returncode: int, elapsed: float, limit: int) -> bool:
+    """124 is `timeout` firing. 137 is a SIGKILL, which is the timeout only
+    when it came after the limit (`--kill-after`); earlier it is something
+    else, the OOM killer for one, and must not be reported as a timeout."""
+    return returncode == 124 or (returncode == 137 and elapsed >= limit)
 
 
 class IsolationError(RuntimeError):
-    """The agent's copy could not be made, or its work could not be copied back."""
+    """The agent's work could not be copied back."""
+
+
+class SetupError(IsolationError):
+    """The agent's own copy could not be made: the agent never started."""
 
 
 def agent_user() -> str | None:
@@ -64,6 +85,8 @@ def _sudo(user: str, *cmd: str, check: bool = True, timeout: int = 600) -> subpr
                               check=check, timeout=timeout)
     except subprocess.CalledProcessError as exc:
         raise IsolationError(f"`{' '.join(cmd[:2])}` as {user} failed: {(exc.stderr or '').strip()[-300:]}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise IsolationError(f"`{' '.join(cmd[:2])}` as {user} did not finish within {timeout} s") from exc
 
 
 @dataclass
@@ -117,24 +140,77 @@ def unavailable(user: str, program: str = "claude") -> str | None:
 
 @contextmanager
 def copy_for(user: str, clone: Path) -> Iterator[Isolated]:
-    """The agent's own copy of `clone`, made and removed as the agent user."""
-    root = Path(_sudo(user, "mktemp", "-d", "/tmp/steward-agent-XXXXXXXX").stdout.strip())
+    """The agent's own copy of `clone`, made and removed as the agent user.
+    A failure before the agent starts raises SetupError."""
+    try:
+        root = Path(_sudo(user, "mktemp", "-d", "/tmp/steward-agent-XXXXXXXX").stdout.strip())
+    except IsolationError as exc:
+        raise SetupError(str(exc)) from exc
     try:
         iso = Isolated(user, root, root / "tree", root / "home", root / "tmp")
-        _sudo(user, "mkdir", "-p", str(iso.tree), str(iso.home), str(iso.tmp))
-        _sudo(user, "chmod", "755", str(root), str(iso.tree))
-        _sudo(user, "chmod", "700", str(iso.home), str(iso.tmp))
-        _sudo(user, "cp", "-RP", "--preserve=mode,timestamps", f"{clone}/.", str(iso.tree))
+        try:
+            _sudo(user, "mkdir", "-p", str(iso.tree), str(iso.home), str(iso.tmp))
+            _sudo(user, "chmod", "755", str(root), str(iso.tree))
+            _sudo(user, "chmod", "700", str(iso.home), str(iso.tmp))
+            _sudo(user, "cp", "-RP", "--preserve=mode,timestamps", f"{clone}/.", str(iso.tree), timeout=1800)
+        except IsolationError as exc:
+            raise SetupError(str(exc)) from exc
         yield iso
     finally:
+        try:
+            stop_all(user)
+        except IsolationError:
+            pass  # removal below is best effort; the run already reported what mattered
         _sudo(user, "rm", "-rf", str(root), check=False)
+
+
+def _alive(user: str) -> bool:
+    """Whether any process of `user` is still running (zombies are not)."""
+    try:
+        done = subprocess.run(["ps", "-o", "stat=", "-u", user], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    return any(line.strip() and not line.strip().startswith("Z") for line in done.stdout.splitlines())
+
+
+def stop_all(user: str) -> None:
+    """Stop every process running as `user`, and confirm none is left.
+
+    The agent's `timeout` only covers its own process group, and only when
+    time runs out; a child the agent detached (`setsid`, a daemonised
+    process) would keep changing the tree while the steward reads it. The
+    agent user can signal all of its own processes, and nothing else."""
+    for _ in range(20):
+        _sudo(user, "kill", "-KILL", "-1", check=False, timeout=30)
+        if not _alive(user):
+            return
+        time.sleep(0.1)
+    raise IsolationError(f"processes running as {user} would not stop")
 
 
 def open_up(iso: Isolated) -> None:
     """Make the agent's tree readable by the steward before copying it back.
     The agent owns every entry in it, so as that user it can grant read on
     all of them, whatever umask or tool created them 0700 or 0600."""
-    _sudo(iso.user, "chmod", "-R", "u+rwX,go+rX", str(iso.tree), check=False, timeout=600)
+    _sudo(iso.user, "chmod", "-R", "u+rwX,go+rX", str(iso.tree), check=False, timeout=1800)
+
+
+def read_regular(path: Path) -> tuple[bytes, int]:
+    """A regular file's bytes and mode, read through a descriptor opened
+    without following a symlink and checked after opening, so a file
+    swapped for a link (to another process's environment, say) between
+    being listed and being read is refused, never read as its target."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise IsolationError(f"`{path.name}` is no longer a regular file")
+        chunks = []
+        while chunk := os.read(fd, 1 << 20):
+            chunks.append(chunk)
+        return b"".join(chunks), st.st_mode
+    finally:
+        os.close(fd)
 
 
 # ── copying the agent's work back ─────────────────────────────────────
@@ -161,7 +237,10 @@ def _entries(root: Path) -> dict[str, os.stat_result]:
             dirnames[:] = [d for d in dirnames if d != ".git"]
         for name in [*filenames, *(d for d in dirnames if os.path.islink(os.path.join(dirpath, d)))]:
             rel = os.path.normpath(os.path.join(rel_dir, name))
-            out[rel] = os.lstat(os.path.join(dirpath, name))
+            try:
+                out[rel] = os.lstat(os.path.join(dirpath, name))
+            except OSError as exc:
+                raise IsolationError(f"`{rel}` changed while being read: {exc.strerror}") from exc
     return out
 
 
@@ -176,18 +255,6 @@ def _inside(clone: Path, path: Path) -> bool:
     """Whether `path`, every link on the way resolved, stays in the clone and out of `.git`."""
     real, root = Path(os.path.realpath(path)), Path(os.path.realpath(clone))
     return real.is_relative_to(root) and not real.is_relative_to(root / ".git")
-
-
-def _make_real_parents(clone: Path, rel: str) -> None:
-    """Every directory above `rel` in the clone is a real directory, not a
-    symlink the write would go through."""
-    current = clone
-    for part in Path(rel).parent.parts:
-        current = current / part
-        if current.is_symlink() or (current.exists() and not current.is_dir()):
-            current.unlink()
-        if not current.exists():
-            current.mkdir()
 
 
 def _remove(path: Path) -> None:
@@ -215,14 +282,16 @@ class _Plan:
     removals: list[str] = field(default_factory=list)
 
 
-def _new_content(src: Path, dst: Path, st: os.stat_result) -> bytes | None:
-    """The file's bytes when the copy-back must write it, else None."""
+def _new_content(src: Path, dst: Path, st: os.stat_result) -> tuple[bytes, bool] | None:
+    """The file's bytes and executable bit when the copy-back must write
+    it, else None. Mode and bytes come from the same descriptor."""
     if _unchanged(dst, st):
         return None
-    content = src.read_bytes()
+    content, mode = read_regular(src)
+    executable = bool(mode & stat.S_IXUSR)
     same = (dst.is_file() and not dst.is_symlink() and dst.read_bytes() == content
-            and (os.lstat(dst).st_mode & stat.S_IXUSR) == (st.st_mode & stat.S_IXUSR))
-    return None if same else content
+            and bool(os.lstat(dst).st_mode & stat.S_IXUSR) == executable)
+    return None if same else (content, executable)
 
 
 def _plan_entry(plan: _Plan, rejected: list[str], rel: str, st: os.stat_result, tree: Path, clone: Path) -> None:
@@ -234,9 +303,9 @@ def _plan_entry(plan: _Plan, rejected: list[str], rel: str, st: os.stat_result, 
         elif not (dst.is_symlink() and os.readlink(dst) == target):
             plan.links[rel] = target
     elif stat.S_ISREG(st.st_mode):
-        content = _new_content(src, dst, st)
-        if content is not None:
-            plan.files[rel] = (content, bool(st.st_mode & stat.S_IXUSR))
+        new = _new_content(src, dst, st)
+        if new is not None:
+            plan.files[rel] = new
     else:
         rejected.append(f"{rel}: not a regular file or symlink")
 
@@ -257,13 +326,111 @@ def _plan(tree: Path, clone: Path, owned) -> tuple[_Plan, list[str]]:
     return plan, rejected
 
 
+class _Undo:
+    """Every change the copy-back makes to the clone, so it can be taken
+    back: a path moved aside (renamed into a sibling directory on the same
+    filesystem, so nothing is copied), a path created, a directory made."""
+
+    def __init__(self, clone: Path):
+        self.dir = Path(tempfile.mkdtemp(prefix=".steward-undo-", dir=clone.parent))
+        self.log: list[tuple[str, Path, Path | None]] = []
+        self.original: dict[Path, Path] = {}
+
+    def stash(self, path: Path) -> None:
+        if not os.path.lexists(path):
+            return
+        dest = self.dir / str(len(self.log))
+        os.rename(path, dest)
+        self.original.setdefault(path, dest)
+        self.log.append(("stash", path, dest))
+
+    def created(self, path: Path) -> None:
+        self.log.append(("create", path, None))
+
+    def made_dir(self, path: Path) -> None:
+        self.log.append(("mkdir", path, None))
+
+    def restore(self, path: Path) -> None:
+        """Put back whatever was at `path` before the copy-back, and forget
+        that the path was touched."""
+        if os.path.lexists(path):
+            _remove(path)
+        dest = self.original.pop(path, None)
+        if dest is not None:
+            os.rename(dest, path)
+        self.log = [entry for entry in self.log if entry[1] != path]
+
+    def rollback(self) -> None:
+        for kind, path, dest in reversed(self.log):
+            try:
+                if kind == "create" and os.path.lexists(path):
+                    _remove(path)
+                elif kind == "mkdir":
+                    path.rmdir()
+                elif kind == "stash" and dest is not None:
+                    if os.path.lexists(path):
+                        _remove(path)
+                    os.rename(dest, path)
+            except OSError:
+                continue  # best effort: keep putting back what can be put back
+        self.commit()
+
+    def commit(self) -> None:
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+def _real_parents(clone: Path, rel: str, undo: _Undo) -> None:
+    """Every directory above `rel` in the clone is a real directory, not a
+    symlink the write would go through."""
+    current = clone
+    for part in Path(rel).parent.parts:
+        current = current / part
+        if current.is_symlink() or (os.path.lexists(current) and not current.is_dir()):
+            undo.stash(current)
+        if not os.path.lexists(current):
+            current.mkdir()
+            undo.made_dir(current)
+
+
+def _write(path: Path, content: bytes, executable: bool) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, content)
+        os.fchmod(fd, 0o755 if executable else 0o644)
+    finally:
+        os.close(fd)
+
+
+def _apply(plan: _Plan, clone: Path, undo: _Undo) -> None:
+    # Removals first: an entry the agent replaced (a directory symlink it
+    # turned into a real directory) must go before its new contents land.
+    for rel in plan.removals:
+        undo.stash(clone / rel)
+    for rel, target in plan.links.items():
+        _real_parents(clone, rel, undo)
+        undo.stash(clone / rel)
+        undo.created(clone / rel)
+        os.symlink(target, clone / rel)
+    for rel, (content, executable) in plan.files.items():
+        _real_parents(clone, rel, undo)
+        undo.stash(clone / rel)
+        undo.created(clone / rel)
+        _write(clone / rel, content, executable)
+
+
+def _escaping_links(clone: Path) -> set[str]:
+    """Every symlink in the clone that, resolved, leads outside it or into `.git`."""
+    return {rel for rel, st in _entries(clone).items()
+            if stat.S_ISLNK(st.st_mode) and not _inside(clone, clone / rel)}
+
+
 def sync_back(tree: Path, clone: Path, skip: Iterable[str] = ()) -> Synced:
     """Make the clone's working tree match the agent's, outside `.git`.
 
     `skip` are clone-relative paths the steward owns locally (its prompt,
-    the result file); they are neither copied nor removed. Raises
-    IsolationError, with the clone untouched, when anything in the agent's
-    tree cannot be read."""
+    the result file); they are neither copied nor removed. Fail-closed: a
+    read that fails raises IsolationError before the clone is touched, and
+    any failure while writing rolls the clone back to exactly what it was."""
     skipped = tuple(s.rstrip("/") for s in skip)
 
     def owned(rel: str) -> bool:
@@ -271,27 +438,30 @@ def sync_back(tree: Path, clone: Path, skip: Iterable[str] = ()) -> Synced:
 
     plan, rejected = _plan(tree, clone, owned)
     out = Synced(rejected=rejected)
-    # Removals first: an entry the agent replaced (a directory symlink it
-    # turned into a real directory) must go before its new contents land.
-    for rel in plan.removals:
-        _remove(clone / rel)
-        out.removed.append(rel)
-    for rel, target in plan.links.items():
-        _make_real_parents(clone, rel)
-        _remove(clone / rel)
-        os.symlink(target, clone / rel)
-    for rel, (content, executable) in plan.files.items():
-        _make_real_parents(clone, rel)
-        _remove(clone / rel)
-        (clone / rel).write_bytes(content)
-        (clone / rel).chmod(0o755 if executable else 0o644)
+    already_out = _escaping_links(clone)     # repo links that pointed out before the agent ran are the repo's
+    undo = _Undo(clone)
+    try:
+        _apply(plan, clone, undo)
+        # A link can look inside on its own and still lead out through
+        # others: resolve each written one with everything in place, and
+        # put back what was there before any that ends outside.
+        for rel in sorted(plan.links):
+            if not _inside(clone, clone / rel):
+                undo.restore(clone / rel)
+                del plan.links[rel]
+                out.rejected.append(f"{rel}: a symlink that resolves outside the repository or into `.git`")
+        # And a link the agent did not touch can now lead out because one it
+        # did touch changed on the way: that undoes the whole copy-back.
+        newly_out = _escaping_links(clone) - already_out
+        if newly_out:
+            raise IsolationError("the agent's changes would make " + ", ".join(f"`{r}`" for r in sorted(newly_out))
+                                 + " resolve outside the repository or into `.git`")
+    except BaseException as exc:
+        undo.rollback()
+        if isinstance(exc, OSError):
+            raise IsolationError(f"writing the agent's work into the clone failed and was rolled back: {exc}") from exc
+        raise
+    undo.commit()
+    out.removed = list(plan.removals)
     out.changed = sorted([*plan.links, *plan.files])
-    # A link can look inside on its own and still lead out through others:
-    # resolve every link written, with everything in place, and take back
-    # any that ends outside the clone or inside `.git`.
-    for rel in sorted(plan.links):
-        if not _inside(clone, clone / rel):
-            (clone / rel).unlink()
-            out.changed.remove(rel)
-            out.rejected.append(f"{rel}: a symlink that resolves outside the repository or into `.git`")
     return out

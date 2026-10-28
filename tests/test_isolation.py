@@ -103,13 +103,13 @@ def test_set_but_refused_is_loud(monkeypatch):
 def test_an_unreadable_file_aborts_with_the_clone_untouched(tmp_path, monkeypatch):
     clone = _tree(tmp_path / "clone", {"README.md": "old\n", "gone.txt": "x"})
     tree = _tree(tmp_path / "tree", {"README.md": "new\n", "secret.bin": "s"})
-    real = Path.read_bytes
+    real = os.open
 
-    def guarded(self):
-        if self.name == "secret.bin":
-            raise PermissionError(13, "Permission denied", str(self))
-        return real(self)
-    monkeypatch.setattr(Path, "read_bytes", guarded)
+    def guarded(path, *a, **k):
+        if str(path).endswith("secret.bin"):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real(path, *a, **k)
+    monkeypatch.setattr(isolation.os, "open", guarded)
     with pytest.raises(isolation.IsolationError, match="secret.bin"):
         isolation.sync_back(tree, clone)
     assert (clone / "README.md").read_text() == "old\n" and (clone / "gone.txt").exists()
@@ -149,7 +149,7 @@ def test_an_untouched_file_is_not_read(tmp_path, monkeypatch):
     tree = _tree(tmp_path / "tree", {"big.bin": "same"})
     st = os.stat(clone / "big.bin")
     os.utime(tree / "big.bin", ns=(st.st_atime_ns, st.st_mtime_ns))   # what cp --preserve=timestamps leaves
-    monkeypatch.setattr(Path, "read_bytes", lambda self: pytest.fail(f"read {self.name}"))
+    monkeypatch.setattr(isolation, "read_regular", lambda path: pytest.fail(f"read {path.name}"))
     assert isolation.sync_back(tree, clone).changed == []
 
 
@@ -179,6 +179,14 @@ if args == ["--version"]:
     print("fake-claude 0.0")
     sys.exit(0)
 brief0 = args[args.index("-p") + 1]
+if "DETACH=1" in brief0:
+    import subprocess
+    # outside the agent's process group (setsid), still writing after the agent exits
+    subprocess.Popen(["setsid", "sh", "-c", "while true; do date +%N > churn.md; sleep 0.01; done"],
+                     start_new_session=True)
+    open(".steward-result.json", "w").write(json.dumps({"outcome": "fixed", "summary": "detached"}))
+    print(json.dumps({"total_cost_usd": 0.0, "num_turns": 1}))
+    sys.exit(0)
 if "HANG=1" in brief0:
     import subprocess, time
     open("before.md", "w").write("written before the hang\n")
@@ -289,3 +297,152 @@ def test_a_timed_out_agent_is_stopped_before_its_tree_is_copied(world):
     assert not (clone / "after.md").exists()
     left = subprocess.run(["pgrep", "-u", AGENT_USER, "-f", "sleep 300"], capture_output=True, text=True)
     assert left.stdout.strip() == "", "the agent's child outlived the timeout"
+
+
+# ── sixth review: races, the transaction, chains through untouched links ──
+
+def _snapshot(root: Path) -> dict:
+    out = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in [*filenames, *dirnames]:
+            p = Path(dirpath) / name
+            rel = str(p.relative_to(root))
+            out[rel] = ("link", os.readlink(p)) if p.is_symlink() else ("dir",) if p.is_dir() else ("file", p.read_bytes())
+    return out
+
+
+def test_a_file_swapped_for_a_symlink_mid_read_is_refused(tmp_path, monkeypatch):
+    secret = tmp_path / "steward-secret"
+    secret.write_text("GH_TOKEN=ghs_secret\n")
+    clone = _tree(tmp_path / "clone", {"README.md": "old\n"})
+    tree = _tree(tmp_path / "tree", {"README.md": "new\n"})
+    before = _snapshot(clone)
+    real = isolation._unchanged
+
+    def swap_then_check(dst, st):           # runs between the walk's lstat and the read
+        (tree / "README.md").unlink()
+        os.symlink(str(secret), tree / "README.md")
+        return real(dst, st)
+    monkeypatch.setattr(isolation, "_unchanged", swap_then_check)
+    with pytest.raises(isolation.IsolationError):
+        isolation.sync_back(tree, clone)
+    assert _snapshot(clone) == before and "ghs_secret" not in (clone / "README.md").read_text()
+
+
+def test_read_regular_refuses_a_symlink_and_a_fifo(tmp_path):
+    (tmp_path / "real").write_text("x")
+    os.symlink(str(tmp_path / "real"), tmp_path / "link")
+    os.mkfifo(tmp_path / "fifo")
+    assert isolation.read_regular(tmp_path / "real")[0] == b"x"
+    with pytest.raises(OSError):
+        isolation.read_regular(tmp_path / "link")
+    with pytest.raises(isolation.IsolationError):
+        isolation.read_regular(tmp_path / "fifo")
+
+
+def test_an_untouched_link_that_now_leads_out_rolls_everything_back(tmp_path):
+    clone = _tree(tmp_path / "work" / "clone", {"README.md": "x", "d/keep.md": "k"})
+    os.symlink("d/..", clone / "x")          # inside today: d is a real directory
+    tree = _tree(tmp_path / "work" / "tree", {"README.md": "changed", "d-gone": ""})
+    (tree / "d-gone").unlink()
+    os.symlink("d/..", tree / "x")           # untouched by the agent
+    os.symlink(".", tree / "d")              # the agent's change: x now resolves to the clone's parent
+    before = _snapshot(clone)
+    with pytest.raises(isolation.IsolationError, match="`x`"):
+        isolation.sync_back(tree, clone)
+    assert _snapshot(clone) == before
+    assert not list((tmp_path / "work").glob(".steward-undo-*"))
+
+
+def test_a_rejected_link_puts_back_the_file_it_replaced(tmp_path):
+    clone = _tree(tmp_path / "work" / "clone", {"README.md": "x", "docs/guide.md": "the guide\n"})
+    tree = _tree(tmp_path / "work" / "tree", {"README.md": "x", "docs/.keep": ""})
+    os.symlink(".", tree / "here")
+    os.symlink("../here/..", tree / "docs" / "guide.md")   # lexically ".", really the clone's parent
+    out = isolation.sync_back(tree, clone)
+    assert (clone / "docs" / "guide.md").read_text() == "the guide\n" and not (clone / "docs" / "guide.md").is_symlink()
+    assert any(r.startswith("docs/guide.md:") for r in out.rejected) and "docs/guide.md" not in out.changed
+    assert "docs/guide.md" not in out.removed
+
+
+def test_a_failed_write_rolls_the_clone_back(tmp_path, monkeypatch):
+    clone = _tree(tmp_path / "work" / "clone", {"a.md": "a", "b.md": "b", "gone.md": "g", "dirlink/x": "x"})
+    tree = _tree(tmp_path / "work" / "tree", {"a.md": "A", "b.md": "B", "new/c.md": "c"})
+    os.symlink("a.md", tree / "alias.md")
+    before = _snapshot(clone)
+    real, calls = isolation._write, []
+
+    def full_disk(path, content, executable):
+        calls.append(path)
+        if len(calls) == 2:
+            raise OSError(28, "No space left on device", str(path))
+        real(path, content, executable)
+    monkeypatch.setattr(isolation, "_write", full_disk)
+    with pytest.raises(isolation.IsolationError, match="rolled back"):
+        isolation.sync_back(tree, clone)
+    assert _snapshot(clone) == before
+    assert not list((tmp_path / "work").glob(".steward-undo-*"))
+
+
+def test_an_entry_vanishing_mid_walk_is_an_isolation_error(tmp_path, monkeypatch):
+    tree = _tree(tmp_path / "tree", {"README.md": "x", "tmp.txt": "t"})
+    real = os.lstat
+    monkeypatch.setattr(isolation.os, "lstat", lambda p, *a, **k: (_ for _ in ()).throw(
+        FileNotFoundError(2, "No such file or directory", p)) if str(p).endswith("tmp.txt") else real(p, *a, **k))
+    with pytest.raises(isolation.IsolationError, match="tmp.txt"):
+        isolation._entries(tree)
+
+
+def test_a_slow_sudo_is_an_isolation_error(monkeypatch):
+    def slow(*a, **k):
+        raise subprocess.TimeoutExpired(a[0], k.get("timeout"))
+    monkeypatch.setattr(isolation.subprocess, "run", slow)
+    with pytest.raises(isolation.IsolationError, match="did not finish"):
+        isolation._sudo("steward-agent", "chmod", "-R", "x", timeout=5)
+
+
+def test_only_a_real_timeout_counts_as_one():
+    assert isolation.timed_out(124, 1.0, 3600)
+    assert isolation.timed_out(137, 3631.0, 3600)          # TERM ignored, killed after --kill-after
+    assert not isolation.timed_out(137, 300.0, 3600)       # the OOM killer five minutes in
+    assert not isolation.timed_out(0, 3700.0, 3600)
+
+
+def test_a_setup_failure_says_the_agent_never_started(tmp_path, monkeypatch):
+    def refuse(user, *cmd, **k):
+        raise isolation.IsolationError("`cp -RP` as steward-agent failed: Permission denied")
+    monkeypatch.setattr(isolation, "_sudo", refuse)
+    with pytest.raises(isolation.SetupError):
+        with isolation.copy_for("steward-agent", tmp_path):
+            pass
+    clone = _tree(tmp_path / "clone", {"README.md": "x"})
+    subprocess.run(["git", "init", "-q"], cwd=clone, check=True)
+    monkeypatch.setenv(isolation.AGENT_USER_ENV, "steward-agent")
+    result = agent.run(workspace.Workspace("acme/a", clone, "main"), "brief", CFG, why_not=None)
+    assert not result.ran and "could not be started" in result.error and "copied back" not in result.error
+
+
+def test_the_probe_runs_once_per_run_and_only_when_needed(monkeypatch, tmp_path):
+    from steward import runner
+    calls = []
+    monkeypatch.setattr(runner.agent, "available", lambda: calls.append(1) or None)
+    ctx = runner.RunContext(base=tmp_path)
+    assert ctx.agent_unavailable() is None and ctx.agent_unavailable() is None
+    assert len(calls) == 1
+    from steward.discover import Repo
+    from steward.inventory import Inventory
+    inv = Inventory(Repo("acme/a", pinned="0.26.0", installed_from="0.26.0", evidence=["mise-pin"]), "0.27.0")
+    monkeypatch.setattr(runner, "gather", lambda cfg, only=None: ([inv], {"acme/a": "0.27.0"}, "0.27.0"))
+    monkeypatch.setattr(runner, "execute", lambda plan, invs, cfg, workdir, agent_check=None: [])
+    calls.clear()
+    runner.run(CFG, None, False, tmp_path)      # an upgrade only: nothing agentic
+    assert calls == []
+
+
+@needs_agent_user
+def test_a_detached_agent_process_is_stopped_before_the_copy_back(world):
+    venv_bin, clone, ws = world
+    result = agent.run(ws, "DETACH=1", CFG, cli_bin=venv_bin / "slopstopper", timeout=60)
+    assert result.ran and result.outcome == "fixed", result.error
+    assert not isolation._alive(AGENT_USER), "a setsid child of the agent outlived the run"
+    assert not list(Path("/tmp").glob("steward-agent-*"))
