@@ -56,11 +56,15 @@ On Actions the agent runs as its own OS user: the run workflow creates
 `steward-agent` and sets `STEWARD_AGENT_USER`, so it cannot touch the
 steward's clone, venvs or token. Running the steward unattended anywhere
 else, do the same: create an unprivileged user, give the steward's
-account passwordless `sudo -u` to it, install the `claude` CLI where that
-user can run it (`/usr/local/bin`), and export `STEWARD_AGENT_USER`. A
-`--workdir` must then be traversable by that user. With the variable set
-but `sudo` refused, agentic orders are skipped with the reason rather
-than run unisolated.
+account passwordless `sudo -u` to it with environment passing allowed
+(`--preserve-env`, which a rule for `ALL` commands implies; a narrower
+rule needs `SETENV`), install the `claude` CLI and the `node` it runs on
+where that user finds them (`/usr/local/bin`, `/usr/bin` or `/bin`), and
+export `STEWARD_AGENT_USER`. A `--workdir` must then be traversable by
+that user. Before any agentic order the steward probes exactly this, by
+running `claude --version` as the agent user the way the run will; if the
+probe fails, agentic orders are skipped with its reason rather than run
+unisolated.
 
 The agentic orders (a finding to triage, a red check after an upgrade)
 run Claude Code headless. Add the secret `ANTHROPIC_API_KEY` (or a

@@ -133,11 +133,18 @@ it can fail.
    its own copy of the clone (`steward/isolation.py`). The steward's
    clone, `.git` and venvs are not writable by it and the steward's
    process environment is not readable by it, so nothing it executes can
-   fake the steward's verification or reach the token. Afterwards the
-   steward copies back regular files and symlinks that stay inside the
-   repo; a symlink pointing out of it (which the steward's own check runs
-   would follow, for instance to another process's `/proc` environment), a
-   FIFO or a device is refused and named in the PR.
+   fake the steward's verification or reach the token. Its time limit is
+   enforced by `timeout` running as that same user, which stops the
+   agent's whole process group: the steward cannot signal a process it
+   does not own. Afterwards the steward copies back regular files and
+   symlinks that, once in place and with every link resolved, still lead
+   inside the repo and outside `.git`. A symlink leading out (which the
+   steward's own check runs would follow, for instance to another
+   process's `/proc` environment), a FIFO or a device is refused and named
+   in the PR. The copy-back is fail-closed: it reads everything before it
+   touches the clone, so content the steward cannot read stops the copy
+   with the clone unchanged and the order skipped with the reason, never
+   half-synced and never mistaken for deleted.
 
 Without `STEWARD_AGENT_USER` (a local run, typically) layers 1 to 3 still
 hold, and the agent shares the steward's OS user. Something it writes

@@ -20,7 +20,7 @@ from typing import Sequence
 from steward import gh, isolation, sandbox
 from steward.config import Config
 from steward.prompts import RESULT_FILE
-from steward.workspace import Workspace, guarded_git_dir
+from steward.workspace import LOCAL_ONLY, Workspace, guarded_git_dir
 
 SKILLS = ("slopstopper-triage", "slopstopper-install")
 # Which `slopstopper run` targets the agent may call: the ones that read
@@ -69,13 +69,15 @@ class AgentResult:
 
 
 def available() -> str | None:
-    """Why the agent cannot run, or None when it can."""
-    if shutil.which("claude") is None:
-        return "claude CLI not on PATH"
+    """Why the agent cannot run, or None when it can. Isolated, the probe
+    runs `claude --version` as the agent user, the way the run will: the
+    steward's own PATH says nothing about what that user can find."""
     if not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")):
         return "no ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN"
     user = isolation.agent_user()
-    return isolation.unavailable(user) if user else None
+    if user:
+        return isolation.unavailable(user)
+    return None if shutil.which("claude") else "claude CLI not on PATH"
 
 
 def ensure_skills(ws: Workspace, pinned: str | None, slopstopper_repo: str) -> str:
@@ -186,6 +188,11 @@ def run(ws: Workspace, prompt: str, cfg: Config, cli_bin: Path | None = None, ti
                                           env=environment(cli_bin, home=home), timeout=timeout)
     except subprocess.TimeoutExpired:
         return AgentResult(True, error=f"agent timed out after {timeout} s", notes=_rejected_note(rejected))
+    except isolation.IsolationError as exc:
+        # The clone is as it was (the copy-back is fail-closed): nothing from
+        # this run lands, and the order says why instead of failing outright.
+        return AgentResult(True, outcome="skipped", error=f"the agent's work was not copied back: {exc}"[:500],
+                           notes=_rejected_note(rejected))
     meta = _meta(proc.stdout)
     out = AgentResult(True, cost_usd=meta.get("total_cost_usd"), turns=meta.get("num_turns"))
     if result_path.is_file():
@@ -199,26 +206,34 @@ def run(ws: Workspace, prompt: str, cfg: Config, cli_bin: Path | None = None, ti
 
 
 # What the steward keeps for itself in the clone: never copied back from the
-# agent's tree, never removed because the agent's tree lacks it.
-STEWARD_FILES = (".steward-prompt.md", RESULT_FILE, ".steward-release-notes.md")
+# agent's tree, never removed because the agent's tree lacks it. One list,
+# the one the clone's `.git/info/exclude` is written from.
+STEWARD_FILES = LOCAL_ONLY
 
 
 def _run_isolated(user: str, ws: Workspace, argv: list[str], cli_bin: Path | None, timeout: int,
                   rejected: list[str]) -> subprocess.CompletedProcess:
-    """The agent as `user`, in its own copy of the clone. Whatever happens,
-    its work is copied back before the copy is removed, so a timeout keeps
-    what it did the same way an in-place run does."""
+    """The agent as `user`, in its own copy of the clone. The time limit is
+    enforced inside, by `timeout` running as that user, so the agent's whole
+    process group is stopped before the steward copies its tree back; the
+    outer limit is only a backstop. A timed-out run raises TimeoutExpired
+    after its work has been copied back, the same as an in-place run."""
     with isolation.copy_for(user, ws.path) as iso:
         env = environment(None, home=iso.home)
+        cmd = isolation.command(iso, argv, env, cli_bin.parent if cli_bin else None, timeout=timeout)
         try:
-            return subprocess.run(isolation.command(iso, argv, env, cli_bin.parent if cli_bin else None),
-                                  cwd=ws.path, capture_output=True, text=True, env=env, timeout=timeout)
+            proc = subprocess.run(cmd, cwd=ws.path, capture_output=True, text=True, env=env,
+                                  timeout=timeout + isolation.KILL_AFTER + 60)
         finally:
+            isolation.open_up(iso)
             synced = isolation.sync_back(iso.tree, ws.path, skip=(*STEWARD_FILES, *ws.excluded))
             rejected += synced.rejected
             result = iso.tree / RESULT_FILE
             if result.is_file() and not result.is_symlink():
                 shutil.copyfile(result, ws.path / RESULT_FILE)
+    if proc.returncode in isolation.TIMED_OUT:
+        raise subprocess.TimeoutExpired(cmd, timeout)
+    return proc
 
 
 def _rejected_note(rejected: list[str]) -> str:
