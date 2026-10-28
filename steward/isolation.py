@@ -31,11 +31,15 @@ sudo to that user with environment passing allowed (a GitHub runner has
 it). Because the run stops every process of that user, the user must be
 dedicated to one steward run at a time. The base directory the run works
 in must be traversable by the agent user, so the venvs and the clone it
-copies can be read.
+copies can be read. The agent user should also be denied cron and `at`
+(the run workflow lists it in `/etc/cron.deny` and `/etc/at.deny`); the
+steward clears its crontab and `at` queue anyway, and undoes a copy-back
+during which any process of that user was running.
 """
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import stat
@@ -138,6 +142,26 @@ def unavailable(user: str, program: str = "claude") -> str | None:
     return None
 
 
+def reaches(user: str, path: Path) -> bool:
+    """Whether `user` can traverse and read `path` (a `--workdir`, say)."""
+    try:
+        done = _sudo(user, "test", "-r", str(path), "-a", "-x", str(path), check=False, timeout=30)
+    except IsolationError:
+        return False
+    return done.returncode == 0
+
+
+def check_cli(user: str, cli_bin: Path) -> None:
+    """Prove `user` can run the pinned CLI the agent will be handed, the
+    venv's interpreter included, before any copy is made: a venv under a
+    home only the steward can enter would otherwise fail inside the agent."""
+    path = os.pathsep.join([str(cli_bin.parent), *SYSTEM_PATH])
+    try:
+        _sudo(user, "/usr/bin/env", f"PATH={path}", str(cli_bin), "--version", timeout=120)
+    except IsolationError as exc:
+        raise SetupError(f"{user} cannot run the pinned CLI at {cli_bin}: {exc}") from exc
+
+
 @contextmanager
 def copy_for(user: str, clone: Path) -> Iterator[Isolated]:
     """The agent's own copy of `clone`, made and removed as the agent user.
@@ -179,13 +203,24 @@ def stop_all(user: str) -> None:
     The agent's `timeout` only covers its own process group, and only when
     time runs out; a child the agent detached (`setsid`, a daemonised
     process) would keep changing the tree while the steward reads it. The
-    agent user can signal all of its own processes, and nothing else."""
+    agent user can signal all of its own processes, and nothing else. Its
+    crontab and `at` queue are cleared first, since either could start it
+    again once the steward starts reading."""
+    _sudo(user, "crontab", "-r", check=False, timeout=30)
+    _sudo(user, "/bin/sh", "-c", "command -v atq >/dev/null 2>&1 && atq | cut -f1 | xargs -r atrm",
+          check=False, timeout=30)
     for _ in range(20):
         _sudo(user, "kill", "-KILL", "-1", check=False, timeout=30)
         if not _alive(user):
             return
         time.sleep(0.1)
     raise IsolationError(f"processes running as {user} would not stop")
+
+
+def frozen(user: str) -> bool:
+    """No process of `user` is running: checked again after the copy-back,
+    which is undone if something of the agent's ran while it read."""
+    return not _alive(user)
 
 
 def open_up(iso: Isolated) -> None:
@@ -195,20 +230,43 @@ def open_up(iso: Isolated) -> None:
     _sudo(iso.user, "chmod", "-R", "u+rwX,go+rX", str(iso.tree), check=False, timeout=1800)
 
 
-def read_regular(path: Path) -> tuple[bytes, int]:
-    """A regular file's bytes and mode, read through a descriptor opened
-    without following a symlink and checked after opening, so a file
-    swapped for a link (to another process's environment, say) between
-    being listed and being read is refused, never read as its target."""
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+_READ = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+
+
+def _open_in(root: Path, rel: str, flags: int = _READ) -> int:
+    """Open `rel` under `root` one component at a time, refusing a symlink at
+    every step: O_NOFOLLOW alone covers only the last component, and a
+    directory on the way swapped for a link would otherwise be followed."""
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise IsolationError(f"`{path.name}` is no longer a regular file")
+        parts = Path(rel).parts
+        for part in parts[:-1]:
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+        return os.open(parts[-1], flags, dir_fd=fd)
+    finally:
+        os.close(fd)
+
+
+def _regular_fd(root: Path, rel: str) -> int:
+    fd = _open_in(root, rel)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise IsolationError(f"`{rel}` is not a regular file")
+    return fd
+
+
+def read_regular(root: Path, rel: str) -> tuple[bytes, int]:
+    """A regular file's bytes and mode, read without following a symlink at
+    any step of the path, checked after opening, so a file or directory
+    swapped for a link between being listed and being read is refused."""
+    fd = _regular_fd(root, rel)
+    try:
         chunks = []
         while chunk := os.read(fd, 1 << 20):
             chunks.append(chunk)
-        return b"".join(chunks), st.st_mode
+        return b"".join(chunks), os.fstat(fd).st_mode
     finally:
         os.close(fd)
 
@@ -222,25 +280,47 @@ class Synced:
     rejected: list[str] = field(default_factory=list)  # "path: why"
 
 
-def _entries(root: Path) -> dict[str, os.stat_result]:
-    """Every non-directory entry under `root` except `.git`, by relative path,
-    without following symlinks (a symlinked directory is one entry). Any
-    directory that cannot be read raises: skipping it would make its
-    contents look deleted."""
+GIT = ".git"
+
+
+def _git_entries(rel_dir: str, dirpath: str, dirnames: list[str], filenames: list[str]) -> list[str]:
+    """The `.git` names in one directory, other than the copy's own repository."""
+    found = []
+    for name in (n for n in (*dirnames, *filenames) if n == GIT):
+        rel = os.path.normpath(os.path.join(rel_dir, name))
+        own_repo = rel == GIT and name in dirnames and not os.path.islink(os.path.join(dirpath, name))
+        if not own_repo:
+            found.append(rel)
+    return found
+
+
+def _lstat(dirpath: str, name: str, rel: str) -> os.stat_result:
+    try:
+        return os.lstat(os.path.join(dirpath, name))
+    except OSError as exc:
+        raise IsolationError(f"`{rel}` changed while being read: {exc.strerror}") from exc
+
+
+def _entries(root: Path, git_entries: list[str] | None = None) -> dict[str, os.stat_result]:
+    """Every non-directory entry under `root`, by relative path, without
+    following symlinks (a symlinked directory is one entry). Anything named
+    `.git`, at any depth and of any kind, is left out and listed in
+    `git_entries`: a `.git` file or link in the agent's tree would otherwise
+    replace the clone's repository. Any directory that cannot be read
+    raises: skipping it would make its contents look deleted."""
     def fail(exc: OSError) -> None:
         raise IsolationError(f"cannot read `{exc.filename}` in the agent's tree: {exc.strerror}")
 
     out: dict[str, os.stat_result] = {}
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False, onerror=fail):
         rel_dir = os.path.relpath(dirpath, root)
-        if rel_dir == ".":
-            dirnames[:] = [d for d in dirnames if d != ".git"]
-        for name in [*filenames, *(d for d in dirnames if os.path.islink(os.path.join(dirpath, d)))]:
+        if git_entries is not None:
+            git_entries += _git_entries(rel_dir, dirpath, dirnames, filenames)
+        dirnames[:] = [d for d in dirnames if d != GIT]
+        links = [d for d in dirnames if os.path.islink(os.path.join(dirpath, d))]
+        for name in [*(f for f in filenames if f != GIT), *links]:
             rel = os.path.normpath(os.path.join(rel_dir, name))
-            try:
-                out[rel] = os.lstat(os.path.join(dirpath, name))
-            except OSError as exc:
-                raise IsolationError(f"`{rel}` changed while being read: {exc.strerror}") from exc
+            out[rel] = _lstat(dirpath, name, rel)
     return out
 
 
@@ -277,21 +357,35 @@ def _unchanged(dst: Path, st: os.stat_result) -> bool:
 
 @dataclass
 class _Plan:
-    files: dict[str, tuple[bytes, bool]] = field(default_factory=dict)  # rel -> (content, executable)
+    files: list[str] = field(default_factory=list)                      # rels to copy from the agent's tree
     links: dict[str, str] = field(default_factory=dict)                 # rel -> target
     removals: list[str] = field(default_factory=list)
 
 
-def _new_content(src: Path, dst: Path, st: os.stat_result) -> tuple[bytes, bool] | None:
-    """The file's bytes and executable bit when the copy-back must write
-    it, else None. Mode and bytes come from the same descriptor."""
+def _differs(tree: Path, rel: str, dst: Path, st: os.stat_result) -> bool:
+    """Whether the copy-back must write `rel`. Cheap checks first (the copy
+    kept timestamps; then size and executable bit); only same-sized files
+    are compared, a chunk at a time, through no-follow descriptors."""
     if _unchanged(dst, st):
-        return None
-    content, mode = read_regular(src)
-    executable = bool(mode & stat.S_IXUSR)
-    same = (dst.is_file() and not dst.is_symlink() and dst.read_bytes() == content
-            and bool(os.lstat(dst).st_mode & stat.S_IXUSR) == executable)
-    return None if same else (content, executable)
+        return False
+    try:
+        ds = os.lstat(dst)
+    except FileNotFoundError:
+        return True
+    if (not stat.S_ISREG(ds.st_mode) or ds.st_size != st.st_size
+            or (ds.st_mode & stat.S_IXUSR) != (st.st_mode & stat.S_IXUSR)):
+        return True
+    src = _regular_fd(tree, rel)
+    try:
+        with open(dst, "rb") as theirs_copy:
+            while True:
+                a, b = os.read(src, 1 << 20), theirs_copy.read(1 << 20)
+                if a != b:
+                    return True
+                if not a:
+                    return False
+    finally:
+        os.close(src)
 
 
 def _plan_entry(plan: _Plan, rejected: list[str], rel: str, st: os.stat_result, tree: Path, clone: Path) -> None:
@@ -303,18 +397,18 @@ def _plan_entry(plan: _Plan, rejected: list[str], rel: str, st: os.stat_result, 
         elif not (dst.is_symlink() and os.readlink(dst) == target):
             plan.links[rel] = target
     elif stat.S_ISREG(st.st_mode):
-        new = _new_content(src, dst, st)
-        if new is not None:
-            plan.files[rel] = new
+        if _differs(tree, rel, dst, st):
+            plan.files.append(rel)
     else:
         rejected.append(f"{rel}: not a regular file or symlink")
 
 
-def _plan(tree: Path, clone: Path, owned) -> tuple[_Plan, list[str]]:
-    """Everything the copy-back will do, with every byte read already, and
-    nothing in the clone touched yet."""
-    plan, rejected = _Plan(), []
-    theirs, ours = _entries(tree), _entries(clone)
+def _plan(tree: Path, clone: Path, owned) -> tuple[_Plan, list[str], dict[str, os.stat_result]]:
+    """What the copy-back will do, and the clone's entries as they are; the
+    clone is not touched. Every comparison has already read what it needed."""
+    plan, rejected, git_entries = _Plan(), [], []
+    theirs, ours = _entries(tree, git_entries), _entries(clone)
+    rejected += [f"{rel}: a `.git` entry is never copied back" for rel in git_entries]
     plan.removals = [rel for rel in sorted(set(ours) - set(theirs)) if not owned(rel)]
     for rel, st in sorted(theirs.items()):
         if owned(rel):
@@ -323,7 +417,7 @@ def _plan(tree: Path, clone: Path, owned) -> tuple[_Plan, list[str]]:
             _plan_entry(plan, rejected, rel, st, tree, clone)
         except OSError as exc:
             raise IsolationError(f"cannot read `{rel}` in the agent's tree: {exc.strerror}") from exc
-    return plan, rejected
+    return plan, rejected, ours
 
 
 class _Undo:
@@ -392,16 +486,34 @@ def _real_parents(clone: Path, rel: str, undo: _Undo) -> None:
             undo.made_dir(current)
 
 
-def _write(path: Path, content: bytes, executable: bool) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+def _write_all(fd: int, data: bytes) -> None:
+    """os.write may write less than asked (a filling disk, or more than about
+    2 GiB at once); loop until all of it is down, and treat no progress as
+    a full disk rather than a silently truncated file."""
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+        view = view[written:]
+
+
+def _copy(tree: Path, rel: str, dst: Path) -> None:
+    src = _regular_fd(tree, rel)
     try:
-        os.write(fd, content)
-        os.fchmod(fd, 0o755 if executable else 0o644)
+        executable = bool(os.fstat(src).st_mode & stat.S_IXUSR)
+        out = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            while chunk := os.read(src, 1 << 20):
+                _write_all(out, chunk)
+            os.fchmod(out, 0o755 if executable else 0o644)
+        finally:
+            os.close(out)
     finally:
-        os.close(fd)
+        os.close(src)
 
 
-def _apply(plan: _Plan, clone: Path, undo: _Undo) -> None:
+def _apply(plan: _Plan, tree: Path, clone: Path, undo: _Undo) -> None:
     # Removals first: an entry the agent replaced (a directory symlink it
     # turned into a real directory) must go before its new contents land.
     for rel in plan.removals:
@@ -411,37 +523,39 @@ def _apply(plan: _Plan, clone: Path, undo: _Undo) -> None:
         undo.stash(clone / rel)
         undo.created(clone / rel)
         os.symlink(target, clone / rel)
-    for rel, (content, executable) in plan.files.items():
+    for rel in plan.files:
         _real_parents(clone, rel, undo)
         undo.stash(clone / rel)
         undo.created(clone / rel)
-        _write(clone / rel, content, executable)
+        _copy(tree, rel, clone / rel)
 
 
-def _escaping_links(clone: Path) -> set[str]:
-    """Every symlink in the clone that, resolved, leads outside it or into `.git`."""
-    return {rel for rel, st in _entries(clone).items()
-            if stat.S_ISLNK(st.st_mode) and not _inside(clone, clone / rel)}
+def _escaping(clone: Path, rels: Iterable[str]) -> set[str]:
+    """Those of `rels` (symlinks in the clone) that, resolved, lead outside it or into `.git`."""
+    return {rel for rel in rels if not _inside(clone, clone / rel)}
 
 
-def sync_back(tree: Path, clone: Path, skip: Iterable[str] = ()) -> Synced:
+def sync_back(tree: Path, clone: Path, skip: Iterable[str] = (), frozen=None) -> Synced:
     """Make the clone's working tree match the agent's, outside `.git`.
 
     `skip` are clone-relative paths the steward owns locally (its prompt,
-    the result file); they are neither copied nor removed. Fail-closed: a
-    read that fails raises IsolationError before the clone is touched, and
-    any failure while writing rolls the clone back to exactly what it was."""
+    the result file); they are neither copied nor removed. `frozen`, when
+    given, is asked once everything is written: False means something of
+    the agent's ran during the copy-back, and it is undone. Fail-closed: a
+    read that fails while planning raises IsolationError before the clone
+    is touched, and any failure after that rolls the clone back exactly."""
     skipped = tuple(s.rstrip("/") for s in skip)
 
     def owned(rel: str) -> bool:
         return any(rel == s or rel.startswith(s + "/") for s in skipped)
 
-    plan, rejected = _plan(tree, clone, owned)
+    plan, rejected, ours = _plan(tree, clone, owned)
     out = Synced(rejected=rejected)
-    already_out = _escaping_links(clone)     # repo links that pointed out before the agent ran are the repo's
+    links_before = {rel for rel, st in ours.items() if stat.S_ISLNK(st.st_mode)}
+    already_out = _escaping(clone, links_before)   # repo links that pointed out before the agent ran are the repo's
     undo = _Undo(clone)
     try:
-        _apply(plan, clone, undo)
+        _apply(plan, tree, clone, undo)
         # A link can look inside on its own and still lead out through
         # others: resolve each written one with everything in place, and
         # put back what was there before any that ends outside.
@@ -452,10 +566,15 @@ def sync_back(tree: Path, clone: Path, skip: Iterable[str] = ()) -> Synced:
                 out.rejected.append(f"{rel}: a symlink that resolves outside the repository or into `.git`")
         # And a link the agent did not touch can now lead out because one it
         # did touch changed on the way: that undoes the whole copy-back.
-        newly_out = _escaping_links(clone) - already_out
+        # The links now are the ones before, less what was removed or
+        # overwritten by a file, plus the ones written: no second walk.
+        links_now = (links_before - set(plan.removals) - set(plan.files)) | set(plan.links)
+        newly_out = _escaping(clone, links_now) - already_out
         if newly_out:
             raise IsolationError("the agent's changes would make " + ", ".join(f"`{r}`" for r in sorted(newly_out))
                                  + " resolve outside the repository or into `.git`")
+        if frozen is not None and not frozen():
+            raise IsolationError("a process of the agent user was running during the copy-back")
     except BaseException as exc:
         undo.rollback()
         if isinstance(exc, OSError):

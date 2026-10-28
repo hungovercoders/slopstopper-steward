@@ -32,12 +32,14 @@ class RunContext:
     base: Path
     deadline: float | None = None  # epoch seconds the push token is good until (STEWARD_DEADLINE)
     releases: dict = field(default_factory=dict)
-    agent_check: object = agent.PROBE  # agent.available(), asked at most once per run
+    agent_check: str | None = None   # agent.available(), once agent_checked
+    agent_checked: bool = False
 
     def agent_unavailable(self) -> str | None:
-        if self.agent_check is agent.PROBE:
-            self.agent_check = agent.available()
-        return self.agent_check  # type: ignore[return-value]
+        """Why the agent cannot run in this run, asked at most once."""
+        if not self.agent_checked:
+            self.agent_check, self.agent_checked = agent.available(), True
+        return self.agent_check
 
     def venv(self, version: str) -> Path:
         """One venv per version per run, outside every clone (the agent's
@@ -164,7 +166,7 @@ def _settle_red(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspa
         return red, unverified, None
     agent.ensure_skills(ws, order.target, cfg.slopstopper_repo)
     result = agent.run(ws, prompts.verify(order, inv, red, cfg.slopstopper_repo), cfg, cli,
-                       timeout=ctx.agent_timeout(), protect=ctx.protected(), why_not=ctx.agent_unavailable())
+                       timeout=ctx.agent_timeout(), protect=ctx.protected(), preflight=ctx.agent_unavailable)
     if not result.ran:
         return red, unverified, result
     red, unverified = _verify_pass(ws, cli)
@@ -246,7 +248,7 @@ def work_triage(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspa
     cli = refresh.cli_for(version, ctx.venv(version), cfg.package)
     agent.ensure_skills(ws, version, cfg.slopstopper_repo)
     result = agent.run(ws, prompts.triage(order, inv, issue.get("body") or "", cfg.slopstopper_repo), cfg, cli,
-                       timeout=ctx.agent_timeout(), protect=ctx.protected(), why_not=ctx.agent_unavailable())
+                       timeout=ctx.agent_timeout(), protect=ctx.protected(), preflight=ctx.agent_unavailable)
     if not result.ran:
         return Outcome(order.to_dict(), "skipped", detail=result.error, agent=result.to_dict())
     red, unverified = _recheck(order, ws, cli)
@@ -276,13 +278,17 @@ def _triage_pr(order: Order, cfg: Config, ws: workspace.Workspace, result: Agent
 # ── the run ──────────────────────────────────────────────────────────
 
 def execute(plan: Plan, invs: list[inventory.Inventory], cfg: Config, workdir: Path | None,
-            agent_check: object = agent.PROBE) -> list[Outcome]:
+            agent_check: str | None = None, agent_checked: bool = False) -> list[Outcome]:
     by_repo = {inv.repo.full_name: inv for inv in invs}
     own_base = workdir is None
     ctx = RunContext(base=workdir or Path(tempfile.mkdtemp(prefix="steward-")), deadline=_deadline(),
-                     agent_check=agent_check)
-    if own_base and isolation.agent_user():
+                     agent_check=agent_check, agent_checked=agent_checked)
+    user = isolation.agent_user()
+    if user and own_base:
         ctx.base.chmod(0o755)  # mkdtemp is 0700; the agent user reads the venvs and copies its clone from here
+    elif user and not ctx.agent_unavailable() and not isolation.reaches(user, ctx.base):
+        ctx.agent_check = (f"{user} cannot read and traverse the workdir {ctx.base}; "
+                           "the agent copies its clone and runs the pinned CLI from there")
     outcomes = []
     try:
         for order in plan.orders:
@@ -300,6 +306,9 @@ def execute(plan: Plan, invs: list[inventory.Inventory], cfg: Config, workdir: P
 
 
 def _work(order: Order, inv: inventory.Inventory, cfg: Config, ctx: RunContext) -> Outcome:
+    if order.agentic and ctx.agent_unavailable():
+        # Skip before paying for a clone and a venv the agent could not use.
+        return Outcome(order.to_dict(), "skipped", detail=str(ctx.agent_unavailable()))
     try:
         ws = workspace.clone(order.repo, order.default_branch, ctx.base / "clones" / order.repo.replace("/", "__") / order.id)
         workspace.branch(ws, order.branch)
@@ -319,11 +328,12 @@ def run(cfg: Config, only: str | None, dry_run: bool, workdir: Path | None) -> R
         report.outcomes = [Outcome(o.to_dict(), "planned", detail=o.reason) for o in plan.orders]
         return report
     # Probe only when an order needs the agent; the answer then serves the run.
-    why_not = agent.available() if any(o.agentic for o in plan.orders) else agent.PROBE
-    if why_not and why_not is not agent.PROBE:
+    agentic = any(o.agentic for o in plan.orders)
+    why_not = agent.available() if agentic else None
+    if why_not:
         report.skipped.append({"repo": "*", "order": "agentic orders", "why": why_not})
         plan.orders = [o for o in plan.orders if not o.agentic]
-    report.outcomes = execute(plan, invs, cfg, workdir, agent_check=why_not)
+    report.outcomes = execute(plan, invs, cfg, workdir, agent_check=why_not, agent_checked=agentic)
     return report
 
 

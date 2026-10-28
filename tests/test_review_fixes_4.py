@@ -92,15 +92,15 @@ def test_agent_run_is_boxed(monkeypatch, tmp_path):
     seen = {}
 
     def fake_claude(args, cwd=None, env=None, timeout=None, **kw):
-        seen.update(args=args, env=env, timeout=timeout)
+        seen.update(args=args, env=env, timeout=timeout, own_group=kw.get("own_group"))
         with (Path(cwd) / ".git" / "config").open("a") as fh:
             fh.write("[core]\n\tfsmonitor = /tmp/evil\n")
         (Path(cwd) / ".steward-result.json").write_text(json.dumps({"outcome": "fixed", "summary": "ok"}))
         return subprocess.CompletedProcess(args, 0, json.dumps({"total_cost_usd": 0.1, "num_turns": 2}), "")
-    monkeypatch.setattr(agent.subprocess, "run", fake_claude)
+    monkeypatch.setattr(agent, "_run_to_files", fake_claude)
     venvs = tmp_path / "venvs"
     result = agent.run(ws, "brief", CFG, timeout=1234, protect=[venvs])
-    assert result.outcome == "fixed" and seen["timeout"] == 1234
+    assert result.outcome == "fixed" and seen["timeout"] == 1234 and seen["own_group"] is True
     env = seen["env"]
     assert "GH_TOKEN" not in env and env["ANTHROPIC_API_KEY"] == "sk-test"
     assert env["HOME"] != os.environ.get("HOME") and not Path(env["HOME"]).exists()  # throwaway, removed after

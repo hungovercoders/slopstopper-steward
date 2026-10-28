@@ -137,13 +137,16 @@ it can fail.
    enforced by `timeout` running as that same user, and when the agent is
    done, timed out or not, every process of that user is stopped and
    confirmed gone, so nothing it detached can change its tree while the
-   steward reads it. The steward then copies back regular files, read
-   through descriptors that refuse to follow a symlink, and symlinks that,
+   steward reads it; its crontab and `at` queue are cleared, and a
+   copy-back during which any of its processes ran is undone. The steward
+   then copies back regular files, opened one path component at a time
+   without following a symlink at any step, and symlinks that,
    once in place and with every link resolved, still lead inside the repo
    and outside `.git`. A symlink leading out (which the steward's own check
    runs would follow, for instance to another process's `/proc`
    environment), a FIFO or a device is refused and named in the PR, and
-   whatever it replaced is put back. The copy-back is a transaction: a
+   whatever it replaced is put back. Nothing named `.git`, at any depth, is
+   ever copied back. The copy-back is a transaction: a
    read that fails stops it before the clone is touched, a write that
    fails rolls every change back, and so does a link the agent left alone
    that an agent change now leads out of the repo. The order is then

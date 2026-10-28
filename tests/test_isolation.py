@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -149,7 +150,7 @@ def test_an_untouched_file_is_not_read(tmp_path, monkeypatch):
     tree = _tree(tmp_path / "tree", {"big.bin": "same"})
     st = os.stat(clone / "big.bin")
     os.utime(tree / "big.bin", ns=(st.st_atime_ns, st.st_mtime_ns))   # what cp --preserve=timestamps leaves
-    monkeypatch.setattr(isolation, "read_regular", lambda path: pytest.fail(f"read {path.name}"))
+    monkeypatch.setattr(isolation, "_regular_fd", lambda root, rel: pytest.fail(f"read {rel}"))
     assert isolation.sync_back(tree, clone).changed == []
 
 
@@ -333,11 +334,17 @@ def test_read_regular_refuses_a_symlink_and_a_fifo(tmp_path):
     (tmp_path / "real").write_text("x")
     os.symlink(str(tmp_path / "real"), tmp_path / "link")
     os.mkfifo(tmp_path / "fifo")
-    assert isolation.read_regular(tmp_path / "real")[0] == b"x"
+    (tmp_path / "d").mkdir()
+    (tmp_path / "d" / "f").write_text("inner")
+    os.symlink("d", tmp_path / "dlink")
+    assert isolation.read_regular(tmp_path, "real")[0] == b"x"
+    assert isolation.read_regular(tmp_path, "d/f")[0] == b"inner"
     with pytest.raises(OSError):
-        isolation.read_regular(tmp_path / "link")
+        isolation.read_regular(tmp_path, "link")
+    with pytest.raises(OSError):
+        isolation.read_regular(tmp_path, "dlink/f")        # a link anywhere on the path, not just the last step
     with pytest.raises(isolation.IsolationError):
-        isolation.read_regular(tmp_path / "fifo")
+        isolation.read_regular(tmp_path, "fifo")
 
 
 def test_an_untouched_link_that_now_leads_out_rolls_everything_back(tmp_path):
@@ -370,14 +377,14 @@ def test_a_failed_write_rolls_the_clone_back(tmp_path, monkeypatch):
     tree = _tree(tmp_path / "work" / "tree", {"a.md": "A", "b.md": "B", "new/c.md": "c"})
     os.symlink("a.md", tree / "alias.md")
     before = _snapshot(clone)
-    real, calls = isolation._write, []
+    real, calls = isolation._copy, []
 
-    def full_disk(path, content, executable):
-        calls.append(path)
+    def full_disk(tree_, rel, dst):
+        calls.append(rel)
         if len(calls) == 2:
-            raise OSError(28, "No space left on device", str(path))
-        real(path, content, executable)
-    monkeypatch.setattr(isolation, "_write", full_disk)
+            raise OSError(28, "No space left on device", str(dst))
+        real(tree_, rel, dst)
+    monkeypatch.setattr(isolation, "_copy", full_disk)
     with pytest.raises(isolation.IsolationError, match="rolled back"):
         isolation.sync_back(tree, clone)
     assert _snapshot(clone) == before
@@ -418,7 +425,7 @@ def test_a_setup_failure_says_the_agent_never_started(tmp_path, monkeypatch):
     clone = _tree(tmp_path / "clone", {"README.md": "x"})
     subprocess.run(["git", "init", "-q"], cwd=clone, check=True)
     monkeypatch.setenv(isolation.AGENT_USER_ENV, "steward-agent")
-    result = agent.run(workspace.Workspace("acme/a", clone, "main"), "brief", CFG, why_not=None)
+    result = agent.run(workspace.Workspace("acme/a", clone, "main"), "brief", CFG, preflight=lambda: None)
     assert not result.ran and "could not be started" in result.error and "copied back" not in result.error
 
 
@@ -433,7 +440,7 @@ def test_the_probe_runs_once_per_run_and_only_when_needed(monkeypatch, tmp_path)
     from steward.inventory import Inventory
     inv = Inventory(Repo("acme/a", pinned="0.26.0", installed_from="0.26.0", evidence=["mise-pin"]), "0.27.0")
     monkeypatch.setattr(runner, "gather", lambda cfg, only=None: ([inv], {"acme/a": "0.27.0"}, "0.27.0"))
-    monkeypatch.setattr(runner, "execute", lambda plan, invs, cfg, workdir, agent_check=None: [])
+    monkeypatch.setattr(runner, "execute", lambda plan, invs, cfg, workdir, **kw: [])
     calls.clear()
     runner.run(CFG, None, False, tmp_path)      # an upgrade only: nothing agentic
     assert calls == []
@@ -446,3 +453,121 @@ def test_a_detached_agent_process_is_stopped_before_the_copy_back(world):
     assert result.ran and result.outcome == "fixed", result.error
     assert not isolation._alive(AGENT_USER), "a setsid child of the agent outlived the run"
     assert not list(Path("/tmp").glob("steward-agent-*"))
+
+
+# ── seventh review ───────────────────────────────────────────────────
+
+@pytest.mark.parametrize("kind", ["file", "symlink", "nested-dir"])
+def test_a_git_entry_in_the_agents_tree_never_replaces_the_repository(tmp_path, kind):
+    clone = _tree(tmp_path / "clone", {"README.md": "x"})
+    subprocess.run(["git", "init", "-q"], cwd=clone, check=True)
+    tree = _tree(tmp_path / "tree", {"README.md": "x", "sub/a.md": "a"})
+    if kind == "file":
+        (tree / ".git").write_text("gitdir: evil\n")
+    elif kind == "symlink":
+        os.symlink("sub", tree / ".git")
+    else:
+        _tree(tree, {"sub/.git/config": "[core]\n\tfsmonitor = /tmp/evil\n"})
+    head = (clone / ".git" / "HEAD").read_bytes()
+    out = isolation.sync_back(tree, clone)
+    assert (clone / ".git").is_dir() and (clone / ".git" / "HEAD").read_bytes() == head
+    assert not (clone / "sub" / ".git").exists()
+    assert not any(c == ".git" or c.endswith("/.git") or "/.git/" in c for c in out.changed)
+    assert any(".git` entry is never copied back" in r for r in out.rejected)
+
+
+def test_the_copys_own_repository_is_not_reported(tmp_path):
+    clone = _tree(tmp_path / "clone", {"README.md": "x"})
+    tree = _tree(tmp_path / "tree", {"README.md": "y", ".git/config": "theirs"})
+    assert isolation.sync_back(tree, clone).rejected == []
+
+
+@pytest.mark.parametrize("make", ["dir", "fifo", "symlink"])
+def test_a_bad_result_file_is_no_result_not_a_failed_copy_back(tmp_path, make):
+    tree, clone = tmp_path / "tree", tmp_path / "clone"
+    tree.mkdir()
+    clone.mkdir()
+    (tree / "summary.json").write_text("{}")
+    target = tree / agent.RESULT_FILE
+    {"dir": lambda: target.mkdir(), "fifo": lambda: os.mkfifo(target),
+     "symlink": lambda: os.symlink("summary.json", target)}[make]()
+    rejected = []
+    agent._take_result(tree, clone, rejected)          # must not raise
+    assert not (clone / agent.RESULT_FILE).exists() and rejected and agent.RESULT_FILE in rejected[0]
+
+
+def test_writes_loop_until_every_byte_is_down(monkeypatch, tmp_path):
+    real = os.write
+    monkeypatch.setattr(isolation.os, "write", lambda fd, data: real(fd, bytes(data[:3])))   # a short write every time
+    fd = os.open(tmp_path / "f", os.O_WRONLY | os.O_CREAT)
+    isolation._write_all(fd, b"0123456789")
+    os.close(fd)
+    assert (tmp_path / "f").read_bytes() == b"0123456789"
+    monkeypatch.setattr(isolation.os, "write", lambda fd, data: 0)
+    fd = os.open(tmp_path / "g", os.O_WRONLY | os.O_CREAT)
+    with pytest.raises(OSError):
+        isolation._write_all(fd, b"x")                   # no progress is a full disk, never a silent truncation
+    os.close(fd)
+
+
+def test_an_in_place_run_kills_what_the_agent_left_in_its_group(tmp_path):
+    marker = "31.4159"
+    started = time.monotonic()
+    done = agent._run_to_files(["sh", "-c", f"sleep {marker} & echo started"], tmp_path, dict(os.environ), 30,
+                               own_group=True)
+    assert done.returncode == 0 and "started" in done.stdout and time.monotonic() - started < 10
+    time.sleep(0.3)
+    left = subprocess.run(["pgrep", "-f", f"sleep {marker}"], capture_output=True, text=True)
+    assert left.stdout.strip() == "", "a background job outlived the in-place agent run"
+
+
+def test_a_process_appearing_during_the_copy_back_undoes_it(tmp_path):
+    clone = _tree(tmp_path / "work" / "clone", {"README.md": "old\n"})
+    tree = _tree(tmp_path / "work" / "tree", {"README.md": "new\n", "added.md": "a"})
+    before = _snapshot(clone)
+    with pytest.raises(isolation.IsolationError, match="during the copy-back"):
+        isolation.sync_back(tree, clone, frozen=lambda: False)
+    assert _snapshot(clone) == before
+
+
+def test_stop_all_clears_cron_and_at_before_killing(monkeypatch):
+    calls = []
+    monkeypatch.setattr(isolation, "_sudo",
+                        lambda user, *cmd, **k: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", ""))
+    monkeypatch.setattr(isolation, "_alive", lambda user: False)
+    isolation.stop_all("steward-agent")
+    assert calls[0] == ("crontab", "-r") and "atrm" in " ".join(calls[1]) and calls[2][:3] == ("kill", "-KILL", "-1")
+
+
+def test_an_unreachable_workdir_skips_agentic_orders_before_cloning(monkeypatch, tmp_path):
+    from steward import runner
+    from steward.discover import Repo
+    from steward.inventory import Finding, Inventory
+    from steward.plan import Order, Plan
+    monkeypatch.setenv(isolation.AGENT_USER_ENV, "steward-agent")
+    monkeypatch.setattr(runner.isolation, "reaches", lambda user, path: False)
+    monkeypatch.setattr(runner.workspace, "clone", lambda *a, **k: pytest.fail("cloned for an agent that cannot run"))
+    order = Order("triage-1", "triage", "acme/a", "t", "r", 3, "main", "0.27.0", "0.27.0",
+                  Finding(1, "x", "u", [], check="hygiene:docs-size"), True)
+    outcomes = runner.execute(Plan(orders=[order]), [Inventory(Repo("acme/a"), "0.27.0")], CFG, tmp_path,
+                              agent_check=None, agent_checked=True)
+    assert outcomes[0].status == "skipped" and "cannot read and traverse the workdir" in outcomes[0].detail
+
+
+def test_the_pinned_cli_must_run_as_the_agent_user(monkeypatch, tmp_path):
+    def refuse(user, *cmd, **k):
+        raise isolation.IsolationError("`/usr/bin/env PATH=...` as steward-agent failed: Permission denied")
+    monkeypatch.setattr(isolation, "_sudo", refuse)
+    with pytest.raises(isolation.SetupError, match="cannot run the pinned CLI"):
+        isolation.check_cli("steward-agent", tmp_path / "venv" / "bin" / "slopstopper")
+
+
+def test_differs_reads_only_same_sized_files(tmp_path, monkeypatch):
+    tree = _tree(tmp_path / "tree", {"a.md": "short", "b.md": "same!"})
+    clone = _tree(tmp_path / "clone", {"a.md": "a longer one", "b.md": "diff!"})
+    opened = []
+    real = isolation._regular_fd
+    monkeypatch.setattr(isolation, "_regular_fd", lambda root, rel: opened.append(rel) or real(root, rel))
+    assert isolation._differs(tree, "a.md", clone / "a.md", os.lstat(tree / "a.md"))
+    assert isolation._differs(tree, "b.md", clone / "b.md", os.lstat(tree / "b.md"))
+    assert opened == ["b.md"]                              # the size difference settled a.md unread

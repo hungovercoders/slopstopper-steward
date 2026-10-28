@@ -126,6 +126,8 @@ jobs:
           pip install -q .
           sudo npm install -g @anthropic-ai/claude-code
           sudo useradd --system --no-create-home --shell /usr/sbin/nologin steward-agent
+          # Nothing may start the agent user again once the steward stops it.
+          echo steward-agent | sudo tee -a /etc/cron.deny /etc/at.deny > /dev/null
           echo "STEWARD_AGENT_USER=steward-agent" >> "$GITHUB_ENV"
           steward --version
           claude --version
