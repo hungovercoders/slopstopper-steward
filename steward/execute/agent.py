@@ -16,10 +16,9 @@ import signal
 import subprocess
 import tempfile
 import time
-from typing import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from steward import gh, isolation, sandbox
 from steward.config import Config
@@ -171,12 +170,14 @@ def _read_result(path: Path, out: AgentResult) -> None:
 
 
 def run(ws: Workspace, prompt: str, cfg: Config, cli_bin: Path | None = None, timeout: int = 3600,
-        protect: Sequence[Path] = (), preflight: Callable[[], str | None] | None = None) -> AgentResult:
+        protect: Sequence[Path] = (), preflight: Callable[[], str | None] | None = None,
+        checked: set[Path] | None = None) -> AgentResult:
     """One boxed run. `protect` are absolute paths outside the clone the agent
     must not edit (the run's venvs); `timeout` comes from the run, so an
     agent never outlives the token the steward will push with. `preflight`
     says why the agent cannot run, or None; a run passes its own cached
-    answer, so the probe runs once per run, not once per order."""
+    answer, so the probe runs once per run, not once per order. `checked`
+    holds the CLIs already proven to run as the agent user, likewise."""
     why_not = (preflight or available)()
     if why_not:
         return AgentResult(False, error=why_not)
@@ -187,7 +188,7 @@ def run(ws: Workspace, prompt: str, cfg: Config, cli_bin: Path | None = None, ti
     try:
         with guarded_git_dir(ws):
             if user:
-                proc = _run_isolated(user, ws, argv, cli_bin, timeout, rejected)
+                proc = _run_isolated(user, ws, argv, cli_bin, timeout, rejected, checked)
             else:
                 with sandbox.scratch_home("steward-agent-home-") as home:
                     proc = _run_to_files(argv, ws.path, environment(cli_bin, home=home), timeout, own_group=True)
@@ -221,14 +222,16 @@ STEWARD_FILES = LOCAL_ONLY
 
 
 def _run_isolated(user: str, ws: Workspace, argv: list[str], cli_bin: Path | None, timeout: int,
-                  rejected: list[str]) -> subprocess.CompletedProcess:
+                  rejected: list[str], checked: set[Path] | None = None) -> subprocess.CompletedProcess:
     """The agent as `user`, in its own copy of the clone. The time limit is
-    enforced inside, by `timeout` running as that user. Whatever happens,
-    every process of the agent user is then stopped, the tree opened for
-    reading and copied back, before the copy is removed; a timed-out run
-    raises TimeoutExpired after that, the same as an in-place run."""
-    if cli_bin is not None:
+    enforced inside, by `timeout` running as that user. Finished or timed
+    out, the agent's work is then brought back before the copy is removed;
+    a timed-out run raises TimeoutExpired after that, the same as an
+    in-place run. An interrupted one brings nothing back."""
+    if cli_bin is not None and cli_bin not in (checked or ()):
         isolation.check_cli(user, cli_bin)
+        if checked is not None:
+            checked.add(cli_bin)
     with isolation.copy_for(user, ws.path) as iso:
         env = environment(None, home=iso.home)
         cmd = isolation.command(iso, argv, env, cli_bin.parent if cli_bin else None, timeout=timeout)
@@ -237,18 +240,33 @@ def _run_isolated(user: str, ws: Workspace, argv: list[str], cli_bin: Path | Non
             # On the backstop, `sudo` is root's and cannot be signalled by the
             # steward: stopping the agent user's processes is what ends it.
             proc = _run_to_files(cmd, ws.path, env, timeout + isolation.KILL_AFTER + 60,
-                                 on_timeout=lambda: isolation.stop_all(user))
-        finally:
-            elapsed = time.monotonic() - started
-            isolation.stop_all(user)
-            isolation.open_up(iso)
-            synced = isolation.sync_back(iso.tree, ws.path, skip=(*STEWARD_FILES, *ws.excluded),
-                                         frozen=lambda: isolation.frozen(user))
-            rejected += synced.rejected
-            _take_result(iso.tree, ws.path, rejected)
-    if isolation.timed_out(proc.returncode, elapsed, timeout):
+                                 on_abort=lambda: isolation.stop_all(user))
+        except subprocess.TimeoutExpired:
+            proc = None
+        late = proc is None or isolation.timed_out(proc.returncode, time.monotonic() - started, timeout)
+        try:
+            _bring_back(iso, ws, rejected)
+        except isolation.IsolationError as exc:
+            if late:
+                raise isolation.IsolationError(f"the agent timed out after {timeout} s, and {exc}") from exc
+            raise
+    if late:
         raise subprocess.TimeoutExpired(cmd, timeout)
     return proc
+
+
+def _bring_back(iso: isolation.Isolated, ws: Workspace, rejected: list[str]) -> None:
+    """Stop every process of the agent user, export its tree into a
+    directory only the steward can write, and copy back from there."""
+    isolation.stop_all(iso.user)
+    isolation.open_up(iso)
+    staging = Path(tempfile.mkdtemp(prefix=".steward-export-", dir=ws.path.parent))
+    try:
+        rejected += isolation.export(iso, staging)
+        rejected += isolation.sync_back(staging, ws.path, skip=(*STEWARD_FILES, *ws.excluded)).rejected
+        _take_result(staging, ws.path, rejected)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def _take_result(tree: Path, clone: Path, rejected: list[str]) -> None:
@@ -266,8 +284,8 @@ def _take_result(tree: Path, clone: Path, rejected: list[str]) -> None:
     (clone / RESULT_FILE).write_bytes(content)
 
 
-def _run_to_files(cmd: list[str], cwd: Path, env: dict, timeout: int, own_group: bool = False,
-                  on_timeout: Callable[[], None] | None = None) -> subprocess.CompletedProcess:
+def _run_to_files(cmd: list[str], cwd: Path, env: dict, timeout: float, own_group: bool = False,
+                  on_abort: Callable[[], None] | None = None) -> subprocess.CompletedProcess:
     """Run `cmd` and wait for it, not for its output pipes. A process the
     agent detached inherits its stdout and stderr; with pipes the steward
     would wait for that process to close them, which it never has to, and
@@ -278,14 +296,16 @@ def _run_to_files(cmd: list[str], cwd: Path, env: dict, timeout: int, own_group:
     that whole group once it exits, so a background job the agent started
     cannot keep editing the clone while the steward verifies and commits.
     Only a process that leaves the session escapes that; running the agent
-    as its own user (`STEWARD_AGENT_USER`) closes that too."""
+    as its own user (`STEWARD_AGENT_USER`) closes that too.
+
+    However the wait ends early (the limit, an interrupt), the run is
+    stopped (`on_abort`, else a kill) and reaped before the error goes on."""
     with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
         proc = subprocess.Popen(cmd, cwd=cwd, stdout=out, stderr=err, env=env, start_new_session=own_group)
         try:
             returncode = proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            (on_timeout or (lambda: _kill(proc, own_group)))()
-            proc.wait()
+        except BaseException:
+            _abort(proc, own_group, on_abort)
             raise
         finally:
             if own_group:
@@ -294,6 +314,23 @@ def _run_to_files(cmd: list[str], cwd: Path, env: dict, timeout: int, own_group:
         err.seek(0)
         return subprocess.CompletedProcess(cmd, returncode, out.read().decode("utf-8", "replace"),
                                            err.read().decode("utf-8", "replace"))
+
+
+REAP_SECONDS = 60
+
+
+def _abort(proc: subprocess.Popen, group: bool, on_abort: Callable[[], None] | None) -> None:
+    """Stop `proc` and reap it. A stop that fails must not replace the error
+    that called for it (a timeout would read as something else); the caller
+    stops the agent again, and reports what it could not do."""
+    try:
+        (on_abort or (lambda: _kill(proc, group)))()
+    except Exception:  # see the docstring
+        pass
+    try:
+        proc.wait(timeout=REAP_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass  # still running past a failed stop; the caller's own stop reports it
 
 
 def _kill(proc: subprocess.Popen, group: bool) -> None:

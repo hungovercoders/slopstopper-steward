@@ -63,8 +63,10 @@ where that user finds them (`/usr/local/bin`, `/usr/bin` or `/bin`), and
 export `STEWARD_AGENT_USER`. Dedicate that user to the steward, one run
 at a time: after each agent run the steward stops every process running
 as it. Deny it cron and `at` (`/etc/cron.deny`, `/etc/at.deny`): the
-steward clears its crontab and `at` queue anyway, and undoes any
-copy-back during which one of its processes was running. A `--workdir` must then be traversable by that user. Before any agentic order the steward probes exactly this, by
+steward clears its crontab and `at` queue anyway, before and after it
+stops the user's processes. A `--workdir` must then be traversable by
+that user; the steward checks that the first time an order needs the
+agent. Before any agentic order the steward probes exactly this, by
 running `claude --version` as the agent user the way the run will; if the
 probe fails, agentic orders are skipped with its reason rather than run
 unisolated.

@@ -34,11 +34,21 @@ class RunContext:
     releases: dict = field(default_factory=dict)
     agent_check: str | None = None   # agent.available(), once agent_checked
     agent_checked: bool = False
+    reach_pending: bool = False      # whether the agent user can reach `base`, still to ask
+    checked_clis: set[Path] = field(default_factory=set)   # CLIs proven to run as the agent user
 
     def agent_unavailable(self) -> str | None:
-        """Why the agent cannot run in this run, asked at most once."""
+        """Why the agent cannot run in this run, asked at most once and only
+        when an order needs the agent, whether the agent user can reach a
+        `--workdir` included."""
         if not self.agent_checked:
             self.agent_check, self.agent_checked = agent.available(), True
+        if self.reach_pending and not self.agent_check:
+            self.reach_pending = False
+            user = isolation.agent_user()
+            if user and not isolation.reaches(user, self.base):
+                self.agent_check = (f"{user} cannot read and traverse the workdir {self.base}; "
+                                    "the agent copies its clone and runs the pinned CLI from there")
         return self.agent_check
 
     def venv(self, version: str) -> Path:
@@ -166,7 +176,8 @@ def _settle_red(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspa
         return red, unverified, None
     agent.ensure_skills(ws, order.target, cfg.slopstopper_repo)
     result = agent.run(ws, prompts.verify(order, inv, red, cfg.slopstopper_repo), cfg, cli,
-                       timeout=ctx.agent_timeout(), protect=ctx.protected(), preflight=ctx.agent_unavailable)
+                       timeout=ctx.agent_timeout(), protect=ctx.protected(), preflight=ctx.agent_unavailable,
+                       checked=ctx.checked_clis)
     if not result.ran:
         return red, unverified, result
     red, unverified = _verify_pass(ws, cli)
@@ -248,7 +259,8 @@ def work_triage(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspa
     cli = refresh.cli_for(version, ctx.venv(version), cfg.package)
     agent.ensure_skills(ws, version, cfg.slopstopper_repo)
     result = agent.run(ws, prompts.triage(order, inv, issue.get("body") or "", cfg.slopstopper_repo), cfg, cli,
-                       timeout=ctx.agent_timeout(), protect=ctx.protected(), preflight=ctx.agent_unavailable)
+                       timeout=ctx.agent_timeout(), protect=ctx.protected(), preflight=ctx.agent_unavailable,
+                       checked=ctx.checked_clis)
     if not result.ran:
         return Outcome(order.to_dict(), "skipped", detail=result.error, agent=result.to_dict())
     red, unverified = _recheck(order, ws, cli)
@@ -286,9 +298,8 @@ def execute(plan: Plan, invs: list[inventory.Inventory], cfg: Config, workdir: P
     user = isolation.agent_user()
     if user and own_base:
         ctx.base.chmod(0o755)  # mkdtemp is 0700; the agent user reads the venvs and copies its clone from here
-    elif user and not ctx.agent_unavailable() and not isolation.reaches(user, ctx.base):
-        ctx.agent_check = (f"{user} cannot read and traverse the workdir {ctx.base}; "
-                           "the agent copies its clone and runs the pinned CLI from there")
+    elif user:
+        ctx.reach_pending = True
     outcomes = []
     try:
         for order in plan.orders:

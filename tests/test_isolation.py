@@ -5,12 +5,15 @@ as a real second user and needs one: `STEWARD_TEST_AGENT_USER` names it
 (CI creates `steward-agent`; locally, `sudo useradd --system steward-agent`).
 """
 
+import io
 import json
 import os
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -188,6 +191,11 @@ if "DETACH=1" in brief0:
     open(".steward-result.json", "w").write(json.dumps({"outcome": "fixed", "summary": "detached"}))
     print(json.dumps({"total_cost_usd": 0.0, "num_turns": 1}))
     sys.exit(0)
+if brief0.startswith("SWAPROOT="):
+    here = os.getcwd()
+    os.rename(here, here + ".moved")             # its own root is its own: the tree can be swapped
+    os.symlink(brief0.split("=", 1)[1], here)
+    sys.exit(0)
 if "HANG=1" in brief0:
     import subprocess, time
     open("before.md", "w").write("written before the hang\n")
@@ -225,6 +233,9 @@ fd = os.open("secret.md", os.O_WRONLY | os.O_CREAT, 0o600)
 os.write(fd, b"only mine\n")
 os.close(fd)
 os.chmod("secret.md", 0o600)                # a file only the agent can read
+os.makedirs("vendored/.git")
+open("vendored/.git/config", "w").write("[core]\n\tfsmonitor = /tmp/evil\n")
+open("vendored/kept.md", "w").write("kept\n")
 open(".steward-result.json", "w").write(json.dumps({"outcome": "fixed", "summary": json.dumps(seen)}))
 print(json.dumps({"total_cost_usd": 0.0, "num_turns": 1}))
 '''
@@ -286,7 +297,10 @@ def test_the_agent_as_its_own_user(world):
     assert not os.path.lexists(clone / "leak.md") and "leak.md" in result.notes  # the escape was refused, and said
     assert (clone / ".git" / "config").read_bytes() == git_config
     assert (venv_bin / "slopstopper").read_text() == "#!/bin/sh\nexit 0\n"
-    assert not list(Path("/tmp").glob("steward-agent-*/tree/README.md"))           # its copy is gone
+    assert (clone / "vendored" / "kept.md").read_text() == "kept\n"
+    assert not (clone / "vendored" / ".git").exists() and ".git" not in result.notes   # left out, quietly
+    assert not list(Path("/tmp").glob("steward-agent-*"))                          # its copy is gone
+    assert not list(clone.parent.glob(".steward-export-*"))                        # and so is the export
 
 
 @needs_agent_user
@@ -318,13 +332,14 @@ def test_a_file_swapped_for_a_symlink_mid_read_is_refused(tmp_path, monkeypatch)
     clone = _tree(tmp_path / "clone", {"README.md": "old\n"})
     tree = _tree(tmp_path / "tree", {"README.md": "new\n"})
     before = _snapshot(clone)
-    real = isolation._unchanged
+    os.utime(tree / "README.md", ns=(0, 10**9))        # not the clone's mtime: the contents are compared
+    real = isolation._regular_fd
 
-    def swap_then_check(dst, st):           # runs between the walk's lstat and the read
+    def swap_then_open(root, rel):          # runs between the walk's lstat and the read
         (tree / "README.md").unlink()
         os.symlink(str(secret), tree / "README.md")
-        return real(dst, st)
-    monkeypatch.setattr(isolation, "_unchanged", swap_then_check)
+        return real(root, rel)
+    monkeypatch.setattr(isolation, "_regular_fd", swap_then_open)
     with pytest.raises(isolation.IsolationError):
         isolation.sync_back(tree, clone)
     assert _snapshot(clone) == before and "ghs_secret" not in (clone / "README.md").read_text()
@@ -473,7 +488,7 @@ def test_a_git_entry_in_the_agents_tree_never_replaces_the_repository(tmp_path, 
     assert (clone / ".git").is_dir() and (clone / ".git" / "HEAD").read_bytes() == head
     assert not (clone / "sub" / ".git").exists()
     assert not any(c == ".git" or c.endswith("/.git") or "/.git/" in c for c in out.changed)
-    assert any(".git` entry is never copied back" in r for r in out.rejected)
+    assert out.rejected == []                            # left out, not reported: the export never carries one
 
 
 def test_the_copys_own_repository_is_not_reported(tmp_path):
@@ -521,22 +536,14 @@ def test_an_in_place_run_kills_what_the_agent_left_in_its_group(tmp_path):
     assert left.stdout.strip() == "", "a background job outlived the in-place agent run"
 
 
-def test_a_process_appearing_during_the_copy_back_undoes_it(tmp_path):
-    clone = _tree(tmp_path / "work" / "clone", {"README.md": "old\n"})
-    tree = _tree(tmp_path / "work" / "tree", {"README.md": "new\n", "added.md": "a"})
-    before = _snapshot(clone)
-    with pytest.raises(isolation.IsolationError, match="during the copy-back"):
-        isolation.sync_back(tree, clone, frozen=lambda: False)
-    assert _snapshot(clone) == before
-
-
-def test_stop_all_clears_cron_and_at_before_killing(monkeypatch):
+def test_stop_all_clears_cron_and_at_before_and_after_killing(monkeypatch):
     calls = []
     monkeypatch.setattr(isolation, "_sudo",
                         lambda user, *cmd, **k: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", ""))
     monkeypatch.setattr(isolation, "_alive", lambda user: False)
     isolation.stop_all("steward-agent")
-    assert calls[0] == ("crontab", "-r") and "atrm" in " ".join(calls[1]) and calls[2][:3] == ("kill", "-KILL", "-1")
+    kinds = ["cron" if c[0] == "crontab" else "at" if "atrm" in " ".join(c) else c[0] for c in calls]
+    assert kinds == ["cron", "at", "kill", "cron", "at"]
 
 
 def test_an_unreachable_workdir_skips_agentic_orders_before_cloning(monkeypatch, tmp_path):
@@ -565,9 +572,140 @@ def test_the_pinned_cli_must_run_as_the_agent_user(monkeypatch, tmp_path):
 def test_differs_reads_only_same_sized_files(tmp_path, monkeypatch):
     tree = _tree(tmp_path / "tree", {"a.md": "short", "b.md": "same!"})
     clone = _tree(tmp_path / "clone", {"a.md": "a longer one", "b.md": "diff!"})
+    os.utime(tree / "b.md", ns=(0, 10**9))                 # a different mtime: only the contents can settle it
     opened = []
     real = isolation._regular_fd
     monkeypatch.setattr(isolation, "_regular_fd", lambda root, rel: opened.append(rel) or real(root, rel))
     assert isolation._differs(tree, "a.md", clone / "a.md", os.lstat(tree / "a.md"))
     assert isolation._differs(tree, "b.md", clone / "b.md", os.lstat(tree / "b.md"))
     assert opened == ["b.md"]                              # the size difference settled a.md unread
+
+
+# ── eighth review: the export, aborts, lazy probes ───────────────────
+
+def _tar(members) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as archive:
+        for name, kind, data in members:
+            info = tarfile.TarInfo(name)
+            if kind == "file":
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+                continue
+            info.type = {"link": tarfile.SYMTYPE, "fifo": tarfile.FIFOTYPE, "dev": tarfile.CHRTYPE}[kind]
+            info.linkname = data or ""
+            archive.addfile(info)
+    return buf.getvalue()
+
+
+def test_the_export_is_unpacked_as_untrusted_data(tmp_path):
+    into = tmp_path / "work" / "staging"
+    into.mkdir(parents=True)
+    stream = io.BytesIO(_tar([
+        ("ok.md", "file", b"ok\n"), ("rel.md", "link", "ok.md"),
+        ("abs.md", "link", "/etc/passwd"), ("up.md", "link", "../../outside"),
+        ("../escaped.md", "file", b"x"),
+        ("pipe", "fifo", None), ("tty", "dev", None),
+    ]))
+    rejected = isolation._unpack(stream, into)
+    assert sorted(p.name for p in into.iterdir()) == ["ok.md", "rel.md"]
+    assert (into / "ok.md").read_text() == "ok\n" and os.readlink(into / "rel.md") == "ok.md"
+    assert not (tmp_path / "work" / "escaped.md").exists()
+    assert {r.split(":")[0] for r in rejected} == {"abs.md", "up.md", "../escaped.md", "pipe", "tty"}
+
+
+@needs_agent_user
+def test_a_tree_swapped_for_a_link_to_steward_files_is_never_read(world):
+    venv_bin, clone, ws = world
+    secret = clone.parent.parent / "steward-only"
+    secret.mkdir()
+    secret.chmod(0o700)
+    (secret / "README.md").write_text("GH_TOKEN=ghs_secret\n")
+    def worktree():     # the hooks are cleared and the prompt written on every run, by design
+        return {k: v for k, v in _snapshot(clone).items() if k.split("/")[0] not in (".git", ".steward-prompt.md")}
+    before = worktree()
+    result = agent.run(ws, f"SWAPROOT={secret}", CFG, cli_bin=venv_bin / "slopstopper", timeout=60)
+    assert result.ran and result.outcome == "skipped" and "not copied back" in result.error, result.error
+    assert worktree() == before and "ghs_secret" not in json.dumps(result.to_dict())
+    assert not list(clone.parent.glob(".steward-export-*"))
+
+
+def test_an_interrupted_run_is_stopped_and_reaped(monkeypatch, tmp_path):
+    marker = "27.1828"
+
+    class Interrupted(subprocess.Popen):
+        def wait(self, timeout=None):
+            if timeout == 300:
+                raise KeyboardInterrupt
+            return super().wait(timeout)
+    monkeypatch.setattr(agent.subprocess, "Popen", Interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        agent._run_to_files(["sleep", marker], tmp_path, dict(os.environ), 300)
+    monkeypatch.undo()
+    left = subprocess.run(["pgrep", "-f", f"sleep {marker}"], capture_output=True, text=True)
+    assert left.stdout.strip() == "", "an interrupted run left the agent running"
+
+
+def test_a_stop_that_fails_does_not_hide_the_timeout(tmp_path):
+    def broken():
+        raise isolation.IsolationError("processes running as steward-agent would not stop")
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        agent._run_to_files(["sleep", "2"], tmp_path, dict(os.environ), 0.2, on_abort=broken)
+    assert time.monotonic() - started < 30                 # reaped, and not waited on forever
+
+
+def _isolated_without_sudo(monkeypatch, tmp_path):
+    clone = _tree(tmp_path / "clone", {"README.md": "x"})
+    subprocess.run(["git", "init", "-q"], cwd=clone, check=True)
+    monkeypatch.setenv(isolation.AGENT_USER_ENV, "steward-agent")
+
+    @contextmanager
+    def fake_copy(user, clone_):
+        yield isolation.Isolated(user, tmp_path, tmp_path, tmp_path, tmp_path)
+    monkeypatch.setattr(isolation, "copy_for", fake_copy)
+    return workspace.Workspace("acme/a", clone, "main")
+
+
+def test_a_timeout_that_cannot_be_copied_back_says_both(monkeypatch, tmp_path):
+    ws = _isolated_without_sudo(monkeypatch, tmp_path)
+
+    def hang(cmd, cwd, env, timeout, **k):
+        raise subprocess.TimeoutExpired(cmd, timeout)
+
+    def stuck(iso, ws_, rejected):
+        raise isolation.IsolationError("processes running as steward-agent would not stop")
+    monkeypatch.setattr(agent, "_run_to_files", hang)
+    monkeypatch.setattr(agent, "_bring_back", stuck)
+    result = agent.run(ws, "brief", CFG, timeout=5, preflight=lambda: None)
+    assert result.ran and "timed out after 5 s" in result.error and "would not stop" in result.error
+
+
+def test_the_pinned_cli_is_checked_once_per_run(monkeypatch, tmp_path):
+    ws = _isolated_without_sudo(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(isolation, "check_cli", lambda user, cli: calls.append(cli))
+    monkeypatch.setattr(agent, "_run_to_files",
+                        lambda cmd, *a, **k: subprocess.CompletedProcess(cmd, 0, "{}", ""))
+    monkeypatch.setattr(agent, "_bring_back", lambda iso, ws_, rejected: None)
+    checked = set()
+    for _ in range(3):
+        agent.run(ws, "brief", CFG, cli_bin=tmp_path / "venv" / "bin" / "slopstopper", preflight=lambda: None,
+                  checked=checked)
+    assert calls == [tmp_path / "venv" / "bin" / "slopstopper"]
+
+
+def test_the_workdir_is_probed_only_when_an_order_needs_the_agent(monkeypatch, tmp_path):
+    from steward import runner
+    from steward.discover import Repo
+    from steward.inventory import Inventory
+    from steward.plan import Order, Plan
+    monkeypatch.setenv(isolation.AGENT_USER_ENV, "steward-agent")
+    monkeypatch.setattr(runner.isolation, "reaches", lambda user, path: pytest.fail("probed for no agentic order"))
+    monkeypatch.setattr(runner.agent, "available", lambda: pytest.fail("probed for no agentic order"))
+    monkeypatch.setattr(runner, "work_refresh", lambda *a: runner.Outcome(a[0].to_dict(), "skipped"))
+    monkeypatch.setattr(runner.workspace, "clone", lambda *a, **k: None)
+    monkeypatch.setattr(runner.workspace, "branch", lambda *a, **k: None)
+    order = Order("upgrade-1", "upgrade", "acme/a", "t", "r", 1, "main", "0.26.0", "0.27.0", None, False)
+    outcomes = runner.execute(Plan(orders=[order]), [Inventory(Repo("acme/a"), "0.27.0")], CFG, tmp_path)
+    assert outcomes[0].status == "skipped"

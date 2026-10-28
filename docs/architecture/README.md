@@ -136,21 +136,24 @@ it can fail.
    fake the steward's verification or reach the token. Its time limit is
    enforced by `timeout` running as that same user, and when the agent is
    done, timed out or not, every process of that user is stopped and
-   confirmed gone, so nothing it detached can change its tree while the
-   steward reads it; its crontab and `at` queue are cleared, and a
-   copy-back during which any of its processes ran is undone. The steward
-   then copies back regular files, opened one path component at a time
-   without following a symlink at any step, and symlinks that,
-   once in place and with every link resolved, still lead inside the repo
-   and outside `.git`. A symlink leading out (which the steward's own check
-   runs would follow, for instance to another process's `/proc`
-   environment), a FIFO or a device is refused and named in the PR, and
-   whatever it replaced is put back. Nothing named `.git`, at any depth, is
-   ever copied back. The copy-back is a transaction: a
-   read that fails stops it before the clone is touched, a write that
-   fails rolls every change back, and so does a link the agent left alone
-   that an agent change now leads out of the repo. The order is then
-   skipped with the reason, the clone exactly as it was.
+   confirmed gone, its crontab and `at` queue cleared before and after.
+   The steward never reads the agent's tree itself: `tar`, running as the
+   agent user, exports it, so a tree swapped for a link to the steward's
+   files reads as a permission error, not as those files. The stream is
+   unpacked as untrusted data (Python's `data` extraction filter: no
+   absolute paths, nothing landing outside, no devices or FIFOs) into a
+   directory only the steward can write, and nothing named `.git`, at any
+   depth, is exported. From there the steward copies back regular files,
+   and symlinks that, once in place and with every link resolved, still
+   lead inside the repo and outside `.git`. A symlink leading out (which
+   the steward's own check runs would follow, for instance to another
+   process's `/proc` environment), a FIFO or a device is refused and named
+   in the PR, and whatever it replaced is put back. The copy-back is
+   fail-closed and a transaction: a failed export or read stops it before
+   the clone is touched, a write that fails rolls every change back, and
+   so does a link the agent left alone that an agent change now leads out
+   of the repo. The order is then skipped with the reason, the clone
+   exactly as it was.
 
 Without `STEWARD_AGENT_USER` (a local run, typically) layers 1 to 3 still
 hold, and the agent shares the steward's OS user. Something it writes

@@ -9,20 +9,24 @@ that user; the steward's files are simply not writable by it, and the
 steward's process environment (which holds the push token) is not
 readable by it either.
 
-After the run the steward copies back what changed: regular files, and
-symlinks that, once in place, still resolve inside the repo and outside
-`.git`. Nothing under `.git` is copied and nothing is followed. Anything
-else (a symlink that leads out, even through a chain of links; a FIFO; a
-device) is refused and reported. The copy-back is fail-closed: every
-read happens before the clone is touched, so a file the steward cannot
-read aborts the copy with the clone exactly as it was, never half-synced
-and never with content mistaken for deleted.
+After the run, every process running as the agent user is stopped and
+confirmed gone, so nothing the agent left behind (a detached child, a
+`setsid` loop) runs on. The steward then never reads the agent's tree
+itself: `tar`, running as the agent user, exports it, so the export can
+reach only what that user could read anyway, and a tree (or anything in
+it) swapped for a link to a steward file reads as a permission error,
+not as the steward's file. The stream is unpacked as untrusted data
+(Python's `data` extraction filter) into a directory only the steward
+can write, and nothing of the agent's can change it from there.
 
-Before anything is read back, every process running as the agent user
-is stopped and confirmed gone, so nothing the agent left behind (a
-detached child, a `setsid` loop) can change its tree while the steward
-reads it. Files are read through a descriptor opened without following
-symlinks and checked to be regular, and the copy into the clone is a
+From that copy the steward copies back what changed: regular files, and
+symlinks that, once in place, still resolve inside the repo and outside
+`.git`. Nothing named `.git` is exported or copied, and nothing is
+followed. Anything else (a symlink that leads out, even through a chain
+of links; a FIFO; a device) is refused and reported. The copy-back is
+fail-closed: a failed export, or a read that fails while planning,
+stops it with the clone exactly as it was, never half-synced and never
+with content mistaken for deleted, and the copy into the clone is a
 transaction: an error part-way rolls every change back.
 
 The steward reaches the user through `sudo -n -u <user>` with
@@ -33,8 +37,8 @@ dedicated to one steward run at a time. The base directory the run works
 in must be traversable by the agent user, so the venvs and the clone it
 copies can be read. The agent user should also be denied cron and `at`
 (the run workflow lists it in `/etc/cron.deny` and `/etc/at.deny`); the
-steward clears its crontab and `at` queue anyway, and undoes a copy-back
-during which any process of that user was running.
+steward clears its crontab and `at` queue anyway, before and after it
+stops the user's processes.
 """
 
 from __future__ import annotations
@@ -44,7 +48,9 @@ import os
 import shutil
 import stat
 import subprocess
+import tarfile
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -62,6 +68,9 @@ PER_USER = ("PATH", "HOME", "TMPDIR", "USER", "LOGNAME", "RUNNER_TEMP")
 # group when time is up: a signal to `sudo` would not reach a process the
 # steward does not own.
 KILL_AFTER = 30
+# The export's tar timestamps come back as floats: an mtime within this of
+# the clone's is the same mtime.
+MTIME_SLACK_NS = 1000
 
 
 def timed_out(returncode: int, elapsed: float, limit: int) -> bool:
@@ -96,7 +105,7 @@ def _sudo(user: str, *cmd: str, check: bool = True, timeout: int = 600) -> subpr
 @dataclass
 class Isolated:
     user: str
-    root: Path   # owned by the agent user, 0755: the steward reads the tree back from here
+    root: Path   # owned by the agent user, 0700: only that user reads the tree
     tree: Path   # the agent's own copy of the clone; its working directory
     home: Path   # the agent's HOME, 0700
     tmp: Path    # the agent's TMPDIR, 0700
@@ -174,7 +183,7 @@ def copy_for(user: str, clone: Path) -> Iterator[Isolated]:
         iso = Isolated(user, root, root / "tree", root / "home", root / "tmp")
         try:
             _sudo(user, "mkdir", "-p", str(iso.tree), str(iso.home), str(iso.tmp))
-            _sudo(user, "chmod", "755", str(root), str(iso.tree))
+            _sudo(user, "chmod", "700", str(root))
             _sudo(user, "chmod", "700", str(iso.home), str(iso.tmp))
             _sudo(user, "cp", "-RP", "--preserve=mode,timestamps", f"{clone}/.", str(iso.tree), timeout=1800)
         except IsolationError as exc:
@@ -202,32 +211,89 @@ def stop_all(user: str) -> None:
 
     The agent's `timeout` only covers its own process group, and only when
     time runs out; a child the agent detached (`setsid`, a daemonised
-    process) would keep changing the tree while the steward reads it. The
-    agent user can signal all of its own processes, and nothing else. Its
-    crontab and `at` queue are cleared first, since either could start it
-    again once the steward starts reading."""
-    _sudo(user, "crontab", "-r", check=False, timeout=30)
-    _sudo(user, "/bin/sh", "-c", "command -v atq >/dev/null 2>&1 && atq | cut -f1 | xargs -r atrm",
-          check=False, timeout=30)
+    process) would keep running, into the next order. The agent user can
+    signal all of its own processes, and nothing else. Its crontab and `at`
+    queue are cleared before the kill, so neither starts it again, and once
+    more after, for an entry a process added before it died."""
     for _ in range(20):
+        _clear_schedules(user)
         _sudo(user, "kill", "-KILL", "-1", check=False, timeout=30)
         if not _alive(user):
-            return
+            _clear_schedules(user)
+            if not _alive(user):
+                return
         time.sleep(0.1)
     raise IsolationError(f"processes running as {user} would not stop")
 
 
-def frozen(user: str) -> bool:
-    """No process of `user` is running: checked again after the copy-back,
-    which is undone if something of the agent's ran while it read."""
-    return not _alive(user)
+def _clear_schedules(user: str) -> None:
+    _sudo(user, "crontab", "-r", check=False, timeout=30)
+    _sudo(user, "/bin/sh", "-c", "command -v atq >/dev/null 2>&1 && atq | cut -f1 | xargs -r atrm",
+          check=False, timeout=30)
+
+
+def _stop_quietly(user: str) -> None:
+    try:
+        stop_all(user)
+    except IsolationError:
+        pass  # the export then fails on its own, and says so
 
 
 def open_up(iso: Isolated) -> None:
-    """Make the agent's tree readable by the steward before copying it back.
-    The agent owns every entry in it, so as that user it can grant read on
-    all of them, whatever umask or tool created them 0700 or 0600."""
-    _sudo(iso.user, "chmod", "-R", "u+rwX,go+rX", str(iso.tree), check=False, timeout=1800)
+    """Make every entry of the agent's tree readable by its owner before the
+    export: the agent owns all of them, so as that user it can, whatever
+    umask or tool created them 0000. Best effort: an entry still unreadable
+    fails the export."""
+    _sudo(iso.user, "chmod", "-R", "u+rwX", str(iso.tree), check=False, timeout=1800)
+
+
+def _unpack(stream, into: Path) -> list[str]:
+    """Unpack a tar stream into `into` as untrusted data, and return what was
+    left out and why. Python's `data` filter refuses absolute paths,
+    anything that would land outside `into` (through `..` or a link), links
+    that lead out, devices and FIFOs, and drops owners and setuid bits; a
+    member it refuses is left out, not fatal."""
+    rejected: list[str] = []
+
+    def keep(member: tarfile.TarInfo, dest: str) -> tarfile.TarInfo | None:
+        try:
+            return tarfile.data_filter(member, dest)
+        except tarfile.FilterError as exc:
+            rejected.append(f"{member.name}: {exc}")
+            return None
+
+    with tarfile.open(fileobj=stream, mode="r|") as archive:
+        archive.extractall(into, filter=keep)
+    return rejected
+
+
+def export(iso: Isolated, into: Path, timeout: int = 1800) -> list[str]:
+    """Copy the agent's tree into `into`, a fresh directory only the steward
+    can write, without the steward reading the tree: `tar` runs as the agent
+    user, `.git` entries at any depth left out, hard links as plain files.
+    Returns what the unpacking refused. A tar that fails, or a stream that
+    does not parse, raises IsolationError: half an export would read as
+    deletions."""
+    cmd = ["sudo", "-n", "-u", iso.user, "--", "tar", "-C", str(iso.tree), f"--exclude={GIT}",
+           "--hard-dereference", "--format=posix", "-cf", "-", "."]
+    with tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err)
+        # `sudo` is root's: stopping the agent user's processes is what ends a stuck tar.
+        watchdog = threading.Timer(timeout, _stop_quietly, (iso.user,))
+        watchdog.start()
+        try:
+            rejected = _unpack(proc.stdout, into)
+        except (tarfile.TarError, OSError) as exc:
+            raise IsolationError(f"the agent's tree could not be unpacked: {exc}") from exc
+        finally:
+            watchdog.cancel()
+            proc.stdout.close()   # a tar still writing gets EPIPE and exits
+            returncode = proc.wait()
+        if returncode != 0:
+            err.seek(0)
+            why = err.read().decode("utf-8", "replace").strip()[-300:]
+            raise IsolationError(f"exporting the agent's tree as {iso.user} failed (exit {returncode}): {why}")
+    return rejected
 
 
 _READ = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
@@ -283,17 +349,6 @@ class Synced:
 GIT = ".git"
 
 
-def _git_entries(rel_dir: str, dirpath: str, dirnames: list[str], filenames: list[str]) -> list[str]:
-    """The `.git` names in one directory, other than the copy's own repository."""
-    found = []
-    for name in (n for n in (*dirnames, *filenames) if n == GIT):
-        rel = os.path.normpath(os.path.join(rel_dir, name))
-        own_repo = rel == GIT and name in dirnames and not os.path.islink(os.path.join(dirpath, name))
-        if not own_repo:
-            found.append(rel)
-    return found
-
-
 def _lstat(dirpath: str, name: str, rel: str) -> os.stat_result:
     try:
         return os.lstat(os.path.join(dirpath, name))
@@ -301,21 +356,20 @@ def _lstat(dirpath: str, name: str, rel: str) -> os.stat_result:
         raise IsolationError(f"`{rel}` changed while being read: {exc.strerror}") from exc
 
 
-def _entries(root: Path, git_entries: list[str] | None = None) -> dict[str, os.stat_result]:
+def _entries(root: Path) -> dict[str, os.stat_result]:
     """Every non-directory entry under `root`, by relative path, without
     following symlinks (a symlinked directory is one entry). Anything named
-    `.git`, at any depth and of any kind, is left out and listed in
-    `git_entries`: a `.git` file or link in the agent's tree would otherwise
-    replace the clone's repository. Any directory that cannot be read
-    raises: skipping it would make its contents look deleted."""
+    `.git`, at any depth and of any kind, is left out: in the clone it is
+    the steward's, and from the agent's tree it would replace the clone's
+    repository (the export leaves them out already). Any directory that
+    cannot be read raises: skipping it would make its contents look
+    deleted."""
     def fail(exc: OSError) -> None:
         raise IsolationError(f"cannot read `{exc.filename}` in the agent's tree: {exc.strerror}")
 
     out: dict[str, os.stat_result] = {}
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False, onerror=fail):
         rel_dir = os.path.relpath(dirpath, root)
-        if git_entries is not None:
-            git_entries += _git_entries(rel_dir, dirpath, dirnames, filenames)
         dirnames[:] = [d for d in dirnames if d != GIT]
         links = [d for d in dirnames if os.path.islink(os.path.join(dirpath, d))]
         for name in [*(f for f in filenames if f != GIT), *links]:
@@ -344,17 +398,6 @@ def _remove(path: Path) -> None:
         shutil.rmtree(path)
 
 
-def _unchanged(dst: Path, st: os.stat_result) -> bool:
-    """Cheap first: the copy kept timestamps, so equal size, mtime and
-    executable bit mean the agent left the file alone."""
-    try:
-        ds = os.lstat(dst)
-    except FileNotFoundError:
-        return False
-    return (stat.S_ISREG(ds.st_mode) and ds.st_size == st.st_size and ds.st_mtime_ns == st.st_mtime_ns
-            and (ds.st_mode & stat.S_IXUSR) == (st.st_mode & stat.S_IXUSR))
-
-
 @dataclass
 class _Plan:
     files: list[str] = field(default_factory=list)                      # rels to copy from the agent's tree
@@ -363,11 +406,11 @@ class _Plan:
 
 
 def _differs(tree: Path, rel: str, dst: Path, st: os.stat_result) -> bool:
-    """Whether the copy-back must write `rel`. Cheap checks first (the copy
-    kept timestamps; then size and executable bit); only same-sized files
-    are compared, a chunk at a time, through no-follow descriptors."""
-    if _unchanged(dst, st):
-        return False
+    """Whether the copy-back must write `rel`. Cheap checks first, on one
+    lstat of the clone's file: another kind, size or executable bit settles
+    it; the same mtime means the agent left it alone (the agent's copy and
+    the export both keep timestamps). Only then are the contents compared,
+    a chunk at a time, through no-follow descriptors."""
     try:
         ds = os.lstat(dst)
     except FileNotFoundError:
@@ -375,6 +418,8 @@ def _differs(tree: Path, rel: str, dst: Path, st: os.stat_result) -> bool:
     if (not stat.S_ISREG(ds.st_mode) or ds.st_size != st.st_size
             or (ds.st_mode & stat.S_IXUSR) != (st.st_mode & stat.S_IXUSR)):
         return True
+    if abs(ds.st_mtime_ns - st.st_mtime_ns) < MTIME_SLACK_NS:
+        return False
     src = _regular_fd(tree, rel)
     try:
         with open(dst, "rb") as theirs_copy:
@@ -406,9 +451,8 @@ def _plan_entry(plan: _Plan, rejected: list[str], rel: str, st: os.stat_result, 
 def _plan(tree: Path, clone: Path, owned) -> tuple[_Plan, list[str], dict[str, os.stat_result]]:
     """What the copy-back will do, and the clone's entries as they are; the
     clone is not touched. Every comparison has already read what it needed."""
-    plan, rejected, git_entries = _Plan(), [], []
-    theirs, ours = _entries(tree, git_entries), _entries(clone)
-    rejected += [f"{rel}: a `.git` entry is never copied back" for rel in git_entries]
+    plan, rejected = _Plan(), []
+    theirs, ours = _entries(tree), _entries(clone)
     plan.removals = [rel for rel in sorted(set(ours) - set(theirs)) if not owned(rel)]
     for rel, st in sorted(theirs.items()):
         if owned(rel):
@@ -535,15 +579,14 @@ def _escaping(clone: Path, rels: Iterable[str]) -> set[str]:
     return {rel for rel in rels if not _inside(clone, clone / rel)}
 
 
-def sync_back(tree: Path, clone: Path, skip: Iterable[str] = (), frozen=None) -> Synced:
+def sync_back(tree: Path, clone: Path, skip: Iterable[str] = ()) -> Synced:
     """Make the clone's working tree match the agent's, outside `.git`.
 
     `skip` are clone-relative paths the steward owns locally (its prompt,
-    the result file); they are neither copied nor removed. `frozen`, when
-    given, is asked once everything is written: False means something of
-    the agent's ran during the copy-back, and it is undone. Fail-closed: a
-    read that fails while planning raises IsolationError before the clone
-    is touched, and any failure after that rolls the clone back exactly."""
+    the result file); they are neither copied nor removed. `tree` is the
+    export, which only the steward can write. Fail-closed: a read that
+    fails while planning raises IsolationError before the clone is
+    touched, and any failure after that rolls the clone back exactly."""
     skipped = tuple(s.rstrip("/") for s in skip)
 
     def owned(rel: str) -> bool:
@@ -573,8 +616,6 @@ def sync_back(tree: Path, clone: Path, skip: Iterable[str] = (), frozen=None) ->
         if newly_out:
             raise IsolationError("the agent's changes would make " + ", ".join(f"`{r}`" for r in sorted(newly_out))
                                  + " resolve outside the repository or into `.git`")
-        if frozen is not None and not frozen():
-            raise IsolationError("a process of the agent user was running during the copy-back")
     except BaseException as exc:
         undo.rollback()
         if isinstance(exc, OSError):
