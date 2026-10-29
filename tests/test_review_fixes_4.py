@@ -118,6 +118,22 @@ def test_allowed_tools_carry_no_exec_path():
     assert not any("reliability:" in t or "security:dast" in t or "api-" in t for t in slop)
 
 
+def test_no_allowed_check_runs_an_interpreter_the_repo_names():
+    """`security:licences` runs `security.licences.python` from the repo's
+    own config (`python: bash` plus a `./pip` script is a shell): an
+    allow-listed command must never start a program the repo chose."""
+    slop = [t for t in agent.ALLOWED_TOOLS if t.startswith("Bash(slopstopper run")]
+    assert not any("security:licences" in t or t.rstrip("*)").endswith("security:") for t in slop)
+    assert "Bash(slopstopper run security:licences*)" in agent.DISALLOWED_TOOLS
+    assert "Bash(slopstopper run --json security:licences*)" in agent.DISALLOWED_TOOLS
+
+
+def test_git_status_cannot_be_pointed_at_a_repository_the_agent_wrote():
+    for tool in ("Edit", "Write", "MultiEdit"):
+        assert f"{tool}(**/.git/**)" in agent.DISALLOWED_TOOLS and f"{tool}(**/.git)" in agent.DISALLOWED_TOOLS
+    assert "Bash(cd *)" in agent.DISALLOWED_TOOLS
+
+
 # ── 2 + 10: one venv per version, outside the clones
 def test_run_context_venvs_and_timeouts(tmp_path):
     ctx = runner.RunContext(base=tmp_path)

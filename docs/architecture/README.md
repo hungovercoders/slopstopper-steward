@@ -109,10 +109,13 @@ it can fail.
    `--permission-mode acceptEdits`, file edits, and a short allow-list of
    commands that execute nothing from the tree: `slopstopper run` for the
    hygiene and static security checks only (the browser and API checks
-   build or serve the repo), the listing commands, `git status`, and the
-   shell readers. An explicit deny-list names the ways to run an arbitrary
-   command (`find`, `task`, `git grep`, interpreters, shells, `gh`, `curl`,
-   `npm`, `pip`), edits under `.git/`, and edits to the run's venvs.
+   build or serve the repo, and `security:licences` runs the interpreter
+   the repo's config names, so neither is allowed), the listing commands,
+   `git status`, and the shell readers. An explicit deny-list names the
+   ways to run an arbitrary command (`find`, `task`, `git grep`,
+   interpreters, shells, `gh`, `curl`, `npm`, `pip`, `security:licences`),
+   writes to any `.git` and changing directory (so `git status` never runs
+   in a repository the agent wrote), and edits to the run's venvs.
 2. **What the agent can see.** Its environment is rebuilt from an
    allow-list (`steward/sandbox.py`): no `GH_TOKEN`, no `GITHUB_TOKEN`, no
    `STEWARD_*`, and a throwaway `HOME`, so there is no stored `gh` login
@@ -157,10 +160,12 @@ it can fail.
 
 Without `STEWARD_AGENT_USER` (a local run, typically) layers 1 to 3 still
 hold, and the agent shares the steward's OS user. Something it writes
-could then make the steward's own verification read green: that costs a
-ready PR instead of a draft, never the token, and the PR's own `ss-*`
-workflows run every check again on GitHub. Set the variable wherever the
-steward runs unattended.
+could then make the steward's own verification read green, which costs a
+ready PR instead of a draft; the PR's own `ss-*` workflows run every check
+again on GitHub. The token is then kept from the agent by layer 1 alone:
+any command that got past the allow-list would run as the steward's user,
+which can read the steward's own process environment. Set the variable
+wherever the steward runs unattended.
 
 The rest of the brief:
 

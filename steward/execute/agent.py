@@ -28,10 +28,14 @@ from steward.workspace import LOCAL_ONLY, Workspace, guarded_git_dir
 SKILLS = ("slopstopper-triage", "slopstopper-install")
 # Which `slopstopper run` targets the agent may call: the ones that read
 # the tree and execute nothing from it. The browser and API checks build or
-# serve the repo (its package.json scripts), which would hand the agent an
-# arbitrary-exec path, so they are not on the list; the steward does not
-# verify them in a clone either.
-_RUN_TARGETS = ("hygiene:", "security:sast", "security:secrets", "security:vulnerability", "security:licences")
+# serve the repo (its package.json scripts), and `security:licences` runs
+# the interpreter the repo's own config names (`security.licences.python`,
+# or a committed `.venv`); each would hand the agent an arbitrary-exec
+# path, so none is on the list. A check whose command or interpreter comes
+# from the repo never is. The steward does not verify those in a clone
+# either.
+_RUN_TARGETS = ("hygiene:", "security:sast", "security:secrets", "security:vulnerability")
+_NEVER_RUN = ("security:licences",)
 ALLOWED_TOOLS = (
     "Read", "Edit", "Write", "MultiEdit", "Glob", "Grep",
     *(f"Bash(slopstopper run {t}*)" for t in _RUN_TARGETS),
@@ -44,12 +48,19 @@ ALLOWED_TOOLS = (
 # Named as well as left off the allow-list, so a permission prompt the
 # headless run would auto-answer never lets one through. `find -exec`,
 # `task` (runs whatever Taskfile.ss.yml says), `git grep -O<cmd>` and the
-# interpreters are all ways to run an arbitrary command.
+# interpreters are all ways to run an arbitrary command. So is `git status`
+# inside a repository the agent wrote (a `.git` anywhere, or a `.git` file
+# pointing at one, whose config names an fsmonitor command): writing any
+# `.git` and changing directory are denied, so `git status` only ever runs
+# in the copy's own repository.
 DISALLOWED_TOOLS = (
     "Bash(git push*)", "Bash(git commit*)", "Bash(git remote*)", "Bash(git config*)", "Bash(git grep*)",
     "Bash(gh *)", "Bash(curl *)", "Bash(wget *)", "Bash(npx *)", "Bash(npm *)", "Bash(pip *)", "Bash(pipx *)",
-    "Bash(find *)", "Bash(task *)", "Bash(python*)", "Bash(sh *)", "Bash(bash *)", "Bash(env *)",
-    "Edit(./.git/**)", "Write(./.git/**)", "MultiEdit(./.git/**)",
+    "Bash(find *)", "Bash(task *)", "Bash(python*)", "Bash(sh *)", "Bash(bash *)", "Bash(env *)", "Bash(cd *)",
+    *(f"Bash(slopstopper run {t}*)" for t in _NEVER_RUN),
+    *(f"Bash(slopstopper run --json {t}*)" for t in _NEVER_RUN),
+    *(f"{tool}({path})" for tool in ("Edit", "Write", "MultiEdit")
+      for path in ("./.git/**", "**/.git/**", "**/.git")),
     "WebFetch", "WebSearch",
 )
 
