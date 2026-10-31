@@ -24,9 +24,13 @@ GitHub's message.
 
 **GitHub App (recommended).** Create one under the org (Settings →
 Developer settings → GitHub Apps) with repository permissions
-*Contents: read and write*, *Pull requests: read and write*, *Issues:
-read*, *Actions: read*, *Metadata: read*. Install it on the adopter
-repos (or all repos). Then in the steward repo:
+*Contents: read and write*, *Workflows: read and write*, *Pull requests:
+read and write*, *Issues: read*, *Actions: read*, *Metadata: read*.
+*Workflows* is what lets an upgrade or refresh push the `ss-*.yml` files
+`slopstopper install` rewrites: without it GitHub refuses the push, and
+the order fails with that refusal. Install it on the adopter repos (or
+all repos). Changing an App's permissions later asks the org owner to
+accept them on the installation. Then in the steward repo:
 
 - Actions **variable** `STEWARD_APP_ID`: the App ID
 - Actions **secret** `STEWARD_APP_PRIVATE_KEY`: the App's private key (PEM)
