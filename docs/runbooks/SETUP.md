@@ -73,8 +73,18 @@ probe fails, agentic orders are skipped with its reason rather than run
 unisolated.
 
 The agentic orders (a finding to triage, a red check after an upgrade)
-run Claude Code headless. Add the secret `ANTHROPIC_API_KEY` (or a
-`CLAUDE_CODE_OAUTH_TOKEN`). Without it, upgrades still run and findings
+run Claude Code headless. Give it one of two secrets:
+
+- `CLAUDE_CODE_OAUTH_TOKEN`, to run on a Claude Pro or Max subscription
+  rather than API billing: run `claude setup-token` on a machine where
+  Claude Code is signed in to that account, and store the token it
+  prints. Agent runs then count against that subscription's usage
+  limits, shared with your own Claude use, so keep `budgets.agent_turns`
+  modest.
+- `ANTHROPIC_API_KEY`, billed per token to an Anthropic API account.
+
+Set one, not both: with both present Claude Code uses the API key, and
+the API bills it. Without either, upgrades still run and findings
 are reported as skipped with the reason. `budgets.agent_usd` and
 `budgets.agent_turns` cap each invocation; `agent.enabled: false`
 switches the agentic orders off entirely.

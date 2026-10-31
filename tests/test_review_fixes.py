@@ -40,6 +40,21 @@ def test_agent_environment_drops_github_credentials(tmp_path):
     assert env["PATH"].startswith(str(tmp_path / "bin"))
 
 
+def test_a_subscription_token_reaches_the_agent_and_an_empty_key_does_not(tmp_path):
+    """Only CLAUDE_CODE_OAUTH_TOKEN set as a secret: ANTHROPIC_API_KEY still
+    arrives as an empty string, and must not reach the agent as a key."""
+    env = agent.environment(None, base={"PATH": "/usr/bin", "ANTHROPIC_API_KEY": "",
+                                        "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-x"})
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-x" and "ANTHROPIC_API_KEY" not in env
+
+
+def test_the_run_workflow_hands_the_steward_either_model_credential():
+    from pathlib import Path
+    text = (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "steward-run.yml").read_text()
+    for key in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
+        assert f"{key}: ${{{{ secrets.{key} }}}}" in text
+
+
 def test_agent_tools_cannot_write_to_github_or_fetch_code():
     for tool in ("Bash(gh *)", "Bash(git push*)", "Bash(npx *)", "Bash(pip *)", "Bash(curl *)", "WebFetch"):
         assert tool in agent.DISALLOWED_TOOLS
