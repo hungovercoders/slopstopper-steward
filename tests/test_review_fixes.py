@@ -58,8 +58,8 @@ def test_the_run_workflow_hands_the_steward_either_model_credential():
 def test_agent_tools_cannot_write_to_github_or_fetch_code():
     for tool in ("Bash(gh *)", "Bash(git push*)", "Bash(npx *)", "Bash(pip *)", "Bash(curl *)", "WebFetch"):
         assert tool in agent.DISALLOWED_TOOLS
-    assert not any(t.startswith(("Bash(npx", "Bash(pip", "Bash(npm", "Bash(gh")) for t in agent.ALLOWED_TOOLS)
-    cmd = agent._command("brief", from_dict({"orgs": ["a"]}))
+    assert not any(t.startswith(("Bash(npx", "Bash(pip", "Bash(npm", "Bash(gh")) for t in agent.allowed_tools(["hygiene:docs-size"]))
+    cmd = agent._command("brief", from_dict({"orgs": ["a"]}), checks=["hygiene:docs-size"])
     assert "--disallowedTools" in cmd and "Bash(gh *)" in cmd
 
 

@@ -110,20 +110,26 @@ def test_agent_run_is_boxed(monkeypatch, tmp_path):
     assert (ws.path / ".git" / "config").read_bytes() == before
 
 
+CHECKS = ["hygiene:docs-size", "security:sast", "security:licences"]
+
+
 def test_allowed_tools_carry_no_exec_path():
     banned = ("Bash(find", "Bash(task", "Bash(git grep", "Bash(python", "Bash(rm", "Bash(npx", "Bash(sh", "Bash(bash")
-    assert not any(t.startswith(banned) for t in agent.ALLOWED_TOOLS)
-    slop = [t for t in agent.ALLOWED_TOOLS if t.startswith("Bash(slopstopper")]
+    tools = agent.allowed_tools(CHECKS)   # what the runner hands in: the clone's runnable checks
+    assert not any(t.startswith(banned) for t in tools)
+    slop = [t for t in tools if t.startswith("Bash(slopstopper")]
     assert "Bash(slopstopper *)" not in slop
+    assert any("hygiene:docs-size" in t for t in slop)
     assert not any("reliability:" in t or "security:dast" in t or "api-" in t for t in slop)
 
 
 def test_no_allowed_check_runs_an_interpreter_the_repo_names():
     """`security:licences` runs `security.licences.python` from the repo's
     own config (`python: bash` plus a `./pip` script is a shell): an
-    allow-listed command must never start a program the repo chose."""
-    slop = [t for t in agent.ALLOWED_TOOLS if t.startswith("Bash(slopstopper run")]
-    assert not any("security:licences" in t or t.rstrip("*)").endswith("security:") for t in slop)
+    allow-listed command must never start a program the repo chose, even
+    when a caller hands the name in."""
+    slop = [t for t in agent.allowed_tools(CHECKS) if t.startswith("Bash(slopstopper run")]
+    assert slop and not any("security:licences" in t for t in slop)
     assert "Bash(slopstopper run security:licences*)" in agent.DISALLOWED_TOOLS
     assert "Bash(slopstopper run --json security:licences*)" in agent.DISALLOWED_TOOLS
 

@@ -127,11 +127,14 @@ it can fail.
 
 1. **What the agent can do.** It runs inside the clone with
    `--permission-mode acceptEdits`, file edits, and a short allow-list of
-   commands that execute nothing from the tree: `slopstopper run` for the
-   hygiene and static security checks only (the browser and API checks
-   build or serve the repo, and `security:licences` runs the interpreter
-   the repo's config names, so neither is allowed), the listing commands,
-   `git status`, and the shell readers. An explicit deny-list names the
+   commands that execute nothing from the tree: `slopstopper run` for
+   exactly the checks the steward itself verifies in the clone, named by
+   the pinned CLI at run time (the browser and API checks build or serve
+   the repo, and `security:licences` runs the interpreter the repo's
+   config names, so none of those is ever on the list), the listing
+   commands, `git status`, and the shell readers. The brief tells the
+   agent which checks those are, and every call the box refuses is
+   listed in the PR body, so an allow rule that never matches is seen. An explicit deny-list names the
    ways to run an arbitrary command (`find`, `task`, `git grep`,
    interpreters, shells, `gh`, `curl`, `npm`, `pip`, `security:licences`),
    writes to any `.git` and changing directory (so `git status` never runs
