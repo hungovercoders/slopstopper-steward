@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
+import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -326,7 +328,23 @@ def _work(order: Order, inv: inventory.Inventory, cfg: Config, ctx: RunContext) 
         work = work_refresh if order.kind in ("upgrade", "refresh") else work_triage
         return work(order, inv, cfg, ws, ctx)
     except Exception as exc:  # one order's failure must not stop the run
-        return Outcome(order.to_dict(), "failed", detail=f"{type(exc).__name__}: {exc}"[:600])
+        return Outcome(order.to_dict(), "failed", detail=_failure(exc))
+
+
+# A credential that could appear in a tool's error output: GitHub tokens,
+# and userinfo in a URL (`https://x-access-token:...@github.com`).
+_SECRET = re.compile(r"\bgh[opsur]_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}|(?<=://)[^/@\s]+(?=@)")
+
+
+def _failure(exc: Exception) -> str:
+    """A failed order's detail. A failed command says what it ran and what
+    it printed on stderr (git's own reason for refusing a push, say), with
+    anything token-shaped redacted: the detail goes into the run report."""
+    detail = f"{type(exc).__name__}: {exc}"
+    if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
+        err = exc.stderr if isinstance(exc.stderr, str) else exc.stderr.decode("utf-8", "replace")
+        detail += " " + err.strip()[-400:]
+    return _SECRET.sub("***", detail)[:900]
 
 
 def run(cfg: Config, only: str | None, dry_run: bool, workdir: Path | None) -> RunReport:

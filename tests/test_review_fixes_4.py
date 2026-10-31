@@ -289,3 +289,20 @@ def test_report_cells_are_single_line_and_escaped():
                                                detail="slopstopper install exited 1:\nTraceback | boom")])
     row = [line for line in report.markdown().splitlines() if line.startswith("| acme/a")][0]
     assert row.count(" | ") == 3 and "\\|" in row
+
+
+def test_a_failed_push_reports_gits_reason_without_the_token():
+    from steward import runner
+    err = ("remote: refusing to allow a GitHub App to create or update workflow "
+           "`.github/workflows/ss-smoke.yml` without `workflows` permission\n"
+           "error: failed to push some refs to 'https://x-access-token:ghs_abcdefghijklmnopqrstuvwxyz0123@github.com/acme/a'\n")
+    exc = subprocess.CalledProcessError(1, ["git", "push", "origin", "steward/upgrade-0.27.0"], output="", stderr=err)
+    detail = runner._failure(exc)
+    assert "without `workflows` permission" in detail
+    assert "ghs_" not in detail and "x-access-token" not in detail and "***" in detail
+
+
+def test_a_plain_failure_is_reported_as_before():
+    from steward import runner
+    assert runner._failure(RuntimeError("no slopstopper-cli at or above 0.27.0")) == \
+        "RuntimeError: no slopstopper-cli at or above 0.27.0"
