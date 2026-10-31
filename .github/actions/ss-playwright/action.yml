@@ -15,6 +15,13 @@ description: >-
 #     uses: ./.github/actions/ss-playwright
 #     timeout-minutes: 12
 #
+# That budget has to cover everything here: the cache restore (a stalled
+# segment gives up after two minutes, #566), the two five-minute browser
+# download attempts, and, where the apt phase runs at all, its two
+# four-minute attempts. On a GitHub-hosted runner the apt phase is skipped
+# (#580), so 12 minutes is the worst case; a self-hosted runner that needs
+# it should allow 20.
+#
 # The workflow must have run `npm ci` first, because the Playwright version
 # that keys the cache is read from node_modules.
 
@@ -23,6 +30,14 @@ inputs:
     description: Browser to install (a `npx playwright install` name)
     required: false
     default: chromium
+  install-deps:
+    description: >-
+      Whether to run `playwright install-deps` (apt) before the download.
+      `auto` runs it on self-hosted runners only: GitHub-hosted images
+      already carry every library Chromium needs, and the phase spent its
+      minutes on fonts no check uses (#580). `true` and `false` force it.
+    required: false
+    default: auto
 
 runs:
   using: composite
@@ -43,28 +58,60 @@ runs:
         fi
         echo "version=$version" >> "$GITHUB_OUTPUT"
 
-    - name: Cache Playwright browsers
-      # Saved on job success only, so a run that fails elsewhere never stores
-      # a partial download. On a hit the install step below finds the build
-      # already present and skips the download; the apt phase still runs.
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+    - name: Restore Playwright browsers
+      id: cache
+      # Restore and save are separate steps so a completed download is kept
+      # whatever the check's verdict (#565): `actions/cache` saves only when
+      # the whole job succeeds, and a red PR re-runs most. On a hit the
+      # install step below finds the build present and skips the download.
+      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      env:
+        # A stalled segment download is otherwise abandoned after ten
+        # minutes, most of the caller's budget (#566).
+        SEGMENT_DOWNLOAD_TIMEOUT_MINS: 2
       with:
         path: ~/.cache/ms-playwright
         key: playwright-${{ runner.os }}-${{ runner.arch }}-${{ inputs.browser }}-${{ steps.pw.outputs.version }}
 
-    - name: Install Playwright browsers
-      # A stalled browser download otherwise holds the job until GitHub's
-      # six-hour limit. Each download attempt gets five minutes and a stall
-      # is retried once; the caller's `timeout-minutes` bounds both. The apt
-      # phase runs once, outside the timeout: killing it mid-install leaves
-      # apt-get holding the dpkg lock, so the retry fails on the lock
-      # instead of downloading (#527). apt gets one plain retry of its own,
-      # since a transient mirror error exits cleanly and leaves no lock.
+    - name: Install the browser's system packages
+      id: deps
+      # Self-hosted runners only, by default, and never on a cache hit: the
+      # restored browser was installed against this image family (#580).
+      if: >-
+        inputs.install-deps == 'true' ||
+        (inputs.install-deps == 'auto' && runner.environment != 'github-hosted' && steps.cache.outputs.cache-hit != 'true')
       shell: bash
       env:
         BROWSER: ${{ inputs.browser }}
       run: |
-        npx playwright install-deps "$BROWSER" || npx playwright install-deps "$BROWSER"
+        # Each attempt is bounded, so a slow mirror fails here with its own
+        # message instead of eating the browser download's time. `timeout`
+        # signals its whole process group, but apt-get under sudo can
+        # outlive it holding the dpkg lock (#527), so the retry first waits
+        # for the lock to clear.
+        for attempt in 1 2; do
+          if timeout --kill-after=30s 4m npx playwright install-deps "$BROWSER"; then
+            exit 0
+          fi
+          echo "::warning::apt attempt ${attempt} failed or stalled after 4 minutes (a slow mirror, usually)"
+          for _ in $(seq 12); do
+            sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock >/dev/null 2>&1 || break
+            sleep 5
+          done
+        done
+        echo "::error::Playwright's system packages could not be installed twice. That is the runner's apt mirror, not the browser download: re-run, or pass install-deps: false if the libraries are already present."
+        exit 1
+
+    - name: Install Playwright browsers
+      id: install
+      # A stalled browser download otherwise holds the job until GitHub's
+      # six-hour limit. Each download attempt gets five minutes and a stall
+      # is retried once; the caller's `timeout-minutes` bounds both (#386,
+      # #527).
+      shell: bash
+      env:
+        BROWSER: ${{ inputs.browser }}
+      run: |
         for attempt in 1 2; do
           if timeout --kill-after=30s 5m npx playwright install "$BROWSER"; then
             exit 0
@@ -73,3 +120,12 @@ runs:
         done
         echo "::error::Playwright browser download failed twice. Re-run the job; if it keeps failing, check the runner's network."
         exit 1
+
+    - name: Save Playwright browsers
+      # Only after a completed install, and only on a miss: the download is
+      # the thing worth keeping, not the check's verdict (#565).
+      if: steps.install.outcome == 'success' && steps.cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: ~/.cache/ms-playwright
+        key: ${{ steps.cache.outputs.cache-primary-key }}
