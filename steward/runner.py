@@ -183,14 +183,17 @@ def _review(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.W
         return red, unverified, None, f"the skills could not be fetched: {exc}"
     marks = [{**w, "state": refresh.issue_state(w["marker"])} for w in refresh.workarounds(ws)]
     (ws.path / ".steward-suite-diff.md").write_text(refresh.suite_diff(ws), encoding="utf-8")
-    checks = _runnable(ws, cli)
+    start = _start(order, inv)
+    (ws.path / ".steward-schema-diff.md").write_text(refresh.schema_diff(cfg.slopstopper_repo, start, order.target),
+                                                     encoding="utf-8")
+    checks, apart = _runnable(ws, cli)
     brief = prompts.review(order, inv, order.details["review"], marks, red, cfg.slopstopper_repo,
-                           start=_start(order, inv), checks=checks)
+                           start=start, checks=checks, apart=apart)
     before = refresh.fingerprint(ws)
     result = agent.run(ws, brief, cfg, cli, timeout=ctx.agent_timeout(), protect=ctx.protected(),
                        preflight=ctx.agent_unavailable, checked=ctx.checked_clis, checks=checks)
     if result.ran and refresh.fingerprint(ws) != before:
-        red, unverified = _verify_pass(ws, cli)
+        red, unverified = _verify_pass(ws, cli, ctx)
     return red, unverified, result, _unreviewed(result)
 
 
@@ -219,7 +222,7 @@ def _settle(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.W
             ctx: RunContext) -> tuple[list[dict], list[dict], AgentResult | None, str]:
     """Verify the refreshed suite. With `upgrade.review` the agent reviews
     the refresh either way; without it the agent only sees what went red."""
-    red, unverified = _verify_pass(ws, cli)
+    red, unverified = _verify_pass(ws, cli, ctx)
     if order.details.get("review"):
         return _review(order, inv, cfg, ws, cli, red, unverified, ctx)
     return (*_settle_red(order, inv, cfg, ws, cli, red, unverified, ctx), "")
@@ -235,15 +238,40 @@ def _review_section(order: Order, unreviewed: str) -> str:
     return f"### Reviewed\n\nThe agent worked the `slopstopper-install` skill's refresh ({why}).\n\n"
 
 
-def _runnable(ws: workspace.Workspace, cli: Path) -> list[str]:
-    """The checks this clone can run, which is also what the agent may run."""
-    return refresh.static_checks(ws, cli).runnable
-
-
-def _verify_pass(ws: workspace.Workspace, cli: Path) -> tuple[list[dict], list[dict]]:
-    """One verification pass: list once, run what is runnable. Returns (red, unverified)."""
+def _runnable(ws: workspace.Workspace, cli: Path) -> tuple[list[str], list[str]]:
+    """(the checks this clone can run, which is also what the agent may run;
+    the ones the steward runs apart as the agent user, which the brief
+    names so the agent knows they will be proved for it)."""
     checks = refresh.static_checks(ws, cli)
-    return refresh.verify(ws, cli, checks.runnable), checks.unverified
+    return checks.runnable, checks.environment if isolation.agent_user() else []
+
+
+def _apart(ws: workspace.Workspace, cli: Path, checks: list[str], ctx: RunContext | None
+           ) -> tuple[list[dict], list[dict]]:
+    """Run the environment-needing checks apart as the agent user, or say
+    why not. Returns (red, unverified)."""
+    if not checks:
+        return [], []
+    user = isolation.agent_user()
+    if not user:
+        return [], [{"check": c, "why": refresh.ENVIRONMENT_WHY} for c in checks]
+    if ctx is None or cli not in ctx.checked_clis:
+        try:
+            isolation.check_cli(user, cli)
+        except isolation.SetupError as exc:
+            return [], [{"check": c, "why": f"{refresh.ENVIRONMENT_WHY}; {exc}"} for c in checks]
+        if ctx is not None:
+            ctx.checked_clis.add(cli)
+    return refresh.verify_apart(ws, cli, checks, user), []
+
+
+def _verify_pass(ws: workspace.Workspace, cli: Path, ctx: RunContext | None = None) -> tuple[list[dict], list[dict]]:
+    """One verification pass: list once, run what is runnable here, run the
+    environment checks apart. Returns (red, unverified)."""
+    checks = refresh.static_checks(ws, cli)
+    red = refresh.verify(ws, cli, checks.runnable)
+    apart_red, apart_unverified = _apart(ws, cli, checks.environment, ctx)
+    return red + apart_red, checks.unverified + apart_unverified
 
 
 def _settle_red(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, cli: Path,
@@ -255,13 +283,13 @@ def _settle_red(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspa
     if not red or not cfg.agent_enabled:
         return red, unverified, None
     agent.ensure_skills(ws, order.target, cfg.slopstopper_repo)
-    checks = _runnable(ws, cli)
-    result = agent.run(ws, prompts.verify(order, inv, red, cfg.slopstopper_repo, checks=checks), cfg, cli,
-                       timeout=ctx.agent_timeout(), protect=ctx.protected(), preflight=ctx.agent_unavailable,
-                       checked=ctx.checked_clis, checks=checks)
+    checks, apart = _runnable(ws, cli)
+    brief = prompts.verify(order, inv, red, cfg.slopstopper_repo, checks=checks, apart=apart)
+    result = agent.run(ws, brief, cfg, cli, timeout=ctx.agent_timeout(), protect=ctx.protected(),
+                       preflight=ctx.agent_unavailable, checked=ctx.checked_clis, checks=checks)
     if not result.ran:
         return red, unverified, result
-    red, unverified = _verify_pass(ws, cli)
+    red, unverified = _verify_pass(ws, cli, ctx)
     return red, unverified, result
 
 
@@ -309,9 +337,11 @@ def _triage_summary(result: AgentResult) -> str:
     return summary
 
 
-def _recheck(order: Order, ws: workspace.Workspace, cli: Path) -> tuple[list[dict], list[dict]]:
+def _recheck(order: Order, ws: workspace.Workspace, cli: Path, ctx: RunContext | None = None
+             ) -> tuple[list[dict], list[dict]]:
     """The steward's own gate on a finding: the named check, re-run when a
-    clone can run it, else reported as unverified. Returns (red, unverified)."""
+    clone can run it (here, or apart as the agent user), else reported as
+    unverified. Returns (red, unverified)."""
     check = order.finding.check if order.finding else None
     if not check:
         what = (order.finding.workflow if order.finding else None) or "workflow"
@@ -319,6 +349,8 @@ def _recheck(order: Order, ws: workspace.Workspace, cli: Path) -> tuple[list[dic
     checks = refresh.static_checks(ws, cli)
     if check in checks.runnable:
         return refresh.verify(ws, cli, [check]), []
+    if check in checks.environment:
+        return _apart(ws, cli, [check], ctx)
     known = [u for u in checks.unverified if u["check"] == check]
     return [], known or [{"check": check, "why": "the steward cannot run it in a clone: it needs a deployed surface, "
                                                  "or the repo has switched it off"}]
@@ -343,13 +375,13 @@ def work_triage(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspa
     issue = gh.api(f"repos/{order.repo}/issues/{order.finding.number}") or {}
     cli = refresh.cli_for(version, ctx.venv(version), cfg.package)
     agent.ensure_skills(ws, version, cfg.slopstopper_repo)
-    checks = _runnable(ws, cli)
-    brief = prompts.triage(order, inv, issue.get("body") or "", cfg.slopstopper_repo, checks=checks)
+    checks, apart = _runnable(ws, cli)
+    brief = prompts.triage(order, inv, issue.get("body") or "", cfg.slopstopper_repo, checks=checks, apart=apart)
     result = agent.run(ws, brief, cfg, cli, timeout=ctx.agent_timeout(), protect=ctx.protected(),
                        preflight=ctx.agent_unavailable, checked=ctx.checked_clis, checks=checks)
     if not result.ran:
         return Outcome(order.to_dict(), "skipped", detail=result.error, agent=result.to_dict())
-    red, unverified = _recheck(order, ws, cli)
+    red, unverified = _recheck(order, ws, cli, ctx)
     if result.outcome == "skipped" or not workspace.commit(ws, f"{order.title}\n\n{result.summary or order.reason}"):
         return Outcome(order.to_dict(), "skipped", detail=result.summary or result.error or "agent changed nothing",
                        agent=result.to_dict())

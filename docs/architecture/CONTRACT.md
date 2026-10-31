@@ -54,6 +54,7 @@ this table is stale.
 | `cli/slopstopper/checks/licences.py` | `pip inspect` | `checks.NEEDS_ENVIRONMENT` | why security:licences needs an installed environment: it inventories the interpreter's packages |
 | `.claude/skills/slopstopper-install/references/refresh.md` | `## Refresh-only` | `prompts.review` | the refresh section the agent works on every upgrade |
 | `.claude/skills/slopstopper-install/references/refresh.md` | `'slopstopper-workaround: hungovercoders/slopstopper#[0-9]+'` | `execute.refresh.workarounds` | the workaround marker the triage skill writes and the refresh removes |
+| `.slopstopper.yml.example` | `profile:` | `execute.refresh.schema_diff` | the config schema the review diffs between the two pins, where a new knob shows |
 | `release-please-config.json` | `"include-v-in-tag": true` | `execute.agent.ensure_skills` | release tags are v<version>, so skills can be fetched at the pinned tag |
 <!-- contract:end -->
 

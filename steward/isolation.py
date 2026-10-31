@@ -132,6 +132,18 @@ def command(iso: Isolated, argv: Sequence[str], env: Mapping[str, str], path_fir
             f"USER={iso.user}", f"LOGNAME={iso.user}", *limit, *argv]
 
 
+def run_apart(user: str, clone: Path, argv: Sequence[str], env: Mapping[str, str], path_first: Path | None,
+              timeout: int) -> subprocess.CompletedProcess:
+    """`argv` as `user` in a fresh copy of `clone`, with exactly `env` (the
+    caller has stripped every secret from it), bounded by `timeout`; the
+    copy is removed after. For a check that installs and runs the repo's
+    own code: that code then runs as a user holding no token and no model
+    key, apart from the steward's clone and the agent's processes."""
+    with copy_for(user, clone) as iso:
+        cmd = command(iso, argv, env, path_first, timeout=timeout)
+        return subprocess.run(cmd, capture_output=True, text=True, env=dict(env), timeout=timeout + KILL_AFTER + 60)
+
+
 def unavailable(user: str, program: str = "claude") -> str | None:
     """Why the agent cannot run as `user`, or None when it can. The probe is
     the real command's shape (the same sudo flags, `--preserve-env`, PATH,
