@@ -76,20 +76,22 @@ flowchart TB
 
    | Kind | When | Who does the work | Priority |
    | ---- | ---- | ----------------- | -------- |
-   | `upgrade` | the pin is behind the policy's target (`upgrade.policy`, `min_age_days`) | code; the agent if the static checks go red, or for a big jump | 0 |
+   | `upgrade` | the pin is behind the policy's target (`upgrade.policy`, `min_age_days`) | code, then the agent's review of the refresh (`upgrade.review`) | 0 |
    | `refresh` | the pin is current but `.ss/.installed-from` is older | code; same | 1 |
    | `triage` | an open finding, security first | the agent with the repo's triage skill | 2 / 3 |
 
-   A big jump is a major version, `upgrade.review_minor_gap` (default 2)
-   minor versions or more, or a suite with no known starting version. For
-   one, the agent works the `slopstopper-install` skill's refresh section
-   on the branch after the install, in the same run that settles any red
-   check. The steward hands it what that section asks for, since the agent
+   The install is code; what it cannot judge is the agent's. With
+   `upgrade.review` (default true) the agent works the
+   `slopstopper-install` skill's refresh section on the branch after the
+   install, in the same run that settles any red check. Every upgrade gets
+   it, not only large ones: on 0.x any minor can rename a knob, wipe a
+   customisation or close a workaround's upstream issue. The steward hands it what that section asks for, since the agent
    has no network and no `git diff`: the install's diff of the
    slopstopper-owned files, the release notes between the pins, and each
-   `slopstopper-workaround` marker with its upstream issue's state. A big
-   jump the agent cannot review (disabled, or unavailable) opens as a
-   draft that says so. Everything else about an upgrade stays code.
+   `slopstopper-workaround` marker with its upstream issue's state. An
+   upgrade the agent cannot review (disabled, or unavailable) opens as a
+   draft that says so. With `upgrade.review: false` the agent only sees a
+   check that went red.
 
    A disabled workflow is reported, not worked: enabling one changes
    repo settings and needs an admin. So is any upgrade or refresh whose

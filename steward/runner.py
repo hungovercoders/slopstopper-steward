@@ -165,7 +165,7 @@ def _refresh_summary(order: Order, inv: inventory.Inventory, moved: str) -> str:
 def _review(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, cli: Path,
             red: list[dict], unverified: list[dict], ctx: RunContext
             ) -> tuple[list[dict], list[dict], AgentResult | None, str]:
-    """A big jump: the agent works the install skill's refresh against this
+    """The review: the agent works the install skill's refresh against this
     branch, red checks included, then the steward verifies again. Returns
     (red, unverified, agent result, why it was not reviewed or "")."""
     if not cfg.agent_enabled:
@@ -184,8 +184,8 @@ def _review(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.W
 
 def _settle(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, cli: Path,
             ctx: RunContext) -> tuple[list[dict], list[dict], AgentResult | None, str]:
-    """Verify the refreshed suite. A big jump gets the agent's review either
-    way; otherwise the agent only sees what went red."""
+    """Verify the refreshed suite. With `upgrade.review` the agent reviews
+    the refresh either way; without it the agent only sees what went red."""
     red, unverified = _verify_pass(ws, cli)
     if order.details.get("review"):
         return _review(order, inv, cfg, ws, cli, red, unverified, ctx)
@@ -197,9 +197,9 @@ def _review_section(order: Order, unreviewed: str) -> str:
     if not why:
         return ""
     if unreviewed:
-        return (f"### Not reviewed\n\nA big jump ({why}), so the agent was to review the refresh, but {unreviewed}. "
+        return (f"### Not reviewed\n\nThe agent was to review the refresh ({why}), but {unreviewed}. "
                 "Opened as a draft: work the `slopstopper-install` skill's refresh section before merging.\n\n")
-    return f"### Reviewed\n\nA big jump ({why}): the agent worked the `slopstopper-install` skill's refresh.\n\n"
+    return f"### Reviewed\n\nThe agent worked the `slopstopper-install` skill's refresh ({why}).\n\n"
 
 
 def _verify_pass(ws: workspace.Workspace, cli: Path) -> tuple[list[dict], list[dict]]:

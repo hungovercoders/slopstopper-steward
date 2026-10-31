@@ -76,14 +76,14 @@ the two versions are in `.steward-release-notes.md`.
 
 
 REVIEW = """\
-# Steward work order: review a big slopstopper upgrade
+# Steward work order: review a slopstopper upgrade
 
 Repository: `{repo}` (default branch `{default_branch}`), profile `{profile}`.
 You are on branch `{branch}`. The steward moved the slopstopper-cli pin from `{pinned}` to `{target}`
 ({why}) and ran `slopstopper install` from the new version, so the ss-* workflows, shims and skills
 on this branch are the new release's.
 
-A jump this size is what the `slopstopper-install` skill's refresh is for: read
+The install was mechanical; what it cannot judge is what the `slopstopper-install` skill's refresh is for: read
 `.claude/skills/slopstopper-install/SKILL.md`, then work `references/refresh.md` against this branch.
 You have no network and no `git diff`, so the steward gathered what that section asks for:
 

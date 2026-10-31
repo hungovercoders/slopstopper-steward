@@ -2,7 +2,7 @@
 
 Order kinds, in the priority they are worked:
   upgrade   the pin is behind the policy's target: move it and rewrite the suite;
-            a big jump (`upgrade.review_minor_gap`) also gets an agent review
+            and, with `upgrade.review`, an agent review of the refresh
   refresh   the pin is current but the suite on disk was written by an older CLI
   triage    an open finding slopstopper raised, security ones first
 
@@ -58,29 +58,20 @@ class Plan:
                 "skipped": self.skipped}
 
 
-def big_jump(start: str | None, target: str | None, gap: int) -> str | None:
-    """Why moving from `start` to `target` is big enough for an agent review
-    of the refresh, or None. A suite with no known starting version counts:
-    nothing says what it carried."""
-    if gap <= 0 or not target:
-        return None
-    lo, hi = parse(start), parse(target)
-    if lo is None or hi is None:
+def jump(start: str | None, target: str) -> str:
+    """The move a review covers, said the way the brief and the PR say it.
+    Size is not the test: on 0.x any minor may rename a knob or close a
+    workaround, and the refresh's judgement steps apply to every one."""
+    if parse(start) is None:
         return f"no known starting version ({start or 'unpinned'}) to {target}"
-    if hi[0] != lo[0]:
-        return f"a major version: {start} to {target}"
-    if hi[1] - lo[1] >= gap:
-        return f"{hi[1] - lo[1]} minor versions: {start} to {target}"
-    return None
+    return f"{start} to {target}"
 
 
-def _upgrade_order(inv: Inventory, target: str | None, gap: int = 0) -> Order | None:
+def _upgrade_order(inv: Inventory, target: str | None, review: bool = False) -> Order | None:
     order = _pin_order(inv, target)
-    if order:
+    if order and review:
         start = order.pinned if order.kind == "upgrade" else inv.repo.installed_from
-        review = big_jump(start, order.target, gap)
-        if review:
-            order.details["review"] = review
+        order.details["review"] = jump(start, order.target)
     return order
 
 
@@ -164,7 +155,7 @@ def _unworkable(inv: Inventory, target: str | None) -> list[dict]:
 def plan_repo(inv: Inventory, target: str | None, cfg: Config) -> Plan:
     plan = Plan(skipped=_unworkable(inv, target))
     candidates: list[Order] = []
-    upgrade = _upgrade_order(inv, target, cfg.review_minor_gap)
+    upgrade = _upgrade_order(inv, target, cfg.review)
     if upgrade:
         candidates.append(upgrade)
     candidates += _triage_orders(inv)
