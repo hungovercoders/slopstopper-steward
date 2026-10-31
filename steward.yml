@@ -2,12 +2,14 @@
 orgs:
   - hungovercoders
 
-# The first real run: pull requests on one repo only, so its PR can be
-# read before the steward is let loose on the rest. Widen by emptying
-# repos.include (docs/runbooks/SETUP.md).
+# Pull requests on these repos only, so each PR can be read before the
+# steward is let loose on the rest. Widen by emptying repos.include
+# (docs/runbooks/SETUP.md). The steward is an adopter too: its own
+# upgrade is the agent review's test, with a workaround to retire.
 repos:
   include:
     - hungovercoders/apic
+    - hungovercoders/slopstopper-steward
 
 mode: pr
 
