@@ -306,3 +306,23 @@ def test_a_plain_failure_is_reported_as_before():
     from steward import runner
     assert runner._failure(RuntimeError("no slopstopper-cli at or above 0.27.0")) == \
         "RuntimeError: no slopstopper-cli at or above 0.27.0"
+
+
+def test_a_failure_is_reported_in_full_below_the_table():
+    from steward.report import Outcome, RunReport
+    reason = "! [remote rejected] steward/upgrade-0.27.0 -> steward/upgrade-0.27.0 (refusing to allow a GitHub App " \
+             "to create or update workflow `.github/workflows/ss-smoke.yml` without `workflows` permission)"
+    detail = "CalledProcessError: Command '['git', 'push']' returned non-zero exit status 1. " + "x" * 300 + " " + reason
+    rep = RunReport("pr", outcomes=[Outcome({"repo": "acme/a", "id": "upgrade-0.27.0"}, "failed", detail=detail),
+                                    Outcome({"repo": "acme/b", "id": "upgrade-0.27.0"}, "pr", pr_url="https://x/pull/1")])
+    md = rep.markdown()
+    row = [line for line in md.splitlines() if line.startswith("| acme/a")][0]
+    assert reason not in row                                  # the table stays bounded
+    failures = md.split("## Failures", 1)[1]
+    assert reason in failures and "acme/a" in failures and "acme/b" not in failures
+
+
+def test_no_failures_section_when_nothing_failed():
+    from steward.report import Outcome, RunReport
+    rep = RunReport("pr", outcomes=[Outcome({"repo": "acme/b", "id": "upgrade-0.27.0"}, "pr", pr_url="https://x/pull/1")])
+    assert "## Failures" not in rep.markdown()

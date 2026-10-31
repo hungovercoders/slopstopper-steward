@@ -65,11 +65,23 @@ class RunReport:
                 if o.agent and o.agent.get("cost_usd") is not None:
                     result += f" (agent ${o.agent['cost_usd']:.2f}, {o.agent.get('turns')} turns)"
                 lines.append(f"| {o.order['repo']} | `{o.order['id']}` | {o.status} | {result} |")
+        lines += self._failures()
         if self.deferred:
             lines += ["", "## Deferred by budget", ""] + [f"- {d['repo']}: `{d['id']}` ({_cell(d['reason'])})" for d in self.deferred]
         if self.skipped:
             lines += ["", "## Skipped", ""] + [f"- {s['repo']}: `{s['order']}`: {_cell(s['why'])}" + (f" {s['url']}" if s.get('url') else "") for s in self.skipped]
         return "\n".join(lines) + "\n"
+
+    def _failures(self) -> list[str]:
+        """Each failed order's whole detail: the table cell is cut short, and
+        the reason (git's own words for a refused push, say) is at the end."""
+        failed = [o for o in self.outcomes if o.status == "failed"]
+        if not failed:
+            return []
+        lines = ["", "## Failures", ""]
+        for o in failed:
+            lines += [f"`{o.order['id']}` on {o.order['repo']}:", "", "~~~text", o.detail.replace("~~~", "~ ~ ~"), "~~~", ""]
+        return lines[:-1]
 
 
 def write(report: RunReport, out_dir: Path = REPORT_DIR) -> tuple[Path, Path]:
