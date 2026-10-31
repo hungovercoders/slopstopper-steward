@@ -11,6 +11,7 @@ agent cannot settle it, with the failures in the body.
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import os
@@ -24,9 +25,9 @@ from pathlib import Path
 from typing import Sequence
 
 from steward.checks import NEEDS_ENVIRONMENT
-from steward import gh, sandbox
+from steward import gh, isolation, sandbox
 from steward.pin import PIN_KEY, PIN_LINE, PinError, set_pin  # noqa: F401  (re-exported)
-from steward.versions import MIN_INSTALL_VERSION
+from steward.versions import MIN_INSTALL_VERSION, parse
 from steward.workspace import LOCAL_ONLY, Workspace
 
 
@@ -82,11 +83,17 @@ def _json(cli: Path, cwd: Path, *args: str, ok_codes: tuple[int, ...] = (0,)):
         return None
 
 
+ENVIRONMENT_WHY = "needs the project's installed dependencies; its workflow installs them"
+
+
 @dataclass
 class Checks:
-    """What a verification pass runs, and what it cannot and says so."""
+    """What a verification pass runs here, what it runs apart (as the agent
+    user, in its own copy: the checks that install the project), and what
+    it cannot run and says so."""
     runnable: list[str] = field(default_factory=list)
     unverified: list[dict] = field(default_factory=list)  # {check, why}
+    environment: list[str] = field(default_factory=list)
 
 
 def _missing_tools(cli: Path, cwd: Path) -> dict[str, str]:
@@ -121,7 +128,7 @@ def static_checks(ws: Workspace, cli: Path) -> Checks:
     out = Checks()
     for check in kept:
         if check in NEEDS_ENVIRONMENT:
-            out.unverified.append({"check": check, "why": "needs the project's installed dependencies; its workflow installs them"})
+            out.environment.append(check)
         elif check in missing:
             out.unverified.append({"check": check, "why": f"`{missing[check]}` is not installed on the steward's runner"})
         else:
@@ -160,21 +167,50 @@ def _run_one(ws: Workspace, cli: Path, check: str, env: dict) -> dict:
         run = subprocess.run([str(cli), "run", "--json", check], cwd=ws.path, capture_output=True, text=True,
                              timeout=CHECK_TIMEOUT, env=env)
     except subprocess.TimeoutExpired:
-        return {"check": check, "exit_code": 2, "status": "timed-out", "reports": [],
-                "failures": [f"`slopstopper run {check}` did not finish within {CHECK_TIMEOUT} s"]}
+        return _cannot_run(check, "timed-out", f"`slopstopper run {check}` did not finish within {CHECK_TIMEOUT} s")
+    return _verdict(check, run.returncode, run.stdout, run.stderr)
+
+
+def _verdict(check: str, returncode: int, stdout: str, stderr: str) -> dict:
+    """The row `run --json` printed, made whole: a CLI that printed nothing
+    usable still yields a row with the exit code and the stderr tail."""
     try:
-        verdict = json.loads(run.stdout) if run.stdout.strip() else {}
+        verdict = json.loads(stdout) if stdout.strip() else {}
     except json.JSONDecodeError:
         verdict = {}
     if not isinstance(verdict, dict):
         verdict = {}
     verdict.setdefault("check", check)
-    verdict.setdefault("exit_code", run.returncode)
-    verdict.setdefault("status", {0: "pass", 1: "fail"}.get(run.returncode, "cannot-run"))
+    verdict.setdefault("exit_code", returncode)
+    verdict.setdefault("status", {0: "pass", 1: "fail"}.get(returncode, "cannot-run"))
     verdict.setdefault("failures", [])
     if verdict["exit_code"] != 0:
-        verdict["stderr_tail"] = "\n".join(run.stderr.strip().splitlines()[-10:])
+        verdict["stderr_tail"] = "\n".join(stderr.strip().splitlines()[-10:])
     return verdict
+
+
+def _cannot_run(check: str, status: str, why: str) -> dict:
+    return {"check": check, "exit_code": 2, "status": status, "reports": [], "failures": [why]}
+
+
+def verify_apart(ws: Workspace, cli: Path, checks: Sequence[str], user: str, timeout: int = CHECK_TIMEOUT) -> list[dict]:
+    """The checks that need the project's installed environment, run one by
+    one as the agent user in a fresh copy of the clone, with no secret in
+    the process: `security:licences` installs the project and runs the
+    interpreter its config names, which must never happen as a user that
+    holds the token or the model key. Red rows as `verify` returns them; a
+    copy or run that fails is a red row saying so, never an exception."""
+    red = []
+    env = sandbox.environment(cli.parent)   # no model key, no token, a HOME the copy sets
+    for check in checks:
+        try:
+            done = isolation.run_apart(user, ws.path, [str(cli), "run", "--json", check], env, cli.parent, timeout)
+            verdict = _verdict(check, done.returncode, done.stdout, done.stderr)
+        except (isolation.IsolationError, subprocess.TimeoutExpired) as exc:
+            verdict = _cannot_run(check, "cannot-run", f"could not be run apart as {user}: {exc}"[:400])
+        if verdict["exit_code"] != 0:
+            red.append(verdict)
+    return red
 
 
 DIFF_LIMIT = 60_000
@@ -205,6 +241,26 @@ def fingerprint(ws: Workspace) -> str:
     """A digest of the tree's change from HEAD, binary files included: equal
     before and after the agent means it left the tree as it was."""
     return hashlib.sha256(_tree_diff(ws, "--binary").encode("utf-8", "surrogateescape")).hexdigest()
+
+
+SCHEMA = ".slopstopper.yml.example"
+
+
+def schema_diff(repo: str, start: str | None, target: str) -> str:
+    """The change to slopstopper's config schema between the two releases
+    (tags are v<version>), where a new knob shows. Text the agent can read;
+    a side that cannot be fetched is said, never read as "nothing new"."""
+    if parse(start) is None:
+        return f"(no known starting version, so no schema diff; the schema at {target} is {SCHEMA} in {repo})\n"
+    try:
+        old, new = gh.contents(repo, SCHEMA, ref=f"v{start}"), gh.contents(repo, SCHEMA, ref=f"v{target}")
+    except gh.GhError as exc:
+        return f"(the schema could not be fetched: {exc})\n"
+    if old is None or new is None:
+        return f"(the schema is missing at v{start if old is None else target}, so no diff)\n"
+    lines = list(difflib.unified_diff(old.splitlines(), new.splitlines(), f"{SCHEMA} @ v{start}",
+                                      f"{SCHEMA} @ v{target}", lineterm="", n=2))
+    return "\n".join(lines) + "\n" if lines else f"({SCHEMA} is the same at v{start} and v{target}: no new knobs)\n"
 
 
 # The marker slopstopper's skills put on a workaround (contract.py holds the

@@ -19,7 +19,7 @@ from steward import gh
 
 AUTHOR = ("slopstopper-steward", "steward@slopstopper.dev")
 LOCAL_ONLY = (".steward-result.json", ".steward-release-notes.md", ".steward-prompt.md", ".steward-venv/",
-              ".steward-suite-diff.md")
+              ".steward-suite-diff.md", ".steward-schema-diff.md")
 
 
 # Every git command the steward runs, before or after the agent, ignores

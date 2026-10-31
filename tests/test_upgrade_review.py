@@ -90,8 +90,9 @@ def upgrade(monkeypatch, tmp_path):
     monkeypatch.setattr(refresh, "suite_diff", lambda ws: "diff --git a/x b/x\n")
     monkeypatch.setattr(refresh, "issue_state", lambda marker: "open")
     monkeypatch.setattr(runner, "release_notes", lambda *a: "## 0.27.0")
-    monkeypatch.setattr(runner, "_verify_pass", lambda ws, cli: ([], []))
+    monkeypatch.setattr(runner, "_verify_pass", lambda ws, cli, ctx=None: ([], []))
     monkeypatch.setattr(refresh, "static_checks", lambda ws, cli: refresh.Checks(runnable=["hygiene:docs-size"]))
+    monkeypatch.setattr(refresh, "schema_diff", lambda repo, start, target: f"--- schema @ v{start}\n+++ schema @ v{target}\n")
     monkeypatch.setattr(runner.agent, "ensure_skills", lambda *a: "present")
     monkeypatch.setattr(runner.agent, "run", lambda ws, brief, *a, **k: seen["briefs"].append(brief)
                         or seen.update(checks=k.get("checks"))
@@ -250,7 +251,7 @@ def test_a_skill_fetch_failure_is_a_draft_not_a_failed_order(upgrade, monkeypatc
 def test_an_agent_that_changed_nothing_is_not_verified_twice(upgrade, monkeypatch):
     ws, ctx, seen = upgrade
     passes = []
-    monkeypatch.setattr(runner, "_verify_pass", lambda ws, cli: passes.append(1) or ([], []))
+    monkeypatch.setattr(runner, "_verify_pass", lambda ws, cli, ctx=None: passes.append(1) or ([], []))
     order, inv = _order("0.26.0")
     runner.work_refresh(order, inv, CFG, ws, ctx)
     assert len(passes) == 1                              # the stub agent wrote nothing
@@ -261,3 +262,10 @@ def test_the_agent_is_allowed_the_checks_the_clone_can_run(upgrade):
     order, inv = _order("0.26.0")
     runner.work_refresh(order, inv, CFG, ws, ctx)
     assert seen["checks"] == ["hygiene:docs-size"] and "`hygiene:docs-size`" in seen["briefs"][0]
+
+
+def test_the_review_hands_the_agent_the_schema_diff(upgrade):
+    ws, ctx, seen = upgrade
+    order, inv = _order("0.26.0")
+    runner.work_refresh(order, inv, CFG, ws, ctx)
+    assert (ws.path / ".steward-schema-diff.md").read_text() == "--- schema @ v0.26.0\n+++ schema @ v0.27.0\n"

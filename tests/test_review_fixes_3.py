@@ -65,8 +65,8 @@ def test_static_checks_from_the_cli(monkeypatch, tmp_path):
     _fake_cli(monkeypatch, ANSWERS)
     checks = refresh.static_checks(workspace.Workspace("acme/a", tmp_path, "main"), CLI)
     assert checks.runnable == ["hygiene:complexity", "security:secrets"]
+    assert checks.environment == ["security:licences"]      # run apart, not here
     assert {u["check"]: u["why"] for u in checks.unverified} == {
-        "security:licences": "needs the project's installed dependencies; its workflow installs them",
         "security:sast": "`semgrep` is not installed on the steward's runner",
     }
 

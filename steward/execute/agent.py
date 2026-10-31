@@ -48,7 +48,7 @@ ALLOWED_TOOLS = (
     "Bash(slopstopper --version)", "Bash(slopstopper checks list*)", "Bash(slopstopper doctor*)",
     "Bash(slopstopper profile *)", "Bash(slopstopper config get*)",
     "Bash(git status*)", "Bash(cat *)", "Bash(ls *)", "Bash(grep *)", "Bash(head *)", "Bash(tail *)",
-    "Bash(wc *)", "Bash(mkdir *)",
+    "Bash(wc *)", "Bash(mkdir *)", "Bash(echo *)",
 )
 
 

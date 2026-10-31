@@ -87,8 +87,12 @@ flowchart TB
    it, not only large ones: on 0.x any minor can rename a knob, wipe a
    customisation or close a workaround's upstream issue. The steward hands it what that section asks for, since the agent
    has no network and no `git diff`: the install's diff of the
-   slopstopper-owned files, the release notes between the pins, and each
-   `slopstopper-workaround` marker with its upstream issue's state. A
+   slopstopper-owned files, the release notes between the pins, the
+   change to `.slopstopper.yml.example` between them (where a new knob
+   shows), and each `slopstopper-workaround` marker with its upstream
+   issue's state. The brief names the checks it may run, and the ones the
+   steward proves for it afterwards, so retiring a workaround on
+   `security:licences` is the agent's to do and the steward's to confirm. A
    review counts only when the agent's result says it finished; an upgrade
    the agent could not review (unavailable, timed out, or left part of it
    for a person) opens as a draft that says why. With `agent.enabled:
@@ -106,11 +110,15 @@ flowchart TB
 5. **verify** asks the pinned CLI which checks a clone can run: what
    `checks list --json` says the repo keeps, minus what `profile expand
    library --json` says needs a deployed surface. A check whose tool
-   `doctor --json` reports missing on the steward's runner, or one listed
-   in `steward/checks.py` as needing an installed environment (each pinned
-   by a contract row), is reported in the PR as "not verified by the
-   steward" rather than run, since its exit 2 would say nothing about the
-   change; the PR's own `ss-*` workflows run it. Any other exit 2 is red.
+   `doctor --json` reports missing on the steward's runner is reported in
+   the PR as "not verified by the steward" rather than run, since its exit
+   2 would say nothing about the change; the PR's own `ss-*` workflows run
+   it. A check listed in `steward/checks.py` as needing an installed
+   environment (each pinned by a contract row) installs the project, which
+   runs its code, so it never runs as the steward: with `STEWARD_AGENT_USER`
+   set it runs apart, as the agent user in a fresh copy of the clone with
+   no token and no model key in the process, before and after the agent;
+   without one it is "not verified". Any other exit 2 is red.
    The run workflow installs Semgrep, Gitleaks and Trivy, pinned and
    checksummed, so the static security checks are verified before the PR
    rather than left to its CI. The browser and API checks never run in a
