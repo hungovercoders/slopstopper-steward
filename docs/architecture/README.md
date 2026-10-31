@@ -88,9 +88,11 @@ flowchart TB
    customisation or close a workaround's upstream issue. The steward hands it what that section asks for, since the agent
    has no network and no `git diff`: the install's diff of the
    slopstopper-owned files, the release notes between the pins, and each
-   `slopstopper-workaround` marker with its upstream issue's state. An
-   upgrade the agent cannot review (disabled, or unavailable) opens as a
-   draft that says so. With `upgrade.review: false` the agent only sees a
+   `slopstopper-workaround` marker with its upstream issue's state. A
+   review counts only when the agent's result says it finished; an upgrade
+   the agent could not review (unavailable, timed out, or left part of it
+   for a person) opens as a draft that says why. With `agent.enabled:
+   false` no review is planned. With `upgrade.review: false` the agent only sees a
    check that went red.
 
    A disabled workflow is reported, not worked: enabling one changes

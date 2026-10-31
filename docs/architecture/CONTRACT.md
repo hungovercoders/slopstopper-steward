@@ -53,6 +53,7 @@ this table is stale.
 | `cli/slopstopper/checks/__init__.py` | `"security:licences"` | `checks.NEEDS_ENVIRONMENT` | a registered check that needs the project's installed environment, which a clone lacks |
 | `cli/slopstopper/checks/licences.py` | `pip inspect` | `checks.NEEDS_ENVIRONMENT` | why security:licences needs an installed environment: it inventories the interpreter's packages |
 | `.claude/skills/slopstopper-install/references/refresh.md` | `## Refresh-only` | `prompts.review` | the refresh section the agent works on every upgrade |
+| `.claude/skills/slopstopper-install/references/refresh.md` | `'slopstopper-workaround: hungovercoders/slopstopper#[0-9]+'` | `execute.refresh.workarounds` | the workaround marker the triage skill writes and the refresh removes |
 | `release-please-config.json` | `"include-v-in-tag": true` | `execute.agent.ensure_skills` | release tags are v<version>, so skills can be fetched at the pinned tag |
 <!-- contract:end -->
 

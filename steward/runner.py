@@ -170,16 +170,44 @@ def _review(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.W
     (red, unverified, agent result, why it was not reviewed or "")."""
     if not cfg.agent_enabled:
         return red, unverified, None, "the agent is disabled in steward.yml"
-    (ws.path / ".steward-suite-diff.md").write_text(refresh.suite_diff(ws), encoding="utf-8")
+    why_not = ctx.agent_unavailable()
+    if why_not:  # before any fetch: an agent that cannot run needs no inputs
+        return red, unverified, None, f"the agent could not run: {why_not}"
+    try:
+        agent.ensure_skills(ws, order.target, cfg.slopstopper_repo)
+    except RuntimeError as exc:
+        return red, unverified, None, f"the skills could not be fetched: {exc}"
     marks = [{**w, "state": refresh.issue_state(w["marker"])} for w in refresh.workarounds(ws)]
-    agent.ensure_skills(ws, order.target, cfg.slopstopper_repo)
-    brief = prompts.review(order, inv, order.details["review"], marks, red, cfg.slopstopper_repo)
+    (ws.path / ".steward-suite-diff.md").write_text(refresh.suite_diff(ws), encoding="utf-8")
+    brief = prompts.review(order, inv, order.details["review"], marks, red, cfg.slopstopper_repo,
+                           start=_start(order, inv))
+    before = refresh.fingerprint(ws)
     result = agent.run(ws, brief, cfg, cli, timeout=ctx.agent_timeout(), protect=ctx.protected(),
                        preflight=ctx.agent_unavailable, checked=ctx.checked_clis)
+    if result.ran and refresh.fingerprint(ws) != before:
+        red, unverified = _verify_pass(ws, cli)
+    return red, unverified, result, _unreviewed(result)
+
+
+def _unreviewed(result: AgentResult) -> str:
+    """Why a review the agent was given did not happen, or "" when it did.
+    Running is not reviewing: a timeout, a refused copy-back or a missing
+    result file all leave `ran` true."""
     if not result.ran:
-        return red, unverified, result, f"the agent could not run: {result.error}"
-    red, unverified = _verify_pass(ws, cli)
-    return red, unverified, result, ""
+        return f"the agent could not run: {result.error}"
+    if result.error:
+        return f"the agent did not finish: {result.error}"
+    if result.outcome == "partial":
+        return f"the agent left part of it for a person: {result.notes or result.summary}"
+    if result.outcome not in ("fixed", "upstream"):
+        return f"the agent did not review it: {result.summary or 'no reason given'}"
+    return ""
+
+
+def _start(order: Order, inv: inventory.Inventory) -> str | None:
+    """The version the suite moves from: the old pin for an upgrade, the
+    version that wrote the suite for a refresh."""
+    return order.pinned if order.kind == "upgrade" else inv.repo.installed_from
 
 
 def _settle(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, cli: Path,
@@ -241,7 +269,9 @@ def work_refresh(order: Order, inv: inventory.Inventory, cfg: Config, ws: worksp
     if installed.returncode != 0:
         return Outcome(order.to_dict(), "failed",
                        detail=f"slopstopper install exited {installed.returncode}: {installed.stderr.strip()[-400:]}")
-    notes = release_notes(cfg, order.pinned, order.target, ctx.releases) if order.kind == "upgrade" else ""
+    start = _start(order, inv)
+    known = order.kind == "upgrade" or versions.parse(start) is not None
+    notes = release_notes(cfg, start, order.target, ctx.releases) if known else ""
     (ws.path / ".steward-release-notes.md").write_text(notes, encoding="utf-8")
     red, unverified, result, unreviewed = _settle(order, inv, cfg, ws, cli, ctx)
     if not workspace.commit(ws, f"{order.title}\n\n{order.reason}."):

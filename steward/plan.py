@@ -155,7 +155,7 @@ def _unworkable(inv: Inventory, target: str | None) -> list[dict]:
 def plan_repo(inv: Inventory, target: str | None, cfg: Config) -> Plan:
     plan = Plan(skipped=_unworkable(inv, target))
     candidates: list[Order] = []
-    upgrade = _upgrade_order(inv, target, cfg.review)
+    upgrade = _upgrade_order(inv, target, cfg.review and cfg.agent_enabled)
     if upgrade:
         candidates.append(upgrade)
     candidates += _triage_orders(inv)

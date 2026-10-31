@@ -69,6 +69,9 @@ SURFACES: tuple[Surface, ...] = (
             "why security:licences needs an installed environment: it inventories the interpreter's packages"),
     Surface(".claude/skills/slopstopper-install/references/refresh.md", "## Refresh-only", "prompts.review",
             "the refresh section the agent works on every upgrade"),
+    Surface(".claude/skills/slopstopper-install/references/refresh.md",
+            "'slopstopper-workaround: hungovercoders/slopstopper#[0-9]+'", "execute.refresh.workarounds",
+            "the workaround marker the triage skill writes and the refresh removes"),
     Surface("release-please-config.json", '"include-v-in-tag": true', "execute.agent.ensure_skills",
             "release tags are v<version>, so skills can be fetched at the pinned tag"),
 )

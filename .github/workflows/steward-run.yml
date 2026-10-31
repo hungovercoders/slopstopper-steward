@@ -122,13 +122,17 @@ jobs:
         # in its clone before it opens a PR, instead of leaving them to the
         # PR's own CI. They read the tree and run nothing from it. Pinned,
         # since they run in the job that later holds the push token; the
-        # downloads are checked against their release's checksums.
+        # downloads are checked against their release's checksums. Semgrep
+        # gets its own venv: its dependency tree is not pinned, and nothing
+        # it installs may land in the interpreter the steward runs on.
         env:
           SEMGREP_VERSION: "1.181.0"
           GITLEAKS_VERSION: "8.30.1"
           TRIVY_VERSION: "0.76.0"
         run: |
-          pip install -q "semgrep==${SEMGREP_VERSION}"
+          python -m venv "$RUNNER_TEMP/semgrep-venv"
+          "$RUNNER_TEMP/semgrep-venv/bin/pip" install -q "semgrep==${SEMGREP_VERSION}"
+          sudo ln -sf "$RUNNER_TEMP/semgrep-venv/bin/semgrep" /usr/local/bin/semgrep
           cd "$RUNNER_TEMP"
           base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
           curl -sSfLO "$base/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
