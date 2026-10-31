@@ -56,9 +56,7 @@ headers:
 # sets; this is for one-offs. `enabled` takes a single check back from a
 # profile.
 workflows:
-  disabled:
-    # slopstopper-workaround: hungovercoders/slopstopper#578 security:licences cannot run on a project with no runtime dependencies (the test extra is declared, pip install . leaves it out); back once the fix ships
-    - ss-security-licences-check.yml
+  disabled: []
   enabled: []
 
 # Backtick paths the docs name that are never on disk in this repo: the
