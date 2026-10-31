@@ -44,7 +44,8 @@ def test_upgrade_executor_end_to_end(tmp_path):
     checks = refresh.static_checks(ws, cli)  # the real CLI's listing, not a fallback
     assert "hygiene:complexity" in checks.runnable and "hygiene:docs-structure" in checks.runnable
     assert not any(c.startswith("reliability:") for c in checks.runnable)  # library drops the URL-driven checks
-    assert "security:licences" in {u["check"] for u in checks.unverified}
+    assert checks.environment == ["security:licences"]        # run apart as the agent user, never here
+    assert "security:licences" not in {u["check"] for u in checks.unverified}
     red = refresh.verify(ws, cli, checks.runnable)
     assert {r["check"] for r in red} <= {"hygiene:entry-files"}, red  # a bare README is the one expected red
     assert all("reports" in r for r in red)  # the whole verdict was parsed, not synthesised from the exit code
