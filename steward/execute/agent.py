@@ -21,30 +21,51 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from steward import gh, isolation, sandbox
+from steward.checks import NEEDS_ENVIRONMENT
 from steward.config import Config
 from steward.prompts import RESULT_FILE
 from steward.workspace import LOCAL_ONLY, Workspace, guarded_git_dir
 
 SKILLS = ("slopstopper-triage", "slopstopper-install")
-# Which `slopstopper run` targets the agent may call: the ones that read
-# the tree and execute nothing from it. The browser and API checks build or
-# serve the repo (its package.json scripts), and `security:licences` runs
-# the interpreter the repo's own config names (`security.licences.python`,
-# or a committed `.venv`); each would hand the agent an arbitrary-exec
-# path, so none is on the list. A check whose command or interpreter comes
-# from the repo never is. The steward does not verify those in a clone
-# either.
-_RUN_TARGETS = ("hygiene:", "security:sast", "security:secrets", "security:vulnerability")
-_NEVER_RUN = ("security:licences",)
+# The `slopstopper run` targets the agent may call are the checks the
+# steward itself verifies in a clone (`refresh.static_checks(...).runnable`,
+# named by the pinned CLI at run time): the ones that read the tree and
+# execute nothing from it. The browser and API checks build or serve the
+# repo (its package.json scripts), and `security:licences` runs the
+# interpreter the repo's own config names (`security.licences.python`, or
+# a committed `.venv`); each would hand the agent an arbitrary-exec path,
+# so none is ever handed in, and the environment-needing ones are dropped
+# here again and denied below.
+#
+# Rule shape matters. In a Bash rule a trailing `:*` is the legacy prefix
+# form, matching the prefix alone or followed by a space, so
+# `Bash(slopstopper run hygiene:*)` never matches `slopstopper run
+# hygiene:docs-size`; and a `:*` anywhere else is invalid. Each check gets
+# exact rules and a with-arguments rule instead.
+_NEVER_RUN = NEEDS_ENVIRONMENT
 ALLOWED_TOOLS = (
     "Read", "Edit", "Write", "MultiEdit", "Glob", "Grep",
-    *(f"Bash(slopstopper run {t}*)" for t in _RUN_TARGETS),
-    *(f"Bash(slopstopper run --json {t}*)" for t in _RUN_TARGETS),
-    "Bash(slopstopper checks list*)", "Bash(slopstopper doctor*)", "Bash(slopstopper profile *)",
-    "Bash(slopstopper config get*)",
+    "Bash(slopstopper --version)", "Bash(slopstopper checks list*)", "Bash(slopstopper doctor*)",
+    "Bash(slopstopper profile *)", "Bash(slopstopper config get*)",
     "Bash(git status*)", "Bash(cat *)", "Bash(ls *)", "Bash(grep *)", "Bash(head *)", "Bash(tail *)",
     "Bash(wc *)", "Bash(mkdir *)",
 )
+
+
+def run_rules(checks: Sequence[str]) -> list[str]:
+    """The allow rules for `slopstopper run` on exactly these checks, in the
+    shapes the agent types: bare, `--json` first, and either with arguments."""
+    rules = []
+    for check in checks:
+        if check in _NEVER_RUN or not check or " " in check:
+            continue
+        for lead in (f"slopstopper run {check}", f"slopstopper run --json {check}"):
+            rules += [f"Bash({lead})", f"Bash({lead} *)"]
+    return rules
+
+
+def allowed_tools(checks: Sequence[str] = ()) -> list[str]:
+    return [*ALLOWED_TOOLS, *run_rules(checks)]
 # Named as well as left off the allow-list, so a permission prompt the
 # headless run would auto-answer never lets one through. `find -exec`,
 # `task` (runs whatever Taskfile.ss.yml says), `git grep -O<cmd>` and the
@@ -77,6 +98,7 @@ class AgentResult:
     cost_usd: float | None = None
     turns: int | None = None
     error: str = ""
+    denied: list[str] = field(default_factory=list)   # tool calls the box refused, as the agent made them
 
     def to_dict(self) -> dict:
         return self.__dict__.copy()
@@ -147,11 +169,11 @@ def environment(cli_bin: Path | None = None, base: dict[str, str] | None = None,
     return sandbox.environment(cli_bin.parent if cli_bin else None, home, model_key=True, base=base)
 
 
-def _command(prompt: str, cfg: Config, protect: Sequence[Path] = ()) -> list[str]:
+def _command(prompt: str, cfg: Config, protect: Sequence[Path] = (), checks: Sequence[str] = ()) -> list[str]:
     deny = [*DISALLOWED_TOOLS, *(f"{tool}(/{p}/**)" for p in protect for tool in ("Edit", "Write", "MultiEdit"))]
     args = [
         "claude", "-p", prompt, "--output-format", "json", "--permission-mode", "acceptEdits",
-        "--allowedTools", *ALLOWED_TOOLS, "--disallowedTools", *deny,
+        "--allowedTools", *allowed_tools(checks), "--disallowedTools", *deny,
         "--max-turns", str(cfg.agent_turns), "--max-budget-usd", str(cfg.agent_usd),
     ]
     if cfg.agent_model:
@@ -164,6 +186,21 @@ def _meta(stdout: str) -> dict:
         return json.loads(stdout) if stdout.strip() else {}
     except json.JSONDecodeError:
         return {}
+
+
+def _denied(meta: dict) -> list[str]:
+    """The tool calls the box refused, from the result's `permission_denials`:
+    a Bash command as typed, any other tool by name. They go into the PR
+    body, so an allow rule that never matches is seen, not guessed at."""
+    out = []
+    for row in meta.get("permission_denials") or []:
+        if not isinstance(row, dict):
+            continue
+        tool = str(row.get("tool_name") or "?")
+        inp = row.get("tool_input") if isinstance(row.get("tool_input"), dict) else {}
+        text = str(inp.get("command") or inp.get("file_path") or inp.get("pattern") or "").replace("\n", " ")
+        out.append(f"{tool}: {text}"[:200] if text else tool)
+    return out[:20]
 
 
 def _read_result(raw: bytes, out: AgentResult) -> None:
@@ -189,20 +226,21 @@ def _read_result(raw: bytes, out: AgentResult) -> None:
 
 def run(ws: Workspace, prompt: str, cfg: Config, cli_bin: Path | None = None, timeout: int = 3600,
         protect: Sequence[Path] = (), preflight: Callable[[], str | None] | None = None,
-        checked: set[Path] | None = None) -> AgentResult:
+        checked: set[Path] | None = None, checks: Sequence[str] = ()) -> AgentResult:
     """One boxed run. `protect` are absolute paths outside the clone the agent
     must not edit (the run's venvs); `timeout` comes from the run, so an
     agent never outlives the token the steward will push with. `preflight`
     says why the agent cannot run, or None; a run passes its own cached
     answer, so the probe runs once per run, not once per order. `checked`
-    holds the CLIs already proven to run as the agent user, likewise."""
+    holds the CLIs already proven to run as the agent user, likewise.
+    `checks` are the `slopstopper run` targets the agent may call."""
     why_not = (preflight or available)()
     if why_not:
         return AgentResult(False, error=why_not)
     (ws.path / ".steward-prompt.md").write_text(prompt, encoding="utf-8")
     result_path = ws.path / RESULT_FILE
     result_path.unlink(missing_ok=True)
-    argv, rejected = _command(prompt, cfg, protect), []
+    argv, rejected = _command(prompt, cfg, protect, checks), []
     try:
         proc, raw = _launch(ws, argv, cli_bin, timeout, rejected, checked)
     except subprocess.TimeoutExpired:
@@ -215,7 +253,7 @@ def run(ws: Workspace, prompt: str, cfg: Config, cli_bin: Path | None = None, ti
         return AgentResult(True, outcome="skipped", error=f"the agent's work was not copied back: {exc}"[:500],
                            notes=_rejected_note(rejected))
     meta = _meta(proc.stdout)
-    out = AgentResult(True, cost_usd=meta.get("total_cost_usd"), turns=meta.get("num_turns"))
+    out = AgentResult(True, cost_usd=meta.get("total_cost_usd"), turns=meta.get("num_turns"), denied=_denied(meta))
     if raw is not None:
         _read_result(raw, out)
     else:

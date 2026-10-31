@@ -91,8 +91,10 @@ def upgrade(monkeypatch, tmp_path):
     monkeypatch.setattr(refresh, "issue_state", lambda marker: "open")
     monkeypatch.setattr(runner, "release_notes", lambda *a: "## 0.27.0")
     monkeypatch.setattr(runner, "_verify_pass", lambda ws, cli: ([], []))
+    monkeypatch.setattr(refresh, "static_checks", lambda ws, cli: refresh.Checks(runnable=["hygiene:docs-size"]))
     monkeypatch.setattr(runner.agent, "ensure_skills", lambda *a: "present")
     monkeypatch.setattr(runner.agent, "run", lambda ws, brief, *a, **k: seen["briefs"].append(brief)
+                        or seen.update(checks=k.get("checks"))
                         or AgentResult(True, outcome="fixed", summary="carried one knob over"))
     monkeypatch.setattr(workspace, "commit", lambda ws, msg: True)
     monkeypatch.setattr(workspace, "push", lambda ws, branch: None)
@@ -252,3 +254,10 @@ def test_an_agent_that_changed_nothing_is_not_verified_twice(upgrade, monkeypatc
     order, inv = _order("0.26.0")
     runner.work_refresh(order, inv, CFG, ws, ctx)
     assert len(passes) == 1                              # the stub agent wrote nothing
+
+
+def test_the_agent_is_allowed_the_checks_the_clone_can_run(upgrade):
+    ws, ctx, seen = upgrade
+    order, inv = _order("0.26.0")
+    runner.work_refresh(order, inv, CFG, ws, ctx)
+    assert seen["checks"] == ["hygiene:docs-size"] and "`hygiene:docs-size`" in seen["briefs"][0]

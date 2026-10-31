@@ -9,7 +9,7 @@ GUARDRAILS = """\
 ## Rules
 
 - Read `.claude/skills/slopstopper-triage/SKILL.md` first and follow it; read a reference only when a step needs it.
-- Reproduce with `slopstopper run --json <category>:<check>` and read `.ss/reports/` before deciding the fix shape. The `task ss:*` shims are not available here (they call the same command), and only the hygiene and static security checks run in this clone.
+- Reproduce with `slopstopper run --json <category>:<check>` and read `.ss/reports/` before deciding the fix shape. The `task ss:*` shims are not available here (they call the same command). The checks you may run in this clone: {checks}. Any other check, and any command not named here, is refused with no one to approve it, so do not retry one.
 - A real finding: fix the code. A false positive: the narrowest suppression the skill documents, with a `# why` comment. A threshold: the matching `.slopstopper.yml` knob, with a comment saying why.
 - A slopstopper bug: do not patch around it silently. Describe it in the result file under `upstream` with the reproduction the skill's `references/upstream.md` asks for, and apply the workaround with its `slopstopper-workaround: {slopstopper_repo}#<N>` marker only if an issue number already exists.
 - Never edit `.github/workflows/ss-*.yml`, `.github/actions/ss-*/` or `Taskfile.ss.yml`: the installer rewrites them. Never move the pin in `mise.toml`. Never disable a check to go green.
@@ -101,6 +101,11 @@ when you could not do the review.
 """
 
 
+def _guardrails(slopstopper_repo: str, checks) -> str:
+    names = ", ".join(f"`{c}`" for c in checks) or "none (nothing this clone can verify)"
+    return GUARDRAILS.format(result_file=RESULT_FILE, slopstopper_repo=slopstopper_repo, checks=names)
+
+
 def _failure_lines(failures: list[dict]) -> list[str]:
     lines = []
     for row in failures:
@@ -113,7 +118,7 @@ def _failure_lines(failures: list[dict]) -> list[str]:
 
 
 def review(order, inv, why: str, workarounds: list[dict], failures: list[dict], slopstopper_repo: str,
-           start: str | None = None) -> str:
+           start: str | None = None, checks=()) -> str:
     marks = [f"  - `{w['marker']}` in {', '.join(f'`{p}`' for p in w['files'])}: {w['state']}" for w in workarounds]
     red = ("The static checks below went red against the refreshed suite; settle them too, with the "
            "`slopstopper-triage` skill:\n\n" + "\n".join(_failure_lines(failures))) if failures else \
@@ -127,24 +132,24 @@ def review(order, inv, why: str, workarounds: list[dict], failures: list[dict], 
         repo=order.repo, default_branch=order.default_branch, profile=inv.profile or "ui (default)",
         branch=order.branch, moved=moved, start=start, target=order.target, why=why,
         workarounds="\n".join(marks) or "  - none", red=red,
-        guardrails=GUARDRAILS.format(result_file=RESULT_FILE, slopstopper_repo=slopstopper_repo),
+        guardrails=_guardrails(slopstopper_repo, checks),
     )
 
 
-def triage(order, inv, body: str, slopstopper_repo: str) -> str:
+def triage(order, inv, body: str, slopstopper_repo: str, checks=()) -> str:
     f = order.finding
     return TRIAGE.format(
         repo=order.repo, default_branch=order.default_branch, pinned=order.pinned or "unpinned",
         profile=inv.profile or "ui (default)", branch=order.branch, number=f.number, title=f.title, url=f.url,
         check=f.check or "unknown", workflow=f.workflow or "unknown", kind=f.kind, body=body.strip() or "(empty)",
-        guardrails=GUARDRAILS.format(result_file=RESULT_FILE, slopstopper_repo=slopstopper_repo),
+        guardrails=_guardrails(slopstopper_repo, checks),
     )
 
 
-def verify(order, inv, failures: list[dict], slopstopper_repo: str) -> str:
+def verify(order, inv, failures: list[dict], slopstopper_repo: str, checks=()) -> str:
     lines = _failure_lines(failures)
     return VERIFY.format(
         repo=order.repo, default_branch=order.default_branch, profile=inv.profile or "ui (default)",
         branch=order.branch, pinned=order.pinned or "unpinned", target=order.target, failures="\n".join(lines),
-        guardrails=GUARDRAILS.format(result_file=RESULT_FILE, slopstopper_repo=slopstopper_repo),
+        guardrails=_guardrails(slopstopper_repo, checks),
     )

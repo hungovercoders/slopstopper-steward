@@ -140,7 +140,11 @@ def _agent_section(result: AgentResult | None) -> str:
     if not result or not result.ran:
         return ""
     text = f"\n**Agent ({result.outcome}, {result.category or 'n/a'}):** {result.summary}"
-    return text + (f"\n\nNotes: {result.notes}" if result.notes else "")
+    if result.notes:
+        text += f"\n\nNotes: {result.notes}"
+    if result.denied:
+        text += "\n\nRefused by the agent's box: " + "; ".join(f"`{d}`" for d in result.denied)
+    return text
 
 
 def _upstream_section(result: AgentResult, cfg: Config) -> str:
@@ -179,11 +183,12 @@ def _review(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.W
         return red, unverified, None, f"the skills could not be fetched: {exc}"
     marks = [{**w, "state": refresh.issue_state(w["marker"])} for w in refresh.workarounds(ws)]
     (ws.path / ".steward-suite-diff.md").write_text(refresh.suite_diff(ws), encoding="utf-8")
+    checks = _runnable(ws, cli)
     brief = prompts.review(order, inv, order.details["review"], marks, red, cfg.slopstopper_repo,
-                           start=_start(order, inv))
+                           start=_start(order, inv), checks=checks)
     before = refresh.fingerprint(ws)
     result = agent.run(ws, brief, cfg, cli, timeout=ctx.agent_timeout(), protect=ctx.protected(),
-                       preflight=ctx.agent_unavailable, checked=ctx.checked_clis)
+                       preflight=ctx.agent_unavailable, checked=ctx.checked_clis, checks=checks)
     if result.ran and refresh.fingerprint(ws) != before:
         red, unverified = _verify_pass(ws, cli)
     return red, unverified, result, _unreviewed(result)
@@ -230,6 +235,11 @@ def _review_section(order: Order, unreviewed: str) -> str:
     return f"### Reviewed\n\nThe agent worked the `slopstopper-install` skill's refresh ({why}).\n\n"
 
 
+def _runnable(ws: workspace.Workspace, cli: Path) -> list[str]:
+    """The checks this clone can run, which is also what the agent may run."""
+    return refresh.static_checks(ws, cli).runnable
+
+
 def _verify_pass(ws: workspace.Workspace, cli: Path) -> tuple[list[dict], list[dict]]:
     """One verification pass: list once, run what is runnable. Returns (red, unverified)."""
     checks = refresh.static_checks(ws, cli)
@@ -245,9 +255,10 @@ def _settle_red(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspa
     if not red or not cfg.agent_enabled:
         return red, unverified, None
     agent.ensure_skills(ws, order.target, cfg.slopstopper_repo)
-    result = agent.run(ws, prompts.verify(order, inv, red, cfg.slopstopper_repo), cfg, cli,
+    checks = _runnable(ws, cli)
+    result = agent.run(ws, prompts.verify(order, inv, red, cfg.slopstopper_repo, checks=checks), cfg, cli,
                        timeout=ctx.agent_timeout(), protect=ctx.protected(), preflight=ctx.agent_unavailable,
-                       checked=ctx.checked_clis)
+                       checked=ctx.checked_clis, checks=checks)
     if not result.ran:
         return red, unverified, result
     red, unverified = _verify_pass(ws, cli)
@@ -332,9 +343,10 @@ def work_triage(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspa
     issue = gh.api(f"repos/{order.repo}/issues/{order.finding.number}") or {}
     cli = refresh.cli_for(version, ctx.venv(version), cfg.package)
     agent.ensure_skills(ws, version, cfg.slopstopper_repo)
-    result = agent.run(ws, prompts.triage(order, inv, issue.get("body") or "", cfg.slopstopper_repo), cfg, cli,
-                       timeout=ctx.agent_timeout(), protect=ctx.protected(), preflight=ctx.agent_unavailable,
-                       checked=ctx.checked_clis)
+    checks = _runnable(ws, cli)
+    brief = prompts.triage(order, inv, issue.get("body") or "", cfg.slopstopper_repo, checks=checks)
+    result = agent.run(ws, brief, cfg, cli, timeout=ctx.agent_timeout(), protect=ctx.protected(),
+                       preflight=ctx.agent_unavailable, checked=ctx.checked_clis, checks=checks)
     if not result.ran:
         return Outcome(order.to_dict(), "skipped", detail=result.error, agent=result.to_dict())
     red, unverified = _recheck(order, ws, cli)
