@@ -61,10 +61,7 @@ class RunReport:
         else:
             lines += ["| Repo | Order | Status | Result |", "| --- | --- | --- | --- |"]
             for o in self.outcomes:
-                result = o.pr_url or _cell(o.detail)
-                if o.agent and o.agent.get("cost_usd") is not None:
-                    model = f", {o.agent['model']}" if o.agent.get("model") else ""
-                    result += f" (agent ${o.agent['cost_usd']:.2f}, {o.agent.get('turns')} turns{model})"
+                result = (o.pr_url or _cell(o.detail)) + _agent_cell(o.agent)
                 lines.append(f"| {o.order['repo']} | `{o.order['id']}` | {o.status} | {result} |")
         lines += self._failures()
         if self.deferred:
@@ -95,3 +92,11 @@ def write(report: RunReport, out_dir: Path = REPORT_DIR) -> tuple[Path, Path]:
         with open(summary, "a", encoding="utf-8") as fh:
             fh.write(report.markdown())
     return md, js
+
+
+def _agent_cell(agent: dict | None) -> str:
+    """What the agent run cost, how long it took and what it ran, for the table."""
+    if not agent or agent.get("cost_usd") is None:
+        return ""
+    model = f", {agent['model']}" if agent.get("model") else ""
+    return f" (agent ${agent['cost_usd']:.2f}, {agent.get('turns')} turns{model})"
