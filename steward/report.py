@@ -63,7 +63,8 @@ class RunReport:
             for o in self.outcomes:
                 result = o.pr_url or _cell(o.detail)
                 if o.agent and o.agent.get("cost_usd") is not None:
-                    result += f" (agent ${o.agent['cost_usd']:.2f}, {o.agent.get('turns')} turns)"
+                    model = f", {o.agent['model']}" if o.agent.get("model") else ""
+                    result += f" (agent ${o.agent['cost_usd']:.2f}, {o.agent.get('turns')} turns{model})"
                 lines.append(f"| {o.order['repo']} | `{o.order['id']}` | {o.status} | {result} |")
         lines += self._failures()
         if self.deferred:

@@ -23,7 +23,7 @@ budgets:
 
 agent:
   enabled: true            # false: upgrades still run, findings are reported not worked
-  model: ""                # handed to `claude --model`; empty uses the CLI default
+  model: ""                # handed to `claude --model` (an alias like sonnet, or an id); empty uses the CLI default. The PR and report name what ran
 
 labels:
   pr: [slopstopper, steward]

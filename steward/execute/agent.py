@@ -97,6 +97,7 @@ class AgentResult:
     notes: str = ""
     cost_usd: float | None = None
     turns: int | None = None
+    model: str = ""          # what the CLI ran, from the result's modelUsage: the pin is an alias
     error: str = ""
     denied: list[str] = field(default_factory=list)   # tool calls the box refused, as the agent made them
 
@@ -188,6 +189,13 @@ def _meta(stdout: str) -> dict:
         return {}
 
 
+def _model(meta: dict) -> str:
+    """The model id(s) the run used, as the result's `modelUsage` names them:
+    `--model sonnet` is an alias, and the report says what it resolved to."""
+    usage = meta.get("modelUsage")
+    return " + ".join(sorted(str(k) for k in usage)) if isinstance(usage, dict) and usage else ""
+
+
 def _denied(meta: dict) -> list[str]:
     """The tool calls the box refused, from the result's `permission_denials`:
     a Bash command as typed, any other tool by name. They go into the PR
@@ -253,7 +261,8 @@ def run(ws: Workspace, prompt: str, cfg: Config, cli_bin: Path | None = None, ti
         return AgentResult(True, outcome="skipped", error=f"the agent's work was not copied back: {exc}"[:500],
                            notes=_rejected_note(rejected))
     meta = _meta(proc.stdout)
-    out = AgentResult(True, cost_usd=meta.get("total_cost_usd"), turns=meta.get("num_turns"), denied=_denied(meta))
+    out = AgentResult(True, cost_usd=meta.get("total_cost_usd"), turns=meta.get("num_turns"), denied=_denied(meta),
+                      model=_model(meta))
     if raw is not None:
         _read_result(raw, out)
     else:

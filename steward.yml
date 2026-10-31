@@ -27,3 +27,7 @@ budgets:
 
 agent:
   enabled: true
+  # The CLI's current Sonnet: enough for reading a diff and a skill and making
+  # light edits, at a known cost. Each PR and report names the exact model
+  # the alias resolved to; pin that id here to hold it still.
+  model: sonnet

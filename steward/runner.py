@@ -139,7 +139,9 @@ def _red_section(heading: str, red: list[dict], tail: str = "") -> str:
 def _agent_section(result: AgentResult | None) -> str:
     if not result or not result.ran:
         return ""
-    text = f"\n**Agent ({result.outcome}, {result.category or 'n/a'}):** {result.summary}"
+    ran = ", ".join(x for x in (result.model, f"${result.cost_usd:.2f}" if result.cost_usd is not None else "",
+                               f"{result.turns} turns" if result.turns is not None else "") if x)
+    text = f"\n**Agent ({result.outcome}, {result.category or 'n/a'}{'; ' + ran if ran else ''}):** {result.summary}"
     if result.notes:
         text += f"\n\nNotes: {result.notes}"
     if result.denied:
