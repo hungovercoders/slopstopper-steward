@@ -12,6 +12,7 @@ agent cannot settle it, with the failures in the body.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -20,7 +21,7 @@ from pathlib import Path
 from typing import Sequence
 
 from steward.checks import NEEDS_ENVIRONMENT
-from steward import sandbox
+from steward import gh, sandbox
 from steward.pin import PIN_KEY, PIN_LINE, PinError, set_pin  # noqa: F401  (re-exported)
 from steward.versions import MIN_INSTALL_VERSION
 from steward.workspace import Workspace
@@ -165,3 +166,51 @@ def _run_one(ws: Workspace, cli: Path, check: str, env: dict) -> dict:
     if verdict["exit_code"] != 0:
         verdict["stderr_tail"] = "\n".join(run.stderr.strip().splitlines()[-10:])
     return verdict
+
+
+# Where `slopstopper install` writes: the paths whose change is the refresh.
+SUITE_PATHS = (".github/workflows", ".github/actions", "Taskfile.ss.yml", ".claude/skills", ".githooks")
+DIFF_LIMIT = 60_000
+
+
+def suite_diff(ws: Workspace) -> str:
+    """The install's change to the slopstopper-owned files, as a unified diff
+    the agent can read (it has no `git diff`), cut to a size a brief can hold."""
+    done = ws.git("diff", "--no-color", "HEAD", "--", *SUITE_PATHS, check=False)
+    text = done.stdout or "(the install changed none of the slopstopper-owned files)\n"
+    return text if len(text) <= DIFF_LIMIT else text[:DIFF_LIMIT] + "\n… (cut: the rest is in the PR's diff)\n"
+
+
+_MARKER = re.compile(r"slopstopper-workaround: ([\w.-]+/[\w.-]+)#(\d+)")
+_SKIP_DIRS = {".git", ".ss", ".claude", "node_modules", ".steward-venv"}
+
+
+def workarounds(ws: Workspace) -> list[dict]:
+    """Every `slopstopper-workaround: <repo>#<N>` marker in the clone, with
+    the files it is in. The skills are left out: they spell the convention."""
+    found: dict[str, list[str]] = {}
+    for dirpath, dirnames, filenames in os.walk(ws.path):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+        for name in filenames:
+            path = Path(dirpath) / name
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            for repo, number in _MARKER.findall(text):
+                found.setdefault(f"{repo}#{number}", []).append(str(path.relative_to(ws.path)))
+    return [{"marker": m, "files": sorted(set(f))} for m, f in sorted(found.items())]
+
+
+def issue_state(marker: str) -> str:
+    """`open`, `closed on <date>` or `unknown` for a `<repo>#<N>` marker."""
+    repo, _, number = marker.partition("#")
+    try:
+        issue = gh.api(f"repos/{repo}/issues/{number}")
+    except gh.GhError:
+        issue = None
+    if not issue:
+        return "unknown (GitHub did not answer; leave the workaround in place)"
+    if issue.get("state") == "closed":
+        return f"closed on {(issue.get('closed_at') or '')[:10]}: {issue.get('title', '')}"
+    return f"open: {issue.get('title', '')}"

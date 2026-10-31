@@ -13,6 +13,7 @@ mode: pr                   # plan | pr. `plan` reads and reports; `pr` also open
 upgrade:
   policy: latest           # latest | minor | patch: how far one PR may move the pin
   min_age_days: 2          # a release younger than this is not a target yet
+  review_minor_gap: 2      # this many minor versions (or a major) ahead: the agent reviews the refresh; 0 never
 
 budgets:
   repos_per_run: 5         # repos worked per run; the plan still covers every adopter

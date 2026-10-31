@@ -9,6 +9,8 @@ Configuration
                              forces plan for one run.
     upgrade.policy           latest | minor | patch: how far a pin may move in one PR.
     upgrade.min_age_days     Skip a release younger than this (lets a bad release be yanked).
+    upgrade.review_minor_gap An upgrade this many minor versions (or any major) ahead of
+                             the pin also gets an agent review of the refresh. 0 never.
     budgets.repos_per_run    Repos worked per run (plan still covers all).
     budgets.prs_per_repo     Open steward PRs per repo, upgrades included.
     budgets.agent_usd        Dollar cap per agent invocation (claude --max-budget-usd).
@@ -41,6 +43,7 @@ class Config:
     mode: str = "pr"
     policy: str = "latest"
     min_age_days: int = 2
+    review_minor_gap: int = 2
     repos_per_run: int = 5
     prs_per_repo: int = 2
     agent_usd: float = 5.0
@@ -101,6 +104,7 @@ def from_dict(data: dict) -> Config:
         mode=str(data.get("mode") or "pr"),
         policy=str(upgrade.get("policy") or "latest"),
         min_age_days=_num(upgrade, "min_age_days", 2, int),
+        review_minor_gap=_num(upgrade, "review_minor_gap", 2, int),
         repos_per_run=_num(budgets, "repos_per_run", 5, int),
         prs_per_repo=_num(budgets, "prs_per_repo", 2, int),
         agent_usd=_num(budgets, "agent_usd", 5.0, float),

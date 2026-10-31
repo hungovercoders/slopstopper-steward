@@ -162,6 +162,46 @@ def _refresh_summary(order: Order, inv: inventory.Inventory, moved: str) -> str:
             f"from {order.target} rewrote the suite (workflows, shims, composite actions, skills).")
 
 
+def _review(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, cli: Path,
+            red: list[dict], unverified: list[dict], ctx: RunContext
+            ) -> tuple[list[dict], list[dict], AgentResult | None, str]:
+    """A big jump: the agent works the install skill's refresh against this
+    branch, red checks included, then the steward verifies again. Returns
+    (red, unverified, agent result, why it was not reviewed or "")."""
+    if not cfg.agent_enabled:
+        return red, unverified, None, "the agent is disabled in steward.yml"
+    (ws.path / ".steward-suite-diff.md").write_text(refresh.suite_diff(ws), encoding="utf-8")
+    marks = [{**w, "state": refresh.issue_state(w["marker"])} for w in refresh.workarounds(ws)]
+    agent.ensure_skills(ws, order.target, cfg.slopstopper_repo)
+    brief = prompts.review(order, inv, order.details["review"], marks, red, cfg.slopstopper_repo)
+    result = agent.run(ws, brief, cfg, cli, timeout=ctx.agent_timeout(), protect=ctx.protected(),
+                       preflight=ctx.agent_unavailable, checked=ctx.checked_clis)
+    if not result.ran:
+        return red, unverified, result, f"the agent could not run: {result.error}"
+    red, unverified = _verify_pass(ws, cli)
+    return red, unverified, result, ""
+
+
+def _settle(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, cli: Path,
+            ctx: RunContext) -> tuple[list[dict], list[dict], AgentResult | None, str]:
+    """Verify the refreshed suite. A big jump gets the agent's review either
+    way; otherwise the agent only sees what went red."""
+    red, unverified = _verify_pass(ws, cli)
+    if order.details.get("review"):
+        return _review(order, inv, cfg, ws, cli, red, unverified, ctx)
+    return (*_settle_red(order, inv, cfg, ws, cli, red, unverified, ctx), "")
+
+
+def _review_section(order: Order, unreviewed: str) -> str:
+    why = order.details.get("review")
+    if not why:
+        return ""
+    if unreviewed:
+        return (f"### Not reviewed\n\nA big jump ({why}), so the agent was to review the refresh, but {unreviewed}. "
+                "Opened as a draft: work the `slopstopper-install` skill's refresh section before merging.\n\n")
+    return f"### Reviewed\n\nA big jump ({why}): the agent worked the `slopstopper-install` skill's refresh.\n\n"
+
+
 def _verify_pass(ws: workspace.Workspace, cli: Path) -> tuple[list[dict], list[dict]]:
     """One verification pass: list once, run what is runnable. Returns (red, unverified)."""
     checks = refresh.static_checks(ws, cli)
@@ -203,17 +243,19 @@ def work_refresh(order: Order, inv: inventory.Inventory, cfg: Config, ws: worksp
                        detail=f"slopstopper install exited {installed.returncode}: {installed.stderr.strip()[-400:]}")
     notes = release_notes(cfg, order.pinned, order.target, ctx.releases) if order.kind == "upgrade" else ""
     (ws.path / ".steward-release-notes.md").write_text(notes, encoding="utf-8")
-    red, unverified, result = _settle_red(order, inv, cfg, ws, cli, *_verify_pass(ws, cli), ctx)
+    red, unverified, result, unreviewed = _settle(order, inv, cfg, ws, cli, ctx)
     if not workspace.commit(ws, f"{order.title}\n\n{order.reason}."):
         return Outcome(order.to_dict(), "skipped", detail="nothing changed after the refresh")
     workspace.push(ws, order.branch)
     summary = _refresh_summary(order, inv, moved) + _agent_section(result)
-    extra = _red_section("Still red after the refresh", red, "Opened as a draft: settle these before merging.\n\n")
+    extra = _review_section(order, unreviewed)
+    extra += _red_section("Still red after the refresh", red, "Opened as a draft: settle these before merging.\n\n")
     extra += _unverified_section(unverified)
     if notes:
         extra += f"<details><summary>Release notes between the two pins</summary>\n\n{notes}\n</details>\n"
-    url = workspace.open_pr(ws, order.title, _pr_body(order, cfg, summary, extra), cfg.pr_labels, draft=bool(red))
-    return Outcome(order.to_dict(), "draft" if red else "pr", pr_url=url, red=red, unverified=unverified,
+    draft = bool(red or unreviewed)
+    url = workspace.open_pr(ws, order.title, _pr_body(order, cfg, summary, extra), cfg.pr_labels, draft=draft)
+    return Outcome(order.to_dict(), "draft" if draft else "pr", pr_url=url, red=red, unverified=unverified,
                    agent=result.to_dict() if result else None)
 
 
