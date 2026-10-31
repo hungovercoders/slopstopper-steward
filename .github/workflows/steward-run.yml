@@ -12,8 +12,9 @@ name: Steward · Run
 # the token expires, and caps each agent run to fit. Without an App, the
 # STEWARD_TOKEN secret (a fine-grained PAT) is used and no deadline is set.
 # GITHUB_TOKEN never leaves this repo, so it is not an option. The agentic
-# orders need ANTHROPIC_API_KEY; without it upgrades still run and findings
-# are only reported.
+# orders need CLAUDE_CODE_OAUTH_TOKEN (a Claude Pro/Max subscription, from
+# `claude setup-token`) or ANTHROPIC_API_KEY (pay-as-you-go API billing);
+# without either, upgrades still run and findings are only reported.
 
 on:
   schedule:
@@ -165,6 +166,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token || secrets.STEWARD_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           REPO: ${{ matrix.repo }}
         run: steward run --repo "$REPO"
 

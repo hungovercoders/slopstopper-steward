@@ -2,9 +2,14 @@
 orgs:
   - hungovercoders
 
-# plan until a run's report has been read (docs/runbooks/SETUP.md); then
-# pr, with repos.include narrowed to one repo for the first real run.
-mode: plan
+# The first real run: pull requests on one repo only, so its PR can be
+# read before the steward is let loose on the rest. Widen by emptying
+# repos.include (docs/runbooks/SETUP.md).
+repos:
+  include:
+    - hungovercoders/apic
+
+mode: pr
 
 upgrade:
   policy: latest

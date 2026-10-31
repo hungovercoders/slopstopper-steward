@@ -32,7 +32,9 @@ def environment(path_prepend: Path | None = None, home: Path | None = None, mode
                 base: Mapping[str, str] | None = None) -> dict[str, str]:
     source = os.environ if base is None else base
     keep = KEEP + (MODEL_KEYS if model_key else ())
-    env = {k: v for k, v in source.items() if k in keep}
+    # An unset Actions secret arrives as an empty string; a model key that is
+    # empty is no key, and must not reach the agent as one.
+    env = {k: v for k, v in source.items() if k in keep and (v or k not in MODEL_KEYS)}
     if home is not None:
         env["HOME"] = str(home)
     elif "HOME" in source:
