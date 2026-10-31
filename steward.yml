@@ -13,7 +13,9 @@ mode: pr
 
 upgrade:
   policy: latest
-  min_age_days: 2
+  # 0 for the first upgrade, so apic can move to 0.27.0 the day it shipped;
+  # set back to 2 afterwards, so a bad release can be yanked before it lands.
+  min_age_days: 0
 
 budgets:
   repos_per_run: 5
