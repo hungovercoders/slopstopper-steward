@@ -11,19 +11,23 @@ agent cannot settle it, with the failures in the body.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
+import stat
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
 from steward.checks import NEEDS_ENVIRONMENT
-from steward import sandbox
+from steward import gh, sandbox
 from steward.pin import PIN_KEY, PIN_LINE, PinError, set_pin  # noqa: F401  (re-exported)
 from steward.versions import MIN_INSTALL_VERSION
-from steward.workspace import Workspace
+from steward.workspace import LOCAL_ONLY, Workspace
 
 
 def cli_for(version: str, venv: Path, package: str = "slopstopper-cli", source: Path | None = None) -> Path:
@@ -127,6 +131,12 @@ def static_checks(ws: Workspace, cli: Path) -> Checks:
 
 CHECK_TIMEOUT = 900
 
+# Trivy's vulnerability DB, kept across verification passes and orders: each
+# pass has a fresh HOME, and pulling the DB into an empty cache every time
+# is what gets a runner rate-limited by the registry. Trivy writes it; it
+# runs nothing from the tree.
+TRIVY_CACHE = Path(tempfile.gettempdir()) / "steward-trivy-cache"
+
 
 def verify(ws: Workspace, cli: Path, checks: Sequence[str]) -> list[dict]:
     """Run the given checks and return the red rows as `run --json` printed
@@ -137,7 +147,7 @@ def verify(ws: Workspace, cli: Path, checks: Sequence[str]) -> list[dict]:
     tree may hold what the agent wrote."""
     red = []
     with sandbox.scratch_home() as home:
-        env = sandbox.environment(cli.parent, home)
+        env = {**sandbox.environment(cli.parent, home), "TRIVY_CACHE_DIR": str(TRIVY_CACHE)}
         for check in checks:
             verdict = _run_one(ws, cli, check, env)
             if verdict["exit_code"] != 0:
@@ -165,3 +175,87 @@ def _run_one(ws: Workspace, cli: Path, check: str, env: dict) -> dict:
     if verdict["exit_code"] != 0:
         verdict["stderr_tail"] = "\n".join(run.stderr.strip().splitlines()[-10:])
     return verdict
+
+
+DIFF_LIMIT = 60_000
+
+
+def _tree_diff(ws: Workspace, *flags: str) -> str:
+    """Everything that differs from HEAD: tracked changes, then each new file
+    as an addition. Before the agent runs, that is the pin move and what
+    `slopstopper install` wrote, wherever it wrote it; no list of the paths
+    the installer owns is kept here. The steward's own files are left out."""
+    spec = ws._pathspec() + [f":(exclude){p.rstrip('/')}" for p in LOCAL_ONLY]
+    parts = [ws.git("diff", "--no-color", *flags, "HEAD", *spec, check=False).stdout]
+    new = ws.git("ls-files", "-z", "--others", "--exclude-standard", *spec, check=False).stdout
+    for rel in sorted(p for p in new.split("\0") if p):
+        # --no-index exits 1 when the files differ, which they always do here
+        parts.append(ws.git("diff", "--no-color", *flags, "--no-index", "--", os.devnull, rel, check=False).stdout)
+    return "".join(parts)
+
+
+def suite_diff(ws: Workspace) -> str:
+    """The install's change, as a unified diff the agent can read (it has no
+    `git diff`), cut to a size a brief can hold."""
+    text = _tree_diff(ws) or "(the install changed nothing)\n"
+    return text if len(text) <= DIFF_LIMIT else text[:DIFF_LIMIT] + "\n… (cut: the rest is in the PR's diff)\n"
+
+
+def fingerprint(ws: Workspace) -> str:
+    """A digest of the tree's change from HEAD, binary files included: equal
+    before and after the agent means it left the tree as it was."""
+    return hashlib.sha256(_tree_diff(ws, "--binary").encode("utf-8", "surrogateescape")).hexdigest()
+
+
+# The marker slopstopper's skills put on a workaround (contract.py holds the
+# surface): `slopstopper-workaround: <owner>/<repo>#<N>`.
+_MARKER = re.compile(r"slopstopper-workaround: ([\w.-]+/[\w.-]+)#(\d+)")
+_SKIP_DIRS = {".git", ".ss", ".claude", "node_modules", *(p.rstrip("/") for p in LOCAL_ONLY)}
+SCAN_LIMIT = 1_000_000
+
+
+def _text(path: Path) -> str | None:
+    """A regular file's text, or None: a symlink, FIFO or device is never
+    opened (it could point anywhere, or block), nor a file over the limit."""
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size > SCAN_LIMIT:
+            return None
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(fd, "rb") as fh:
+            return fh.read(SCAN_LIMIT + 1).decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def workarounds(ws: Workspace) -> list[dict]:
+    """Every `slopstopper-workaround: <repo>#<N>` marker in the clone, with
+    the files it is in. The skills are left out (they spell the convention),
+    and so are the steward's own files."""
+    found: dict[str, list[str]] = {}
+    for dirpath, dirnames, filenames in os.walk(ws.path):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+        for name in filenames:
+            path = Path(dirpath) / name
+            if path.parent == ws.path and name in LOCAL_ONLY:
+                continue
+            text = _text(path)
+            if text is None:
+                continue
+            for repo, number in _MARKER.findall(text):
+                found.setdefault(f"{repo}#{number}", []).append(str(path.relative_to(ws.path)))
+    return [{"marker": m, "files": sorted(set(f))} for m, f in sorted(found.items())]
+
+
+def issue_state(marker: str) -> str:
+    """`open`, `closed on <date>` or `unknown` for a `<repo>#<N>` marker."""
+    repo, _, number = marker.partition("#")
+    try:
+        issue = gh.api(f"repos/{repo}/issues/{number}")
+    except gh.GhError:
+        issue = None
+    if not issue:
+        return "unknown (GitHub did not answer; leave the workaround in place)"
+    if issue.get("state") == "closed":
+        return f"closed on {(issue.get('closed_at') or '')[:10]}: {issue.get('title', '')}"
+    return f"open: {issue.get('title', '')}"

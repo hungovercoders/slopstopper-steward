@@ -162,6 +162,74 @@ def _refresh_summary(order: Order, inv: inventory.Inventory, moved: str) -> str:
             f"from {order.target} rewrote the suite (workflows, shims, composite actions, skills).")
 
 
+def _review(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, cli: Path,
+            red: list[dict], unverified: list[dict], ctx: RunContext
+            ) -> tuple[list[dict], list[dict], AgentResult | None, str]:
+    """The review: the agent works the install skill's refresh against this
+    branch, red checks included, then the steward verifies again. Returns
+    (red, unverified, agent result, why it was not reviewed or "")."""
+    if not cfg.agent_enabled:
+        return red, unverified, None, "the agent is disabled in steward.yml"
+    why_not = ctx.agent_unavailable()
+    if why_not:  # before any fetch: an agent that cannot run needs no inputs
+        return red, unverified, None, f"the agent could not run: {why_not}"
+    try:
+        agent.ensure_skills(ws, order.target, cfg.slopstopper_repo)
+    except RuntimeError as exc:
+        return red, unverified, None, f"the skills could not be fetched: {exc}"
+    marks = [{**w, "state": refresh.issue_state(w["marker"])} for w in refresh.workarounds(ws)]
+    (ws.path / ".steward-suite-diff.md").write_text(refresh.suite_diff(ws), encoding="utf-8")
+    brief = prompts.review(order, inv, order.details["review"], marks, red, cfg.slopstopper_repo,
+                           start=_start(order, inv))
+    before = refresh.fingerprint(ws)
+    result = agent.run(ws, brief, cfg, cli, timeout=ctx.agent_timeout(), protect=ctx.protected(),
+                       preflight=ctx.agent_unavailable, checked=ctx.checked_clis)
+    if result.ran and refresh.fingerprint(ws) != before:
+        red, unverified = _verify_pass(ws, cli)
+    return red, unverified, result, _unreviewed(result)
+
+
+def _unreviewed(result: AgentResult) -> str:
+    """Why a review the agent was given did not happen, or "" when it did.
+    Running is not reviewing: a timeout, a refused copy-back or a missing
+    result file all leave `ran` true."""
+    if not result.ran:
+        return f"the agent could not run: {result.error}"
+    if result.error:
+        return f"the agent did not finish: {result.error}"
+    if result.outcome == "partial":
+        return f"the agent left part of it for a person: {result.notes or result.summary}"
+    if result.outcome not in ("fixed", "upstream"):
+        return f"the agent did not review it: {result.summary or 'no reason given'}"
+    return ""
+
+
+def _start(order: Order, inv: inventory.Inventory) -> str | None:
+    """The version the suite moves from: the old pin for an upgrade, the
+    version that wrote the suite for a refresh."""
+    return order.pinned if order.kind == "upgrade" else inv.repo.installed_from
+
+
+def _settle(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, cli: Path,
+            ctx: RunContext) -> tuple[list[dict], list[dict], AgentResult | None, str]:
+    """Verify the refreshed suite. With `upgrade.review` the agent reviews
+    the refresh either way; without it the agent only sees what went red."""
+    red, unverified = _verify_pass(ws, cli)
+    if order.details.get("review"):
+        return _review(order, inv, cfg, ws, cli, red, unverified, ctx)
+    return (*_settle_red(order, inv, cfg, ws, cli, red, unverified, ctx), "")
+
+
+def _review_section(order: Order, unreviewed: str) -> str:
+    why = order.details.get("review")
+    if not why:
+        return ""
+    if unreviewed:
+        return (f"### Not reviewed\n\nThe agent was to review the refresh ({why}), but {unreviewed}. "
+                "Opened as a draft: work the `slopstopper-install` skill's refresh section before merging.\n\n")
+    return f"### Reviewed\n\nThe agent worked the `slopstopper-install` skill's refresh ({why}).\n\n"
+
+
 def _verify_pass(ws: workspace.Workspace, cli: Path) -> tuple[list[dict], list[dict]]:
     """One verification pass: list once, run what is runnable. Returns (red, unverified)."""
     checks = refresh.static_checks(ws, cli)
@@ -201,19 +269,23 @@ def work_refresh(order: Order, inv: inventory.Inventory, cfg: Config, ws: worksp
     if installed.returncode != 0:
         return Outcome(order.to_dict(), "failed",
                        detail=f"slopstopper install exited {installed.returncode}: {installed.stderr.strip()[-400:]}")
-    notes = release_notes(cfg, order.pinned, order.target, ctx.releases) if order.kind == "upgrade" else ""
+    start = _start(order, inv)
+    known = order.kind == "upgrade" or versions.parse(start) is not None
+    notes = release_notes(cfg, start, order.target, ctx.releases) if known else ""
     (ws.path / ".steward-release-notes.md").write_text(notes, encoding="utf-8")
-    red, unverified, result = _settle_red(order, inv, cfg, ws, cli, *_verify_pass(ws, cli), ctx)
+    red, unverified, result, unreviewed = _settle(order, inv, cfg, ws, cli, ctx)
     if not workspace.commit(ws, f"{order.title}\n\n{order.reason}."):
         return Outcome(order.to_dict(), "skipped", detail="nothing changed after the refresh")
     workspace.push(ws, order.branch)
     summary = _refresh_summary(order, inv, moved) + _agent_section(result)
-    extra = _red_section("Still red after the refresh", red, "Opened as a draft: settle these before merging.\n\n")
+    extra = _review_section(order, unreviewed)
+    extra += _red_section("Still red after the refresh", red, "Opened as a draft: settle these before merging.\n\n")
     extra += _unverified_section(unverified)
     if notes:
         extra += f"<details><summary>Release notes between the two pins</summary>\n\n{notes}\n</details>\n"
-    url = workspace.open_pr(ws, order.title, _pr_body(order, cfg, summary, extra), cfg.pr_labels, draft=bool(red))
-    return Outcome(order.to_dict(), "draft" if red else "pr", pr_url=url, red=red, unverified=unverified,
+    draft = bool(red or unreviewed)
+    url = workspace.open_pr(ws, order.title, _pr_body(order, cfg, summary, extra), cfg.pr_labels, draft=draft)
+    return Outcome(order.to_dict(), "draft" if draft else "pr", pr_url=url, red=red, unverified=unverified,
                    agent=result.to_dict() if result else None)
 
 

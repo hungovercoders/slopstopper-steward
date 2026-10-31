@@ -18,7 +18,8 @@ from typing import Iterator
 from steward import gh
 
 AUTHOR = ("slopstopper-steward", "steward@slopstopper.dev")
-LOCAL_ONLY = (".steward-result.json", ".steward-release-notes.md", ".steward-prompt.md", ".steward-venv/")
+LOCAL_ONLY = (".steward-result.json", ".steward-release-notes.md", ".steward-prompt.md", ".steward-venv/",
+              ".steward-suite-diff.md")
 
 
 # Every git command the steward runs, before or after the agent, ignores

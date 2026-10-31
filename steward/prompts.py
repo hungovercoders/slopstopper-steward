@@ -75,6 +75,62 @@ the two versions are in `.steward-release-notes.md`.
 """
 
 
+REVIEW = """\
+# Steward work order: review a slopstopper upgrade
+
+Repository: `{repo}` (default branch `{default_branch}`), profile `{profile}`.
+You are on branch `{branch}`. {moved} ({why}), so the ss-* workflows, shims and skills
+on this branch are `{target}`'s.
+
+The install was mechanical; what it cannot judge is what the `slopstopper-install` skill's refresh is for: read
+`.claude/skills/slopstopper-install/SKILL.md`, then work `references/refresh.md` against this branch.
+You have no network and no `git diff`, so the steward gathered what that section asks for:
+
+- `.steward-suite-diff.md`: everything the install changed, new files included.
+- `.steward-release-notes.md`: the release notes from `{start}` to `{target}`.
+- The workarounds this repo carries, with the state of each upstream issue:
+{workarounds}
+
+{red}
+
+{guardrails}
+For this order, `outcome` says whether the review is done: `fixed` when you worked the refresh section
+to the end, whether or not anything needed changing (the summary says which); `upstream` when it found a
+slopstopper bug; `partial` when something is left for a person (say what in `notes`); `skipped` only
+when you could not do the review.
+"""
+
+
+def _failure_lines(failures: list[dict]) -> list[str]:
+    lines = []
+    for row in failures:
+        lines.append(f"- `{row['check']}` exit {row['exit_code']} ({row['status']})")
+        for item in row.get("failures", [])[:15]:
+            lines.append(f"  - {item}")
+        if not row.get("failures"):
+            lines += [f"  - report: `{path}`" for path in row.get("reports", [])]
+    return lines
+
+
+def review(order, inv, why: str, workarounds: list[dict], failures: list[dict], slopstopper_repo: str,
+           start: str | None = None) -> str:
+    marks = [f"  - `{w['marker']}` in {', '.join(f'`{p}`' for p in w['files'])}: {w['state']}" for w in workarounds]
+    red = ("The static checks below went red against the refreshed suite; settle them too, with the "
+           "`slopstopper-triage` skill:\n\n" + "\n".join(_failure_lines(failures))) if failures else \
+        "Every static check the steward can run here is green against the refreshed suite."
+    start = start or order.pinned or "unpinned"
+    moved = (f"The pin was already `{order.target}`, but `{start}` wrote the suite; the steward re-ran "
+             f"`slopstopper install` from `{order.target}`") if order.kind == "refresh" else \
+        (f"The steward moved the slopstopper-cli pin from `{order.pinned or 'unpinned'}` to `{order.target}` "
+         f"and ran `slopstopper install` from it")
+    return REVIEW.format(
+        repo=order.repo, default_branch=order.default_branch, profile=inv.profile or "ui (default)",
+        branch=order.branch, moved=moved, start=start, target=order.target, why=why,
+        workarounds="\n".join(marks) or "  - none", red=red,
+        guardrails=GUARDRAILS.format(result_file=RESULT_FILE, slopstopper_repo=slopstopper_repo),
+    )
+
+
 def triage(order, inv, body: str, slopstopper_repo: str) -> str:
     f = order.finding
     return TRIAGE.format(
@@ -86,13 +142,7 @@ def triage(order, inv, body: str, slopstopper_repo: str) -> str:
 
 
 def verify(order, inv, failures: list[dict], slopstopper_repo: str) -> str:
-    lines = []
-    for row in failures:
-        lines.append(f"- `{row['check']}` exit {row['exit_code']} ({row['status']})")
-        for item in row.get("failures", [])[:15]:
-            lines.append(f"  - {item}")
-        if not row.get("failures"):
-            lines += [f"  - report: `{path}`" for path in row.get("reports", [])]
+    lines = _failure_lines(failures)
     return VERIFY.format(
         repo=order.repo, default_branch=order.default_branch, profile=inv.profile or "ui (default)",
         branch=order.branch, pinned=order.pinned or "unpinned", target=order.target, failures="\n".join(lines),

@@ -1,7 +1,8 @@
 """Inventory in, work orders out. Pure: nothing here touches GitHub.
 
 Order kinds, in the priority they are worked:
-  upgrade   the pin is behind the policy's target: move it and rewrite the suite
+  upgrade   the pin is behind the policy's target: move it and rewrite the suite;
+            and, with `upgrade.review`, an agent review of the refresh
   refresh   the pin is current but the suite on disk was written by an older CLI
   triage    an open finding slopstopper raised, security ones first
 
@@ -57,7 +58,24 @@ class Plan:
                 "skipped": self.skipped}
 
 
-def _upgrade_order(inv: Inventory, target: str | None) -> Order | None:
+def jump(start: str | None, target: str) -> str:
+    """The move a review covers, said the way the brief and the PR say it.
+    Size is not the test: on 0.x any minor may rename a knob or close a
+    workaround, and the refresh's judgement steps apply to every one."""
+    if parse(start) is None:
+        return f"no known starting version ({start or 'unpinned'}) to {target}"
+    return f"{start} to {target}"
+
+
+def _upgrade_order(inv: Inventory, target: str | None, review: bool = False) -> Order | None:
+    order = _pin_order(inv, target)
+    if order and review:
+        start = order.pinned if order.kind == "upgrade" else inv.repo.installed_from
+        order.details["review"] = jump(start, order.target)
+    return order
+
+
+def _pin_order(inv: Inventory, target: str | None) -> Order | None:
     repo = inv.repo
     if target and behind(target, MIN_INSTALL_VERSION):
         return None  # plan_repo records why
@@ -137,7 +155,7 @@ def _unworkable(inv: Inventory, target: str | None) -> list[dict]:
 def plan_repo(inv: Inventory, target: str | None, cfg: Config) -> Plan:
     plan = Plan(skipped=_unworkable(inv, target))
     candidates: list[Order] = []
-    upgrade = _upgrade_order(inv, target)
+    upgrade = _upgrade_order(inv, target, cfg.review and cfg.agent_enabled)
     if upgrade:
         candidates.append(upgrade)
     candidates += _triage_orders(inv)

@@ -76,9 +76,24 @@ flowchart TB
 
    | Kind | When | Who does the work | Priority |
    | ---- | ---- | ----------------- | -------- |
-   | `upgrade` | the pin is behind the policy's target (`upgrade.policy`, `min_age_days`) | code; the agent only if the static checks go red | 0 |
-   | `refresh` | the pin is current but `.ss/.installed-from` is older | code; same fallback | 1 |
+   | `upgrade` | the pin is behind the policy's target (`upgrade.policy`, `min_age_days`) | code, then the agent's review of the refresh (`upgrade.review`) | 0 |
+   | `refresh` | the pin is current but `.ss/.installed-from` is older | code; same | 1 |
    | `triage` | an open finding, security first | the agent with the repo's triage skill | 2 / 3 |
+
+   The install is code; what it cannot judge is the agent's. With
+   `upgrade.review` (default true) the agent works the
+   `slopstopper-install` skill's refresh section on the branch after the
+   install, in the same run that settles any red check. Every upgrade gets
+   it, not only large ones: on 0.x any minor can rename a knob, wipe a
+   customisation or close a workaround's upstream issue. The steward hands it what that section asks for, since the agent
+   has no network and no `git diff`: the install's diff of the
+   slopstopper-owned files, the release notes between the pins, and each
+   `slopstopper-workaround` marker with its upstream issue's state. A
+   review counts only when the agent's result says it finished; an upgrade
+   the agent could not review (unavailable, timed out, or left part of it
+   for a person) opens as a draft that says why. With `agent.enabled:
+   false` no review is planned. With `upgrade.review: false` the agent only sees a
+   check that went red.
 
    A disabled workflow is reported, not worked: enabling one changes
    repo settings and needs an admin. So is any upgrade or refresh whose
@@ -96,6 +111,11 @@ flowchart TB
    by a contract row), is reported in the PR as "not verified by the
    steward" rather than run, since its exit 2 would say nothing about the
    change; the PR's own `ss-*` workflows run it. Any other exit 2 is red.
+   The run workflow installs Semgrep, Gitleaks and Trivy, pinned and
+   checksummed, so the static security checks are verified before the PR
+   rather than left to its CI. The browser and API checks never run in a
+   clone: they need the PR's deployed preview, and building the site would
+   run the repo's code beside the push token.
 6. **report** writes `.steward/reports/run.{md,json}` and the Actions job
    summary.
 ## Where the agent is boxed
