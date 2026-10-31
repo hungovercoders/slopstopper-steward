@@ -1,0 +1,53 @@
+# .github/dependency-review-config.yml: seeded by slopstopper install.sh,
+# read by ss-security-vulnerability-new-check.yml. Yours to edit: a refresh
+# never overwrites it.
+#
+# The dependency review on each pull request fails when a dependency the PR
+# introduces carries a licence outside this list. The default allows the
+# permissive licences and the file-level copyleft ones (MPL, EPL), and
+# leaves out the GPL, LGPL and AGPL families, so a permissively licensed
+# project stays free of their obligations. A licence the action cannot
+# detect is reported but never fails the run. Ids are SPDX
+# (https://spdx.org/licenses/).
+#
+# Options: https://github.com/actions/dependency-review-action#configuration-options
+
+allow-licenses:
+  - 0BSD
+  - Apache-2.0
+  - Artistic-2.0
+  - BlueOak-1.0.0
+  - BSD-2-Clause
+  - BSD-2-Clause-Views
+  - BSD-3-Clause
+  - BSL-1.0
+  - CC-BY-3.0
+  - CC-BY-4.0
+  - CC0-1.0
+  - curl
+  - EPL-2.0
+  - ISC
+  - MIT
+  - MIT-0
+  - MPL-2.0
+  - OFL-1.1
+  - PSF-2.0
+  - Python-2.0
+  - Unicode-3.0
+  - Unicode-DFS-2016
+  - Unlicense
+  - WTFPL
+  - X11
+  - Zlib
+  # The patent grant that golang.org/x modules carry beside BSD-3-Clause.
+  - LicenseRef-scancode-google-patent-license-golang
+  # The Unicode data licence some XML and text packages bundle.
+  - LicenseRef-scancode-unicode
+
+# A dependency whose licence you have reviewed and accepted, although it is
+# not on the list above: package URLs (purl), without a version. For
+# example, a build-time image library under the LGPL that your shipped
+# artefact never links:
+#
+# allow-dependencies-licenses:
+#   - pkg:npm/@img/sharp-libvips-linux-x64

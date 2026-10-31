@@ -1,0 +1,75 @@
+name: Install Playwright browsers
+description: >-
+  Installs Chromium (or the browser named in `browser`) for the Playwright
+  checks, with the browser directory cached per Playwright version so a warm
+  run never touches the download CDN. Every workflow that runs a browser
+  check calls this after `npm ci`.
+
+# One local composite action rather than the same block copied into every
+# workflow (#535). install.sh copies this directory into adopter repos next
+# to the workflows, so what a workflow does stays visible in their tree.
+#
+# Composite steps cannot carry `timeout-minutes`, so the calling step does:
+#
+#   - name: Install Playwright browsers
+#     uses: ./.github/actions/ss-playwright
+#     timeout-minutes: 12
+#
+# The workflow must have run `npm ci` first, because the Playwright version
+# that keys the cache is read from node_modules.
+
+inputs:
+  browser:
+    description: Browser to install (a `npx playwright install` name)
+    required: false
+    default: chromium
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve the Playwright version
+      id: pw
+      # The resolved version from node_modules, not the range in
+      # package.json, so a lockfile bump misses the cache and downloads the
+      # build it needs (#536).
+      shell: bash
+      run: |
+        set -euo pipefail
+        # --no-install: a bare npx would fetch the latest playwright from the
+        # registry when node_modules is missing and key the cache on it.
+        if ! version="$(npx --no-install playwright --version 2>/dev/null | awk '{print $2}')" || [ -z "$version" ]; then
+          echo "::error::Playwright is not in node_modules; run npm ci before this action"
+          exit 1
+        fi
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+
+    - name: Cache Playwright browsers
+      # Saved on job success only, so a run that fails elsewhere never stores
+      # a partial download. On a hit the install step below finds the build
+      # already present and skips the download; the apt phase still runs.
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ~/.cache/ms-playwright
+        key: playwright-${{ runner.os }}-${{ runner.arch }}-${{ inputs.browser }}-${{ steps.pw.outputs.version }}
+
+    - name: Install Playwright browsers
+      # A stalled browser download otherwise holds the job until GitHub's
+      # six-hour limit. Each download attempt gets five minutes and a stall
+      # is retried once; the caller's `timeout-minutes` bounds both. The apt
+      # phase runs once, outside the timeout: killing it mid-install leaves
+      # apt-get holding the dpkg lock, so the retry fails on the lock
+      # instead of downloading (#527). apt gets one plain retry of its own,
+      # since a transient mirror error exits cleanly and leaves no lock.
+      shell: bash
+      env:
+        BROWSER: ${{ inputs.browser }}
+      run: |
+        npx playwright install-deps "$BROWSER" || npx playwright install-deps "$BROWSER"
+        for attempt in 1 2; do
+          if timeout --kill-after=30s 5m npx playwright install "$BROWSER"; then
+            exit 0
+          fi
+          echo "::warning::Playwright browser download attempt ${attempt} failed or stalled after 5 minutes"
+        done
+        echo "::error::Playwright browser download failed twice. Re-run the job; if it keeps failing, check the runner's network."
+        exit 1

@@ -1,0 +1,75 @@
+# .slopstopper.yml: slopstopper's per-repo config.
+#
+# This is the starter the installer seeds: the handful of keys most repos
+# actually set. Every other knob has a sensible default and is documented,
+# with its default, in the schema reference:
+#   https://github.com/hungovercoders/slopstopper/blob/main/.slopstopper.yml.example
+# Copy a block from there when you need it. Re-running the installer never
+# overwrites this file.
+#
+# That link tracks main; .ss/.installed-from names the slopstopper-cli version
+# that wrote this install (put v<version> for `main` to see that release's
+# schema). A knob the CLI reads takes effect once the pinned CLI has it.
+
+# This repo's shape. ui (the default) is a site or app that serves HTML;
+# api has JSON/gRPC endpoints and no browser surface, so it drops the nine
+# browser checks; library deploys nothing and drops every URL-driven check.
+# `install.sh --profile api` writes this; re-run install.sh after changing it.
+profile: library
+
+# Where the deployed app lives. production is what scheduled and post-deploy
+# runs audit (and the API checks on a push to main); preview is where your
+# PRs deploy. The browser checks build and serve the repo on PRs and pushes;
+# the API checks and DAST's API mode (api.openapi.spec) hit preview on a PR,
+# and skip there without it. Leave it blank if you have no preview.
+urls:
+  production:
+  preview:
+
+# Paths each browser check audits, comma-separated. `/` is the default.
+# For a larger site, `reliability.coverage.*` in the schema reference
+# derives these from your sitemap or the PR's diff instead.
+pages:
+  smoke:         /
+  e2e:           /
+  accessibility: /
+  seo:           /
+  broken_links:  /
+
+# The site-wide share image the smoke test asserts. '' skips the assertion.
+smoke:
+  og_image_path: /og-image.png
+
+# Your security-headers file, for the CSP-drift check: public/_headers
+# (Cloudflare Pages / Netlify), worker/headers.json, or on a host that can't
+# send headers the built HTML root (e.g. dist) with `format: meta`, which
+# reads each page's <meta> CSP. null skips the check.
+headers:
+  source: null
+
+# If you serve an API, copy the `api:` block from the schema reference
+# above. Under `ui` the four API checks are installed once the repo shows an
+# API: a spec, a server framework, or api.health.path / api.latency.paths /
+# api.headers.paths / api.openapi.spec set here; re-run install.sh after.
+
+# Any check you don't want, by workflow filename. A profile drops whole
+# sets; this is for one-offs. `enabled` takes a single check back from a
+# profile.
+workflows:
+  disabled:
+    # slopstopper-workaround: hungovercoders/slopstopper#578 security:licences cannot run on a project with no runtime dependencies (the test extra is declared, pip install . leaves it out); back once the fix ships
+    - ss-security-licences-check.yml
+  enabled: []
+
+# Backtick paths the docs name that are never on disk in this repo: the
+# slopstopper source files the contract table (docs/architecture/CONTRACT.md,
+# generated from steward/contract.py) relies on, and the files a steward run
+# writes (.steward/reports/*, the agent's result file in a clone).
+hygiene:
+  docs_accuracy:
+    ignore_refs:
+      - cli/slopstopper/*
+      - release-please-config.json
+      - install.sh
+      - .steward/*
+      - .steward-*

@@ -1,0 +1,85 @@
+name: SlopStopper · Code Complexity Check
+
+# Fails when a function exceeds hygiene.complexity.max_ccn (default 15,
+# Lizard-measured). The gate lives in the CLI, so `task ss:hygiene:complexity`
+# gives the identical result locally, in the pre-push hook and here.
+# Triggers: PR, push to main. Emits a rolling PR comment (updated
+# in-place per push) and a main-branch tracking issue on findings.
+# Docs: docs/hygiene/README.md.
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  complexity-check:
+    name: Check Code Complexity with Lizard
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up slopstopper
+        # Python, the mise-pinned toolchain (task, node, slopstopper-cli) and,
+        # in the slopstopper repo only, the CLI from source. One local
+        # composite action; install.sh copies it in next to the workflows.
+        uses: ./.github/actions/ss-setup
+
+      - name: Install Lizard
+        run: |
+          pip install --upgrade pip
+          pip install lizard
+
+      - name: Run complexity analysis
+        id: check
+        # The check owns the gate: `task ss:hygiene:complexity` exits non-zero
+        # when a function exceeds `hygiene.complexity.max_ccn` (default 15).
+        # You get the same result locally and in the pre-push hook. We only
+        # continue-on-error so the report, comment and issue steps still run,
+        # and the final step re-raises the failure.
+        continue-on-error: true
+        run: task ss:hygiene:complexity
+
+      - name: Upload complexity reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: complexity-reports
+          path: |
+            .ss/reports/complexity/complexity-report.md
+            .ss/reports/complexity/complexity-report.csv
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Emit PR comment
+        if: github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: slopstopper emit hygiene:complexity --target pr-comment --status ${{ steps.check.outcome == 'success' && 'pass' || 'fail' }} --on-pass=delete
+
+      - name: Emit issue on main (if high complexity)
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && steps.check.outcome == 'failure'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: slopstopper emit hygiene:complexity --target issue
+
+      - name: Close issue on main when clean
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && steps.check.outcome == 'success'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: slopstopper emit hygiene:complexity --target issue --on-pass=close
+
+      - name: Fail job if high complexity found
+        if: steps.check.outcome == 'failure'
+        run: |
+          echo "::error::Code complexity threshold exceeded. Review the report and refactor (or tune hygiene.complexity.max_ccn)."
+          exit 1

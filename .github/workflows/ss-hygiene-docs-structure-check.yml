@@ -1,0 +1,82 @@
+name: SlopStopper · Hygiene - Documentation Structure Check
+
+# Validates that every doc under docs/ has an explicit route from AGENTS.md,
+# the docs map (docs/README.md) or a README above it (AGENTS.md-first). Triggers: PR, push
+# to main. Emits a rolling PR comment and a main-branch tracking
+# issue on violations.
+# Docs: docs/hygiene/README.md.
+
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'AGENTS.md'
+      - '.slopstopper.yml'
+      - '.github/workflows/ss-hygiene-docs-structure-check.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'docs/**'
+      - 'AGENTS.md'
+      - '.slopstopper.yml'
+      - '.github/workflows/ss-hygiene-docs-structure-check.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  check-docs-structure:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up slopstopper
+        # Python, the mise-pinned toolchain (task, node, slopstopper-cli) and,
+        # in the slopstopper repo only, the CLI from source. One local
+        # composite action; install.sh copies it in next to the workflows.
+        uses: ./.github/actions/ss-setup
+
+      - name: Run documentation structure check
+        id: check
+        continue-on-error: true
+        run: task ss:hygiene:docs-structure
+
+      - name: Emit PR comment
+        if: github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: slopstopper emit hygiene:docs-structure --target pr-comment --status ${{ steps.check.outcome == 'success' && 'pass' || 'fail' }} --on-pass=delete
+
+      - name: Emit issue on main (if violations)
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && steps.check.outcome == 'failure'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: slopstopper emit hygiene:docs-structure --target issue
+
+      - name: Close issue on main when clean
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && steps.check.outcome == 'success'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: slopstopper emit hygiene:docs-structure --target issue --on-pass=close
+
+      - name: Upload structure report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: docs-structure-report
+          path: .ss/reports/docs/docs-structure-report.md
+          retention-days: 30
+
+      - name: Fail the job if violations
+        if: steps.check.outcome == 'failure'
+        run: |
+          echo "::error::Documentation structure violations detected. See report."
+          exit 1

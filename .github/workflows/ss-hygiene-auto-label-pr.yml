@@ -1,0 +1,24 @@
+name: SlopStopper · Hygiene - Auto Label PRs
+
+# pull_request_target rather than pull_request: the job checks out and
+# runs nothing from the PR (actions/labeler reads .github/labeler.yml from
+# the base branch through the API), and only the base repository's token
+# can add labels on a PR from a fork.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Label PR based on changed files
+        uses: actions/labeler@bf12e9b00b37c5c0ca2b87b79b2daf7891dbda13 # v7.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          sync-labels: true

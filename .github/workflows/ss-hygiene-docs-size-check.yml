@@ -1,0 +1,87 @@
+name: SlopStopper · Documentation Size Monitor
+
+# Monitors documentation file sizes against the thresholds in
+# .slopstopper.yml (hygiene.docs_size.*). Triggers: PR, push to main.
+# Emits a rolling PR comment and a main-branch tracking issue when
+# any doc exceeds its budget.
+# Docs: docs/hygiene/README.md.
+
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+      - '.slopstopper.yml'
+      - '.github/workflows/ss-hygiene-docs-size-check.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'docs/**'
+      - '.slopstopper.yml'
+      - '.github/workflows/ss-hygiene-docs-size-check.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  check-docs-size:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up slopstopper
+        # Python, the mise-pinned toolchain (task, node, slopstopper-cli) and,
+        # in the slopstopper repo only, the CLI from source. One local
+        # composite action; install.sh copies it in next to the workflows.
+        uses: ./.github/actions/ss-setup
+
+      - name: Run documentation size check
+        id: check
+        run: |
+          task ss:hygiene:docs-size
+          # The report is canonical (.ss/reports/docs/docs-size-report.md).
+          # We set has_alerts from the report content because the check
+          # itself is non-blocking and always exits 0, so the workflow's
+          # gating is what surfaces the alerts.
+          if grep -q "❌" .ss/reports/docs/docs-size-report.md; then
+            echo "has_alerts=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_alerts=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Emit PR comment
+        if: github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: slopstopper emit hygiene:docs-size --target pr-comment --status ${{ steps.check.outputs.has_alerts == 'true' && 'warn' || 'pass' }} --on-pass=delete
+
+      - name: Emit issue on main (if thresholds exceeded)
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && steps.check.outputs.has_alerts == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: slopstopper emit hygiene:docs-size --target issue
+
+      - name: Close issue on main when within thresholds
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && steps.check.outputs.has_alerts != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: slopstopper emit hygiene:docs-size --target issue --on-pass=close
+
+      - name: Warn if thresholds exceeded on main
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && steps.check.outputs.has_alerts == 'true'
+        run: |
+          echo "::warning::Documentation size thresholds exceeded! An issue has been created."
+
+      - name: Upload report
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: documentation-size-report
+          path: .ss/reports/docs/docs-size-report.md
+          retention-days: 30

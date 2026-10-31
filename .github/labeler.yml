@@ -1,0 +1,38 @@
+# .github/labeler.yml: seeded by slopstopper install.sh.
+#
+# Drives the ss-hygiene-auto-label-pr workflow. Maps changed-file globs
+# to PR labels. These are sensible starting categories, so adjust them to
+# your repo's structure.
+#
+# Format: actions/labeler@v5
+#   <label-name>:
+#     - changed-files:
+#         - any-glob-to-any-file: ['<glob1>', '<glob2>']
+
+docs:
+  - changed-files:
+      - any-glob-to-any-file: ['docs/**', '**/*.md', 'README.md', 'AGENTS.md', 'CLAUDE.md']
+
+ci:
+  - changed-files:
+      - any-glob-to-any-file: ['.github/**', 'Taskfile*.yml', '.ss/**', 'install*.sh']
+
+deps:
+  - changed-files:
+      - any-glob-to-any-file: ['package.json', 'package-lock.json', 'requirements*.txt', 'pyproject.toml']
+
+src:
+  - changed-files:
+      - any-glob-to-any-file: ['src/**', 'app/**', 'lib/**', 'components/**']
+
+tests:
+  - changed-files:
+      - any-glob-to-any-file: ['tests/**', '**/*.test.*', '**/*.spec.*']
+
+security:
+  - changed-files:
+      - any-glob-to-any-file: ['.zap/**', '.gitleaks.toml', 'docs/security/**']
+
+config:
+  - changed-files:
+      - any-glob-to-any-file: ['.slopstopper.yml', 'wrangler.jsonc', 'vercel.json', 'netlify.toml']
