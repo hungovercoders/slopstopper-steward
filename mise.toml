@@ -1,4 +1,4 @@
 [tools]
 "node" = "20"
 "task" = "3"
-"pipx:slopstopper-cli" = "0.27.0"
+"pipx:slopstopper-cli" = "0.28.0"
