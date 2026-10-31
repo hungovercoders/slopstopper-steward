@@ -2,7 +2,9 @@
 orgs:
   - hungovercoders
 
-mode: pr
+# plan until a run's report has been read (docs/runbooks/SETUP.md); then
+# pr, with repos.include narrowed to one repo for the first real run.
+mode: plan
 
 upgrade:
   policy: latest
