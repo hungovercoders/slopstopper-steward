@@ -45,7 +45,8 @@ def test_refused_calls_are_kept_from_the_result(monkeypatch, tmp_path):
     monkeypatch.setattr(agent.isolation, "agent_user", lambda: None)
     monkeypatch.setattr(agent, "available", lambda: None)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-    meta = {"total_cost_usd": 0.2, "num_turns": 3, "permission_denials": [
+    meta = {"total_cost_usd": 0.2, "num_turns": 3, "modelUsage": {"claude-sonnet-4-5-20250929": {"inputTokens": 1}},
+            "permission_denials": [
         {"tool_name": "Bash", "tool_use_id": "t1", "tool_input": {"command": "slopstopper run --json hygiene:docs-size"}},
         {"tool_name": "WebFetch", "tool_use_id": "t2", "tool_input": {"url": "https://x"}},
         "junk",
@@ -59,6 +60,8 @@ def test_refused_calls_are_kept_from_the_result(monkeypatch, tmp_path):
     assert result.denied == ["Bash: slopstopper run --json hygiene:docs-size", "WebFetch"]
     assert "Refused by the agent's box: `Bash: slopstopper run --json hygiene:docs-size`" in runner._agent_section(result)
     assert result.to_dict()["denied"] == result.denied
+    assert result.model == "claude-sonnet-4-5-20250929"
+    assert "claude-sonnet-4-5-20250929, $0.20, 3 turns" in runner._agent_section(result)
 
 
 def test_the_brief_names_the_checks_the_agent_may_run():
@@ -67,3 +70,15 @@ def test_the_brief_names_the_checks_the_agent_may_run():
     brief = prompts.review(order, inv, "x", [], [], "hungovercoders/slopstopper", checks=["hygiene:docs-size", "security:sast"])
     assert "The checks you may run in this clone: `hygiene:docs-size`, `security:sast`." in brief
     assert "none (nothing this clone can verify)" in prompts.verify(order, inv, [], "hungovercoders/slopstopper")
+
+
+def test_the_model_is_read_from_model_usage_or_left_blank():
+    assert agent._model({"modelUsage": {"b": {}, "a": {}}}) == "a + b"
+    assert agent._model({}) == "" and agent._model({"modelUsage": "junk"}) == ""
+
+
+def test_the_run_report_names_the_model(tmp_path):
+    from steward import report
+    out = runner.Outcome({"id": "upgrade-0.28.0", "repo": "acme/a", "kind": "upgrade"}, "pr", pr_url="https://x/1",
+                         agent={"cost_usd": 0.35, "turns": 13, "model": "claude-sonnet-4-5-20250929", "outcome": "fixed"})
+    assert "(agent $0.35, 13 turns, claude-sonnet-4-5-20250929)" in report.RunReport("pr", [], [out]).markdown()
