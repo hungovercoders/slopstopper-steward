@@ -10,7 +10,7 @@ artifact. Three tables:
 | Section | Holds |
 | ------- | ----- |
 | Adopters | each repo, its pin, PyPI's latest, the CLI that wrote its suite, open findings, the evidence it was found by |
-| Orders | each order worked and its status: `pr`, `merged` (with `merge.auto`), `draft`, `skipped` (with why), `failed` (with the error), `deferred` (the push token would expire before it finished; the next run picks it up), or `planned` in a dry run; a Dependabot order ends `green` or `red` instead |
+| Orders | each order worked and its status: `pr`, `merged` (with `merge.auto`), `draft`, `skipped` (with why), `failed` (with the error), `deferred` (the push token would expire before it finished; the next run picks it up), or `planned` in a dry run; a Dependabot order ends `green`, `red` or `merged` (with `dependabot.merge`) |
 | Deferred / Skipped | what the budgets left for next time, orders with an open PR, disabled workflows that need an admin |
 
 Agent cost and turns are on the order's row when one ran, with the
@@ -82,9 +82,12 @@ self-review, or "still red" with the failing checks, left for a person.
 A green PR gets no comment and no push. The comment's marker names the
 head the steward worked, so the next run moves on; a new push from
 Dependabot (or your own) makes it eligible again. The PR's body stays
-Dependabot's, and the steward never merges one: the run report's row
-says `green` or `red`, and merging is yours. Major bumps, and bumps
-whose versions cannot be read (digests), are listed as skipped.
+Dependabot's. With `dependabot.merge` a green one is merged and the row
+says `merged`; "could not merge it" in the comment means GitHub refused
+(a branch rule, a conflict) and the PR is yours. Without it the row says
+`green` and merging is yours. Major bumps, and bumps whose versions
+cannot be read (digests), are listed as skipped. `dependabot.budget`
+caps how many are worked per repo per run.
 
 ## Keeping the steward off something
 

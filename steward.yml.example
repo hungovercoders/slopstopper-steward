@@ -32,8 +32,10 @@ agent:
   self_review: true        # a read-only second run reviews the agent's diff; one correction round; unanswered, the PR is a draft
 
 dependabot:
-  enabled: false           # true: wait for Dependabot's PRs' checks and, red, fix on their branch; never merged
+  enabled: false           # true: wait for Dependabot's PRs' checks and, red, fix on their branch
   updates: [patch, minor]  # patch | minor | major: the bumps it may work; the rest are left to a person
+  merge: false             # true: a Dependabot PR the steward saw green is merged (merge.method, merge.delete_branch apply)
+  budget: 5                # Dependabot PRs worked per repo per run, apart from budgets.prs_per_repo
 
 merge:
   auto: false              # true: a green PR of a kind below is merged by the run that opened it (drafts and refusals are left ready)

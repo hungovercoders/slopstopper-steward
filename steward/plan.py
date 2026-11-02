@@ -6,7 +6,8 @@ Order kinds, in the priority they are worked:
   refresh   the pin is current but the suite on disk was written by an older CLI
   triage    an open finding slopstopper raised, security ones first
   dependabot  an open Dependabot PR (with `dependabot.enabled`): its checks are
-            waited for and, red, worked on Dependabot's own branch
+            waited for and, red, worked on Dependabot's own branch; green, merged
+            with `dependabot.merge`. Budgeted by `dependabot.budget`, not prs_per_repo
 
 A repo gets at most `budgets.prs_per_repo` open steward PRs; an order whose
 id already has an open PR is dropped, so a re-run is idempotent. Orders a
@@ -187,10 +188,6 @@ def plan_repo(inv: Inventory, target: str | None, cfg: Config) -> Plan:
     if upgrade:
         candidates.append(upgrade)
     candidates += _triage_orders(inv)
-    if cfg.dependabot_enabled:
-        bumps, rows = _dependabot_orders(inv, cfg)
-        candidates += bumps
-        plan.skipped += rows
     budget = max(0, cfg.prs_per_repo - len(inv.open_orders))
     for order in sorted(candidates, key=lambda o: o.priority):
         if order.id in inv.open_orders:
@@ -210,6 +207,14 @@ def plan_repo(inv: Inventory, target: str | None, cfg: Config) -> Plan:
             continue
         plan.orders.append(order)
         budget -= 1
+    if cfg.dependabot_enabled:
+        # Dependabot's PRs are not steward PRs: they have a budget of their
+        # own, so a backlog of bumps neither starves nor is starved by the
+        # steward's own orders.
+        bumps, rows = _dependabot_orders(inv, cfg)
+        plan.skipped += rows
+        plan.orders += bumps[:cfg.dependabot_budget]
+        plan.deferred += bumps[cfg.dependabot_budget:]
     for w in inv.disabled_workflows:
         plan.skipped.append({"repo": inv.repo.full_name, "order": f"enable-{w['path'].rsplit('/', 1)[-1]}",
                              "why": f"workflow {w['state']}: needs `gh workflow enable` by an admin"})

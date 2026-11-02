@@ -112,18 +112,25 @@ def test_bumps_are_orders_on_dependabots_branch_within_the_budget():
     assert [o.id for o in plan.plan_repo(_inv(patch, major), "0.28.0", wide).orders] == ["dependabot-7", "dependabot-8"]
 
 
-def test_bumps_share_the_repos_budget_after_the_rest():
+def test_bumps_have_a_budget_of_their_own_after_the_rest():
     bumps = [dependabot.from_pr(_pr(n)) for n in (7, 8, 9)]
     inv = _inv(*bumps)
     inv.findings = [inventory.Finding(1, "t", "u", ["slopstopper"], check="hygiene:docs-size")]
+    inv.open_orders = {"upgrade-0.29.0": {"number": 5, "url": "p"}, "triage-2": {"number": 6, "url": "p"}}   # prs_per_repo spent
     p = plan.plan_repo(inv, "0.28.0", CFG)
-    assert [o.id for o in p.orders] == ["triage-1", "dependabot-7"] and [o.id for o in p.deferred] == ["dependabot-8", "dependabot-9"]
+    assert [o.id for o in p.orders] == ["dependabot-7", "dependabot-8", "dependabot-9"]   # the steward's own budget is not theirs
+    assert [o.id for o in p.deferred] == ["triage-1"]
+    two = from_dict({"orgs": ["acme"], "dependabot": {"enabled": True, "budget": 2}})
+    p = plan.plan_repo(_inv(*bumps), "0.28.0", two)
+    assert [o.id for o in p.orders] == ["dependabot-7", "dependabot-8"] and [o.id for o in p.deferred] == ["dependabot-9"]
 
 
 def test_config_keys():
     assert OFF.dependabot_enabled is False and OFF.dependabot_updates == ["patch", "minor"]
-    c = from_dict({"orgs": ["a"], "dependabot": {"enabled": True, "updates": ["patch"]}})
-    assert c.dependabot_enabled and c.dependabot_updates == ["patch"]
+    assert OFF.dependabot_merge is False and OFF.dependabot_budget == 5
+    c = from_dict({"orgs": ["a"], "dependabot": {"enabled": True, "updates": ["patch"], "merge": True, "budget": 10}})
+    assert c.dependabot_enabled and c.dependabot_updates == ["patch"] and c.dependabot_merge and c.dependabot_budget == 10
+    assert from_dict({"orgs": ["a"], "dependabot": {"merge": "yes"}}).dependabot_merge is False
     with pytest.raises(ValueError, match="dependabot.updates"):
         from_dict({"orgs": ["a"], "dependabot": {"updates": ["huge"]}})
     with pytest.raises(ValueError, match="merge.kinds"):
@@ -183,6 +190,7 @@ def bump(monkeypatch, tmp_path):
     monkeypatch.setattr(workspace, "push_onto", lambda ws, branch: seen["pushes"].append(branch))
     monkeypatch.setattr(workspace, "push", lambda ws, branch: (_ for _ in ()).throw(AssertionError("force-with-lease on Dependabot's branch")))
     monkeypatch.setattr(workspace, "comment_pr", lambda repo, n, body: seen["comments"].append((n, body)))
+    monkeypatch.setattr(workspace, "merge_pr", lambda repo, n, method, delete: seen.__setitem__("merged", (n, method, delete)))
     monkeypatch.setattr(workspace, "update_pr_body", lambda *a: (_ for _ in ()).throw(AssertionError("Dependabot's body is Dependabot's")))
     inv = Inventory(Repo("acme/a", pinned="0.28.0"), "0.28.0")
     ws = workspace.Workspace("acme/a", tmp_path, "main")
@@ -252,6 +260,47 @@ def test_no_checks_or_wait_off_is_skipped_quietly(bump):
     assert go().status == "skipped" and seen["comments"] == []
     out = go(from_dict({"orgs": ["acme"], "dependabot": {"enabled": True}, "ci": {"wait": False}}))
     assert out.status == "skipped" and "ci.wait is off" in out.detail
+
+
+MERGE = from_dict({"orgs": ["acme"], "dependabot": {"enabled": True, "merge": True}})
+
+
+def test_a_green_bump_is_merged_with_dependabot_merge(bump):
+    go, waits, seen = bump
+    waits.append(([_run("test (ubuntu)")], False))
+    out = go(MERGE)
+    assert out.status == "merged" and seen["merged"] == (7, "squash", True) and seen["comments"] == []
+    assert out.ci["merged"] and "· merged" in __import__("steward.report", fromlist=["x"]).RunReport("pr", [], [out]).markdown()
+
+
+def test_a_bump_fixed_in_a_round_is_merged_once_green(bump):
+    go, waits, seen = bump
+    waits += [([_run("test (ubuntu)", conclusion="failure")], False), ([_run("test (ubuntu)", rid=2)], False)]
+    out = go(from_dict({"orgs": ["acme"], "dependabot": {"enabled": True, "merge": True}, "merge": {"method": "rebase", "delete_branch": False}}))
+    assert out.status == "merged" and seen["merged"] == (7, "rebase", False) and seen["pushes"]
+    assert "green after 1 fix round(s)" in seen["comments"][0][1]       # the fix is still accounted for on the PR
+
+
+def test_a_refused_merge_is_said_on_the_pr_and_the_pr_left_green(bump, monkeypatch):
+    go, waits, seen = bump
+    def refuse(repo, n, method, delete):
+        raise ci.gh.GhError("pr merge 7 on acme/a: Base branch requires 1 approving review")
+    monkeypatch.setattr(workspace, "merge_pr", refuse)
+    waits.append(([_run("test (ubuntu)")], False))
+    out = go(MERGE)
+    assert out.status == "green" and "requires 1 approving review" in out.ci["merge_note"]
+    (number, body), = seen["comments"]
+    assert "could not merge it" in body and "<!-- steward:worked=sha0 -->" in body   # the next run moves on
+
+
+def test_merge_is_off_by_default_and_never_for_red(bump):
+    go, waits, seen = bump
+    waits.append(([_run("test (ubuntu)")], False))
+    assert go().status == "green" and "merged" not in seen
+    red = ([_run("test (ubuntu)", conclusion="failure")], False)
+    waits += [red, red, red]
+    assert go(MERGE).status == "red" and "merged" not in seen
+    assert from_dict({"orgs": ["acme"], "merge": {"auto": True}}).dependabot_merge is False   # merge.auto is the steward's own
 
 
 def test_the_work_dispatch_checks_out_dependabots_branch(monkeypatch, tmp_path):

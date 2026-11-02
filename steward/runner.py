@@ -473,11 +473,13 @@ def _settle_ci(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspac
 
 
 def _merge(order: Order, cfg: Config, number: int, info: dict) -> str:
-    """Merge a ready PR when `merge.auto` covers its kind and the steward
-    saw its checks green itself: a wait that was skipped, stopped or saw
-    no check proves nothing, and the PR is left for a person. Returns the
-    order's status, `merged` or `pr`."""
-    if not cfg.merge_auto or order.kind not in cfg.merge_kinds:
+    """Merge a ready PR when the config covers its kind (`merge.auto` and
+    `merge.kinds` for the steward's own, `dependabot.merge` for
+    Dependabot's) and the steward saw its checks green itself: a wait that
+    was skipped, stopped or saw no check proves nothing, and the PR is
+    left for a person. Returns `merged` or `pr`."""
+    covered = cfg.dependabot_merge if order.kind == "dependabot" else cfg.merge_auto and order.kind in cfg.merge_kinds
+    if not covered:
         return "pr"
     if not info["waited"] or not info.get("checks") or info["note"]:
         info["merge_note"] = info["note"] or "the steward saw no check on the PR, so it has nothing green to merge on"
@@ -767,7 +769,9 @@ def work_dependabot(order: Order, inv: inventory.Inventory, cfg: Config, ws: wor
         except Exception as exc:
             info["note"] = f"the wait stopped: {_failure(exc)}"
     status = _dependabot_status(info)
-    if status == "red" or info["agent"]:
+    if status == "green" and _merge(order, cfg, number, info) == "merged":
+        status = "merged"
+    if status == "red" or info["agent"] or info.get("merge_note"):
         try:
             workspace.comment_pr(order.repo, number, _dependabot_comment(order, cfg, info, workspace.head_sha(ws)))
         except Exception as exc:
@@ -794,6 +798,9 @@ def _dependabot_comment(order: Order, cfg: Config, info: dict, sha: str) -> str:
                 "Left for a person." if rounds else f"The checks on this pull request went red:\n\n{rows}\n\n")
         if info["note"]:
             head += f"{info['note']}.\n\n"
+    elif info.get("merge_note"):
+        head = (f"The checks are green{f' after {rounds} fix round(s)' if rounds else ''}, but the steward could not "
+                f"merge it: {info['merge_note']}. Merge it by hand once read.\n\n")
     else:
         head = f"The checks are green after {rounds} fix round(s) pushed onto this branch.\n\n"
     agent = "".join(_agent_section(AgentResult(**a)) for a in info["agent"]).lstrip("\n")
