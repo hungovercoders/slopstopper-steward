@@ -5,6 +5,8 @@ Order kinds, in the priority they are worked:
             and, with `upgrade.review`, an agent review of the refresh
   refresh   the pin is current but the suite on disk was written by an older CLI
   triage    an open finding slopstopper raised, security ones first
+  dependabot  an open Dependabot PR (with `dependabot.enabled`): its checks are
+            waited for and, red, worked on Dependabot's own branch
 
 A repo gets at most `budgets.prs_per_repo` open steward PRs; an order whose
 id already has an open PR is dropped, so a re-run is idempotent. Orders a
@@ -34,10 +36,11 @@ class Order:
     finding: Finding | None = None
     agentic: bool = False
     details: dict = field(default_factory=dict)
+    head: str | None = None   # an existing branch the order works on (Dependabot's); else the steward's own
 
     @property
     def branch(self) -> str:
-        return f"steward/{self.id}"
+        return self.head or f"steward/{self.id}"
 
     def to_dict(self) -> dict:
         return {
@@ -110,6 +113,31 @@ def _triage_orders(inv: Inventory) -> list[Order]:
     return orders
 
 
+def _dependabot_orders(inv: Inventory, cfg: Config) -> tuple[list[Order], list[dict]]:
+    """(orders, skipped rows). A bump the steward already worked at this
+    head, one it cannot size, or one past `dependabot.updates` is a row."""
+    orders, rows = [], []
+    for bump in sorted(inv.dependabot, key=lambda b: b.number):
+        order_id = f"dependabot-{bump.number}"
+        why = ""
+        if bump.worked:
+            why = f"the steward already worked head `{bump.sha[:7]}`; a new push from Dependabot resets it"
+        elif bump.level is None:
+            why = "cannot tell how far the bump goes (no version to read); left for a person"
+        elif bump.level not in cfg.dependabot_updates:
+            why = f"a {bump.level} bump; `dependabot.updates` leaves it to a person"
+        if why:
+            rows.append({"repo": inv.repo.full_name, "order": order_id, "why": why, "url": bump.url})
+            continue
+        orders.append(Order(
+            order_id, "dependabot", inv.repo.full_name, bump.title, f"Dependabot PR #{bump.number}: {bump.title}", 4,
+            inv.repo.default_branch, inv.repo.pinned, inv.repo.pinned, agentic=True, head=bump.head,
+            details={"number": bump.number, "url": bump.url, "sha": bump.sha, "level": bump.level,
+                     "updates": [list(u) for u in bump.updates]},
+        ))
+    return orders, rows
+
+
 PIN_KINDS = ("upgrade", "refresh")
 
 
@@ -159,6 +187,10 @@ def plan_repo(inv: Inventory, target: str | None, cfg: Config) -> Plan:
     if upgrade:
         candidates.append(upgrade)
     candidates += _triage_orders(inv)
+    if cfg.dependabot_enabled:
+        bumps, rows = _dependabot_orders(inv, cfg)
+        candidates += bumps
+        plan.skipped += rows
     budget = max(0, cfg.prs_per_repo - len(inv.open_orders))
     for order in sorted(candidates, key=lambda o: o.priority):
         if order.id in inv.open_orders:

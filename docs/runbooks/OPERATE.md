@@ -10,7 +10,7 @@ artifact. Three tables:
 | Section | Holds |
 | ------- | ----- |
 | Adopters | each repo, its pin, PyPI's latest, the CLI that wrote its suite, open findings, the evidence it was found by |
-| Orders | each order worked and its status: `pr`, `merged` (with `merge.auto`), `draft`, `skipped` (with why), `failed` (with the error), `deferred` (the push token would expire before it finished; the next run picks it up), or `planned` in a dry run |
+| Orders | each order worked and its status: `pr`, `merged` (with `merge.auto`), `draft`, `skipped` (with why), `failed` (with the error), `deferred` (the push token would expire before it finished; the next run picks it up), or `planned` in a dry run; a Dependabot order ends `green` or `red` instead |
 | Deferred / Skipped | what the budgets left for next time, orders with an open PR, disabled workflows that need an admin |
 
 Agent cost and turns are on the order's row when one ran, with the
@@ -73,12 +73,26 @@ on in `steward.yml` once the self-review has earned it on a few PRs, and
 keep a branch rule on the base if a human review must stay in the loop:
 the steward merges with the token's rights and nothing more.
 
+### A comment on a Dependabot PR
+
+With `dependabot.enabled`, a Dependabot PR whose checks went red gets
+worked on its own branch, and one "slopstopper-steward" comment says how
+it ended: "green after N fix round(s)" with the agent's account and its
+self-review, or "still red" with the failing checks, left for a person.
+A green PR gets no comment and no push. The comment's marker names the
+head the steward worked, so the next run moves on; a new push from
+Dependabot (or your own) makes it eligible again. The PR's body stays
+Dependabot's, and the steward never merges one: the run report's row
+says `green` or `red`, and merging is yours. Major bumps, and bumps
+whose versions cannot be read (digests), are listed as skipped.
+
 ## Keeping the steward off something
 
-- An issue: add the label named by `labels.ignore` (`steward:ignore`).
+- An issue, or a Dependabot PR: add the label named by `labels.ignore` (`steward:ignore`).
 - A repo: `repos.exclude` in `steward.yml`.
 - A kind of work: `agent.enabled: false` stops every agentic order;
-  `upgrade.policy: patch` keeps pins inside a minor.
+  `upgrade.policy: patch` keeps pins inside a minor; `dependabot.enabled:
+  false` leaves Dependabot's PRs alone.
 - Everything: `mode: plan`.
 
 ## Re-running one repo

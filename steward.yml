@@ -36,6 +36,13 @@ agent:
   # unanswered review makes the PR a draft.
   self_review: true
 
+dependabot:
+  # Dependabot's open PRs on these repos are orders too: the steward waits
+  # for each one's checks and, red, fixes on Dependabot's own branch (one
+  # comment on the PR says what it did). It never merges one.
+  enabled: true
+  updates: [patch, minor]
+
 merge:
   # Off until the self-review has been read on a few PRs. On, a green
   # upgrade or refresh PR (merge.kinds) is squash-merged by the run that

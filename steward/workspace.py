@@ -98,6 +98,13 @@ def branch(ws: Workspace, name: str) -> None:
     ws.git("checkout", "-B", name, f"origin/{ws.default_branch}")
 
 
+def checkout_remote(ws: Workspace, name: str) -> None:
+    """Work on a branch that already exists on the remote (Dependabot's),
+    at its tip."""
+    ws.git("fetch", "origin", name)
+    ws.git("checkout", "-B", name, f"origin/{name}")
+
+
 def commit(ws: Workspace, message: str) -> bool:
     if not ws.dirty():
         return False
@@ -108,6 +115,19 @@ def commit(ws: Workspace, message: str) -> bool:
 
 def push(ws: Workspace, name: str) -> None:
     ws.git("push", "--no-verify", "--force-with-lease", "-u", "origin", name)
+
+
+def push_onto(ws: Workspace, name: str) -> None:
+    """A plain push onto a branch that is not the steward's: fast-forward
+    only, so a tip that moved since the fetch (Dependabot rebased) refuses
+    the push rather than losing it."""
+    ws.git("push", "--no-verify", "origin", name)
+
+
+def comment_pr(repo: str, number: int, body: str) -> None:
+    result = gh.gh("pr", "comment", str(number), "-R", repo, "--body-file", "-", input=body)
+    if result.returncode != 0:
+        raise gh.GhError(f"pr comment {number} on {repo}: {result.stderr.strip()}")
 
 
 def head_sha(ws: Workspace) -> str:
