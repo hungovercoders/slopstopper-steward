@@ -31,6 +31,10 @@ Configuration
                              Default [upgrade, refresh].
     merge.method             squash | merge | rebase. Default squash.
     merge.delete_branch      Delete the steward branch after the merge. Default true.
+    dependabot.enabled       Work Dependabot's open PRs too: wait for each one's checks and,
+                             red, fix on Dependabot's own branch within `ci.fix_rounds`. The
+                             steward never merges one. Default false.
+    dependabot.updates       Which bumps it may work: patch, minor, major. Default [patch, minor].
     labels.pr                Labels on every steward PR.
     labels.ignore            An issue carrying this label is never picked up.
     slopstopper.repo         Where slopstopper lives (bugs go here; skills are fetched here).
@@ -48,7 +52,8 @@ DEFAULT_PATH = Path("steward.yml")
 MODES = ("plan", "pr")
 POLICIES = ("latest", "minor", "patch")
 MERGE_METHODS = ("squash", "merge", "rebase")
-ORDER_KINDS = ("upgrade", "refresh", "triage")
+ORDER_KINDS = ("upgrade", "refresh", "triage")   # the kinds merge.kinds may name: a Dependabot PR is never merged
+LEVELS = ("patch", "minor", "major")
 
 
 @dataclass
@@ -74,6 +79,8 @@ class Config:
     merge_kinds: list[str] = field(default_factory=lambda: ["upgrade", "refresh"])
     merge_method: str = "squash"
     merge_delete_branch: bool = True
+    dependabot_enabled: bool = False
+    dependabot_updates: list[str] = field(default_factory=lambda: ["patch", "minor"])
     pr_labels: list[str] = field(default_factory=lambda: ["slopstopper", "steward"])
     ignore_label: str = "steward:ignore"
     slopstopper_repo: str = "hungovercoders/slopstopper"
@@ -121,7 +128,7 @@ def from_dict(data: dict) -> Config:
     budgets, agent, labels, ss = (
         _section(data, "budgets"), _section(data, "agent"), _section(data, "labels"), _section(data, "slopstopper"),
     )
-    ci, merge = _section(data, "ci"), _section(data, "merge")
+    ci, merge, bot = _section(data, "ci"), _section(data, "merge"), _section(data, "dependabot")
     cfg = Config(
         orgs=orgs,
         include=_listof(repos.get("include"), "repos.include"),
@@ -141,6 +148,9 @@ def from_dict(data: dict) -> Config:
         agent_model=str(agent.get("model") or ""),
         self_review=agent.get("self_review") is not False,
         **_merge(merge),
+        dependabot_enabled=bot.get("enabled") is True,
+        dependabot_updates=_listof(bot.get("updates"), "dependabot.updates") if bot.get("updates") is not None
+        else ["patch", "minor"],
         pr_labels=_listof(labels.get("pr"), "labels.pr") or ["slopstopper", "steward"],
         ignore_label=str(labels.get("ignore") or "steward:ignore"),
         slopstopper_repo=str(ss.get("repo") or "hungovercoders/slopstopper"),
@@ -171,6 +181,9 @@ def _check(cfg: Config) -> None:
     odd = [k for k in cfg.merge_kinds if k not in ORDER_KINDS]
     if odd:
         raise ValueError(f"steward.yml: merge.kinds must be among {ORDER_KINDS}, not {odd}")
+    odd = [k for k in cfg.dependabot_updates if k not in LEVELS]
+    if odd:
+        raise ValueError(f"steward.yml: dependabot.updates must be among {LEVELS}, not {odd}")
 
 
 def load(path: Path = DEFAULT_PATH) -> Config:

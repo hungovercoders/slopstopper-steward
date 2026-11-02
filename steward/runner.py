@@ -450,7 +450,7 @@ def _settle_ci(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspac
     bounded by `ci.wait_minutes` and the run's deadline. The body gets a
     section saying how it ended; a PR that is not green becomes a draft.
     Returns (status, what happened)."""
-    info: dict = {"waited": False, "rounds": 0, "failing": [], "timed_out": False, "note": "", "agent": [], "locks": []}
+    info = _ci_info()
     if not cfg.ci_wait:
         info["note"] = "ci.wait is off"
     else:
@@ -500,9 +500,15 @@ def _merge_section(info: dict) -> str:
     return ""
 
 
+def _ci_info() -> dict:
+    return {"waited": False, "rounds": 0, "failing": [], "timed_out": False, "note": "", "agent": [], "locks": []}
+
+
 def _ci_loop(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, cli: Path | None,
              ctx: RunContext, info: dict) -> None:
-    """Wait, and while a slopstopper check is red and a round is left, fix and wait again."""
+    """Wait, and while a check the agent may work is red and a round is
+    left, fix and wait again. On the steward's own PRs that is a
+    slopstopper check; on Dependabot's, every red check is the bump's."""
     sha = workspace.head_sha(ws)
     expected, workflows = ci.expected_workflows(ws.path), {}
     for round_ in range(cfg.ci_fix_rounds + 1):
@@ -518,7 +524,7 @@ def _ci_loop(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.
         info.update(waited=True, timed_out=timed_out, waited_minutes=round(budget / 60), checks=len(runs))
         red = ci.describe(order.repo, runs, workflows)
         info["failing"] = [{k: r[k] for k in ("name", "conclusion", "url", "workflow", "ours")} for r in red]
-        ours = [r for r in red if r["ours"]]
+        ours = red if order.kind == "dependabot" else [r for r in red if r["ours"]]
         if _ci_stops(cfg, cli, red, ours, timed_out, round_):
             return
         if not _ci_fix_round(order, inv, cfg, ws, cli, ctx, ours, info, round_ + 1):
@@ -535,39 +541,70 @@ def _ci_stops(cfg: Config, cli: Path | None, red: list, ours: list, timed_out: b
 
 def _ci_fix_round(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, cli: Path,
                   ctx: RunContext, ours: list[dict], info: dict, number: int) -> bool:
-    """One agent attempt at the red slopstopper checks, from their logs. The
-    lock is kept in step and the steward's own verification re-run before
-    the push: a fix that goes red here is not pushed, and the PR is drafted.
+    """One agent attempt at the red checks, from their logs. The lock is
+    kept in step and the steward's own verification re-run before the
+    push: a fix that goes red here is not pushed, and the PR is drafted.
     Returns whether a wait should follow."""
-    try:
-        agent.ensure_skills(ws, order.target or inv.repo.pinned, cfg.slopstopper_repo)
-    except RuntimeError as exc:
-        info["note"] = f"the skills could not be fetched for round {number}: {exc}"
+    bump = order.kind == "dependabot"
+    if not bump and not _skills_ready(order, inv, cfg, ws, info, number):
         return False
     tails = {r["name"]: ci.log_tail(order.repo, r["id"]) for r in ours[:8]}
     (ws.path / ".steward-ci-failures.md").write_text(ci.failures_markdown(ours, tails), encoding="utf-8")
     checks, apart = _runnable(ws, cli)
-    brief = prompts.ci_fix(order, inv, ours, cfg.slopstopper_repo, checks=checks, apart=apart)
+    brief = _fix_brief(order, inv, cfg, ours, checks, apart)
+    # On Dependabot's branch the steward's gate is "nothing newly red": what
+    # was red before the bump is the repo's, not the fix's.
+    baseline = {r["check"] for r in _verify_pass(ws, cli, ctx)[0]} if bump else set()
     result = _agent_pass(order, inv, cfg, ws, cli, ctx, brief, checks, apart)
     info["agent"].append(result.to_dict())
-    if not result.ran or not ws.dirty():
-        info["note"] = f"the agent changed nothing in round {number}: {result.summary or result.error}"
-        return False
-    blocked = _review_blocks(result)
-    if blocked:
-        info["note"] = f"the agent's round {number} was not pushed: {blocked}"
+    stop = _fix_stops(ws, result, number)
+    if stop:
+        info["note"] = stop
         return False
     info["locks"] += _sync_locks(ws)
-    red = _verify_after_fix(order, ws, cli, ctx)
+    red = [r for r in _verify_after_fix(order, ws, cli, ctx) if r["check"] not in baseline]
     if red:
         info["note"] = (f"the agent's round {number} left the steward's own checks red "
                         f"({', '.join(r['check'] for r in red)}), so it was not pushed")
         return False
-    workspace.commit(ws, f"fix(slopstopper): settle the pull request's checks (round {number})\n\n"
-                         f"{result.summary or result.error}")
-    workspace.push(ws, order.branch)
+    _push_fix(order, ws, result, number)
     info["rounds"] = number
     return True
+
+
+def _skills_ready(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, info: dict,
+                  number: int) -> bool:
+    try:
+        agent.ensure_skills(ws, order.target or inv.repo.pinned, cfg.slopstopper_repo)
+        return True
+    except RuntimeError as exc:
+        info["note"] = f"the skills could not be fetched for round {number}: {exc}"
+        return False
+
+
+def _fix_brief(order: Order, inv: inventory.Inventory, cfg: Config, ours: list[dict], checks: list[str],
+               apart: list[str]) -> str:
+    if order.kind == "dependabot":
+        body = (gh.api(f"repos/{order.repo}/pulls/{order.details['number']}") or {}).get("body") or ""
+        return prompts.dependabot_fix(order, inv, ours, body, cfg.slopstopper_repo, checks=checks, apart=apart)
+    return prompts.ci_fix(order, inv, ours, cfg.slopstopper_repo, checks=checks, apart=apart)
+
+
+def _fix_stops(ws: workspace.Workspace, result: AgentResult, number: int) -> str:
+    """Why this round ends without a push, or ""."""
+    if not result.ran or not ws.dirty():
+        return f"the agent changed nothing in round {number}: {result.summary or result.error}"
+    blocked = _review_blocks(result)
+    return f"the agent's round {number} was not pushed: {blocked}" if blocked else ""
+
+
+def _push_fix(order: Order, ws: workspace.Workspace, result: AgentResult, number: int) -> None:
+    """Commit and push the round: onto the steward's branch with its lease,
+    or fast-forward onto Dependabot's."""
+    bump = order.kind == "dependabot"
+    what = "fix(deps): adapt to the dependency bump" if bump else "fix(slopstopper): settle the pull request's checks"
+    workspace.commit(ws, f"{what} (round {number})\n\n{result.summary or result.error}")
+    (workspace.push_onto if bump else workspace.push)(ws, order.branch)
 
 
 def _verify_after_fix(order: Order, ws: workspace.Workspace, cli: Path, ctx: RunContext) -> list[dict]:
@@ -711,6 +748,60 @@ def _triage_pr(order: Order, cfg: Config, ws: workspace.Workspace, result: Agent
                    ci=ci_info)
 
 
+# ── dependabot ───────────────────────────────────────────────────────
+
+def work_dependabot(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, ctx: RunContext) -> Outcome:
+    """Wait for Dependabot's PR's checks on its own branch and, red, work
+    them the way a steward PR's are settled, pushing onto that branch. The
+    PR's body is Dependabot's and stays so: the steward says what it did in
+    one comment, whose marker keeps the next run off this same head."""
+    number = order.details["number"]
+    version = _verifier_version(order, inv)
+    cli = refresh.cli_for(version, ctx.venv(version), cfg.package) if version else None
+    info = _ci_info()
+    if not cfg.ci_wait:
+        info["note"] = "ci.wait is off, and a Dependabot PR is only its checks"
+    else:
+        try:
+            _ci_loop(order, inv, cfg, ws, cli, ctx, info)
+        except Exception as exc:
+            info["note"] = f"the wait stopped: {_failure(exc)}"
+    status = _dependabot_status(info)
+    if status == "red" or info["agent"]:
+        try:
+            workspace.comment_pr(order.repo, number, _dependabot_comment(order, cfg, info, workspace.head_sha(ws)))
+        except Exception as exc:
+            info["note"] = (info["note"] + " " if info["note"] else "") + f"the PR could not be commented on: {_failure(exc)}"
+    last = info["agent"][-1] if info["agent"] else None
+    return Outcome(order.to_dict(), status, pr_url=order.details["url"], detail=info["note"], agent=last, ci=info)
+
+
+def _dependabot_status(info: dict) -> str:
+    """`green`, `red`, or `skipped` when the checks never settled (none
+    ran, still running, not awaited): nothing to act on either way."""
+    if info["failing"]:
+        return "red"
+    if info["waited"] and info.get("checks") and not info["timed_out"]:
+        return "green"
+    return "skipped"
+
+
+def _dependabot_comment(order: Order, cfg: Config, info: dict, sha: str) -> str:
+    rounds = info["rounds"]
+    if info["failing"]:
+        rows = "\n".join(f"- `{f['name']}` ({f['conclusion']}): {f['url']}" for f in info["failing"])
+        head = (f"The checks on this pull request are still red after {rounds} fix round(s):\n\n{rows}\n\n"
+                "Left for a person." if rounds else f"The checks on this pull request went red:\n\n{rows}\n\n")
+        if info["note"]:
+            head += f"{info['note']}.\n\n"
+    else:
+        head = f"The checks are green after {rounds} fix round(s) pushed onto this branch.\n\n"
+    agent = "".join(_agent_section(AgentResult(**a)) for a in info["agent"]).lstrip("\n")
+    return (f"### slopstopper-steward\n\n{head}{agent}\n\n{FOOTER}Posted by [slopstopper-steward]({STEWARD_URL}); "
+            f"order `{order.id}`. A label `{cfg.ignore_label}` on this pull request keeps the steward off it.\n"
+            f"<!-- steward:worked={sha} -->\n")
+
+
 # ── the run ──────────────────────────────────────────────────────────
 
 def execute(plan: Plan, invs: list[inventory.Inventory], cfg: Config, workdir: Path | None,
@@ -746,6 +837,9 @@ def _work(order: Order, inv: inventory.Inventory, cfg: Config, ctx: RunContext) 
         return Outcome(order.to_dict(), "skipped", detail=str(ctx.agent_unavailable()))
     try:
         ws = workspace.clone(order.repo, order.default_branch, ctx.base / "clones" / order.repo.replace("/", "__") / order.id)
+        if order.kind == "dependabot":
+            workspace.checkout_remote(ws, order.branch)
+            return work_dependabot(order, inv, cfg, ws, ctx)
         workspace.branch(ws, order.branch)
         work = work_refresh if order.kind in ("upgrade", "refresh") else work_triage
         return work(order, inv, cfg, ws, ctx)

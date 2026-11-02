@@ -31,6 +31,10 @@ agent:
   model: ""                # handed to `claude --model` (an alias like sonnet, or an id); empty uses the CLI default. The PR and report name what ran
   self_review: true        # a read-only second run reviews the agent's diff; one correction round; unanswered, the PR is a draft
 
+dependabot:
+  enabled: false           # true: wait for Dependabot's PRs' checks and, red, fix on their branch; never merged
+  updates: [patch, minor]  # patch | minor | major: the bumps it may work; the rest are left to a person
+
 merge:
   auto: false              # true: a green PR of a kind below is merged by the run that opened it (drafts and refusals are left ready)
   kinds: [upgrade, refresh] # upgrade | refresh | triage

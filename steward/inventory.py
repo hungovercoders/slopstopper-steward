@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from steward import gh
+from steward import dependabot, gh
 from steward.config import Config
 from steward.discover import Repo
 
@@ -59,6 +59,7 @@ class Inventory:
     disabled_workflows: list[dict] = field(default_factory=list)
     open_orders: dict[str, dict] = field(default_factory=dict)  # order id -> {number, url}
     skills_present: bool = False
+    dependabot: list[dependabot.Bump] = field(default_factory=list)   # only with dependabot.enabled
 
     def to_dict(self) -> dict:
         return {
@@ -66,7 +67,7 @@ class Inventory:
             "findings": [f.to_dict() for f in self.findings],
             "untrusted": [f.to_dict() for f in self.untrusted],
             "disabled_workflows": self.disabled_workflows, "open_orders": self.open_orders,
-            "skills_present": self.skills_present,
+            "skills_present": self.skills_present, "dependabot": [b.to_dict() for b in self.dependabot],
         }
 
 
@@ -137,9 +138,28 @@ def _disabled_workflows(repo: Repo) -> list[dict]:
             for w in workflows if w.get("path", "").startswith(".github/workflows/ss-") and w.get("state") != "active"]
 
 
-def _open_orders(repo: Repo) -> dict[str, dict]:
+def _open_pulls(repo: Repo) -> list[dict]:
+    return gh.api(f"repos/{repo.full_name}/pulls?state=open&per_page=100", paginate=True) or []
+
+
+def _dependabot(repo: Repo, pulls: list[dict], cfg: Config) -> list[dependabot.Bump]:
+    """Dependabot's open PRs, the ignore label honoured, each marked when a
+    steward comment already names its current head (the steward had its
+    turn on that head; a new push from Dependabot clears the mark)."""
+    bumps = []
+    for pr in pulls:
+        bump = dependabot.from_pr(pr)
+        if bump is None or cfg.ignore_label in bump.labels:
+            continue
+        comments = gh.api(f"repos/{repo.full_name}/issues/{bump.number}/comments?per_page=100", paginate=True) or []
+        bump.worked = dependabot.worked(comments, bump.sha)
+        bumps.append(bump)
+    return bumps
+
+
+def _open_orders(pulls: list[dict]) -> dict[str, dict]:
     orders: dict[str, dict] = {}
-    for pr in gh.api(f"repos/{repo.full_name}/pulls?state=open&per_page=100", paginate=True) or []:
+    for pr in pulls:
         ref = (pr.get("head") or {}).get("ref", "")
         if not ref.startswith(BRANCH_PREFIX):
             continue
@@ -154,5 +174,8 @@ def take(repo: Repo, latest: str | None, cfg: Config) -> Inventory:
     inv.skills_present = gh.contents(repo.full_name, TRIAGE_SKILL, repo.default_branch) is not None
     inv.findings, inv.untrusted = _findings(repo, cfg)
     inv.disabled_workflows = _disabled_workflows(repo)
-    inv.open_orders = _open_orders(repo)
+    pulls = _open_pulls(repo)
+    inv.open_orders = _open_orders(pulls)
+    if cfg.dependabot_enabled:
+        inv.dependabot = _dependabot(repo, pulls, cfg)
     return inv

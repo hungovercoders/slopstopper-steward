@@ -79,6 +79,7 @@ flowchart TB
    | `upgrade` | the pin is behind the policy's target (`upgrade.policy`, `min_age_days`) | code, then the agent's review of the refresh (`upgrade.review`) | 0 |
    | `refresh` | the pin is current but `.ss/.installed-from` is older | code; same | 1 |
    | `triage` | an open finding, security first | the agent with the repo's triage skill | 2 / 3 |
+   | `dependabot` | an open Dependabot PR, with `dependabot.enabled` | the settle loop, on Dependabot's branch | 4 |
 
    The install is code; what it cannot judge is the agent's. With
    `upgrade.review` (default true) the agent works the
@@ -102,6 +103,28 @@ flowchart TB
    A disabled workflow is reported, not worked: enabling one changes
    repo settings and needs an admin. So is any upgrade or refresh whose
    target has no `slopstopper install` (below `MIN_INSTALL_VERSION`).
+
+   With `dependabot.enabled` (default false) the inventory also lists
+   Dependabot's open PRs (its own, from the same repository, not drafts,
+   without the ignore label) and each becomes an order, after the rest
+   and inside the same per-repo budget. The order works on Dependabot's
+   branch, not a `steward/` one: the settle loop below waits for the PR's
+   checks and, red, hands every failing job (the repo's own tests, not
+   only slopstopper's) to the agent with its log tail, the bump's
+   release notes from the PR body, and a brief that says a fix adapts
+   the repo to the new version and never loosens a test or pins back.
+   The agent cannot run the repo's tests; the PR's CI is the verifier,
+   so each round costs a CI run. The steward's own gate before a push is
+   "nothing newly red" rather than "all green", since a static check red
+   on the base is the repo's, not the fix's. The push is a plain
+   fast-forward onto Dependabot's branch (a tip that moved refuses it),
+   and Dependabot stops rebasing a PR someone else pushed to, so the PR
+   is the steward's from then on. Dependabot's body is never rewritten:
+   one comment says what the steward did, with `<!-- steward:worked=<sha> -->`,
+   and the next run skips a PR whose head that marker names. A bump the
+   steward cannot size, or one past `dependabot.updates` (patch and
+   minor by default), is reported, not worked. A Dependabot PR is never
+   merged by the steward.
 4. **execute** clones each order's repo, branches `steward/<order id>`
    and runs the executor. Nothing is pushed until the work is committed;
    the agent cannot push at all. The pin moves through one PR at a time:
@@ -265,5 +288,8 @@ The rest of the brief:
 No push to a default branch, no merge outside `merge.auto` (and then
 only of the run's own green PR), no second PR for an order that has one
 open, no edit of an issue, no label on an issue, no repo settings change.
+The one write to a PR that is not the steward's is a Dependabot PR's,
+with `dependabot.enabled`: a fast-forward commit on its branch and one
+comment, never its body, never a merge.
 An issue with the `labels.ignore` label (`steward:ignore` by default) is
 never picked up.
