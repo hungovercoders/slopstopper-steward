@@ -43,6 +43,18 @@ Agent cost and turns are on the order's row when one ran.
   then mark the workaround with the issue number so the next refresh can
   remove it.
 
+### "CI still red" and "Checks"
+
+Every PR body ends with how the PR's own checks went. "The PR's N checks
+are green" means the steward waited for them (and, if it says "after a fix
+round", pushed a fix the agent made from the failing jobs' logs). "CI still
+red" lists the checks that stayed red, with links; the PR is a draft.
+Work them with the `slopstopper-triage` skill on the PR's branch: the
+steward does not come back to a settled order. "Not awaited" means the run
+hit its time limit before the checks finished; the PR is ready and its
+checks are whatever the PR page shows. `ci.wait_minutes`, `ci.fix_rounds`
+and `ci.wait` in `steward.yml` set the limits.
+
 ## Keeping the steward off something
 
 - An issue: add the label named by `labels.ignore` (`steward:ignore`).

@@ -124,7 +124,20 @@ flowchart TB
    rather than left to its CI. The browser and API checks never run in a
    clone: they need the PR's deployed preview, and building the site would
    run the repo's code beside the push token.
-6. **report** writes `.steward/reports/run.{md,json}` and the Actions job
+6. **settle** waits for the PR's own checks, the last verifier: the
+   browser and API checks only exist there. It polls the head commit's
+   check runs (`ci.wait_minutes` per wait, inside the run's token
+   deadline). A red slopstopper check goes to the agent with the tail of
+   its job log and the triage skill, on the same branch; the steward
+   pushes and waits again, up to `ci.fix_rounds` times. Green: the body
+   says so. Red, out of rounds or out of time: the PR becomes a draft
+   whose body names each failing check, and the report row says the same.
+   A repo's own non-slopstopper check is reported, not worked. Before any
+   of this, a `package.json` the install changed next to a
+   `package-lock.json` has its lock regenerated (`npm install
+   --package-lock-only --ignore-scripts`, apart as the agent user), since
+   every browser workflow starts with `npm ci`.
+7. **report** writes `.steward/reports/run.{md,json}` and the Actions job
    summary.
 ## Where the agent is boxed
 

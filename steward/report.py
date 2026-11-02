@@ -26,10 +26,11 @@ class Outcome:
     agent: dict | None = None
     red: list[dict] = field(default_factory=list)
     unverified: list[dict] = field(default_factory=list)
+    ci: dict | None = None
 
     def to_dict(self) -> dict:
         return {"order": self.order, "status": self.status, "pr_url": self.pr_url, "detail": self.detail,
-                "agent": self.agent, "red": self.red, "unverified": self.unverified}
+                "agent": self.agent, "red": self.red, "unverified": self.unverified, "ci": self.ci}
 
 
 @dataclass
@@ -61,7 +62,7 @@ class RunReport:
         else:
             lines += ["| Repo | Order | Status | Result |", "| --- | --- | --- | --- |"]
             for o in self.outcomes:
-                result = (o.pr_url or _cell(o.detail)) + _agent_cell(o.agent)
+                result = (o.pr_url or _cell(o.detail)) + _agent_cell(o.agent) + _ci_cell(o.ci)
                 lines.append(f"| {o.order['repo']} | `{o.order['id']}` | {o.status} | {result} |")
         lines += self._failures()
         if self.deferred:
@@ -100,3 +101,18 @@ def _agent_cell(agent: dict | None) -> str:
         return ""
     model = f", {agent['model']}" if agent.get("model") else ""
     return f" (agent ${agent['cost_usd']:.2f}, {agent.get('turns')} turns{model})"
+
+
+def _ci_cell(ci: dict | None) -> str:
+    """How the PR's own checks ended, for the table."""
+    if not ci:
+        return ""
+    if ci.get("note") and not ci.get("waited"):
+        return f" · CI not awaited ({ci['note']})"
+    rounds = ci.get("rounds") or 0
+    if ci.get("failing"):
+        names = ", ".join(sorted({f["name"] for f in ci["failing"]}))
+        return f" · CI red after {rounds} fix round(s): {names}"
+    if ci.get("timed_out"):
+        return f" · CI still running after {ci.get('waited_minutes', '?')} min"
+    return " · CI green" + (f" after {rounds} fix round(s)" if rounds else "")

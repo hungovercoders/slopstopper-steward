@@ -25,7 +25,9 @@ GitHub's message.
 **GitHub App (recommended).** Create one under the org (Settings →
 Developer settings → GitHub Apps) with repository permissions
 *Contents: read and write*, *Workflows: read and write*, *Pull requests:
-read and write*, *Issues: read*, *Actions: read*, *Metadata: read*.
+read and write*, *Issues: read*, *Checks: read*, *Actions: read*,
+*Metadata: read*. *Checks* and *Actions* are what let the steward wait for
+a PR's own checks and read a failing job's log.
 *Workflows* is what lets an upgrade or refresh push the `ss-*.yml` files
 `slopstopper install` rewrites: without it GitHub refuses the push, and
 the order fails with that refusal. Install it on the adopter repos (or

@@ -15,6 +15,10 @@ Configuration
     budgets.prs_per_repo     Open steward PRs per repo, upgrades included.
     budgets.agent_usd        Dollar cap per agent invocation (claude --max-budget-usd).
     budgets.agent_turns      Turn cap per agent invocation.
+    ci.wait                  After opening a PR, wait for its checks and fix what the triage
+                             skill covers; a PR that stays red is a draft. Default true.
+    ci.wait_minutes          The most one wait for the PR's checks may take. Default 20.
+    ci.fix_rounds            Agent attempts at a red PR before it is drafted. Default 2.
     agent.enabled            false disables every agentic order; upgrades still run.
     agent.model              Model name handed to claude --model (empty: the CLI default).
     labels.pr                Labels on every steward PR.
@@ -49,6 +53,9 @@ class Config:
     agent_usd: float = 5.0
     agent_turns: int = 60
     agent_enabled: bool = True
+    ci_wait: bool = True
+    ci_wait_minutes: int = 20
+    ci_fix_rounds: int = 2
     agent_model: str = ""
     pr_labels: list[str] = field(default_factory=lambda: ["slopstopper", "steward"])
     ignore_label: str = "steward:ignore"
@@ -97,6 +104,7 @@ def from_dict(data: dict) -> Config:
     budgets, agent, labels, ss = (
         _section(data, "budgets"), _section(data, "agent"), _section(data, "labels"), _section(data, "slopstopper"),
     )
+    ci = _section(data, "ci")
     cfg = Config(
         orgs=orgs,
         include=_listof(repos.get("include"), "repos.include"),
@@ -110,6 +118,9 @@ def from_dict(data: dict) -> Config:
         agent_usd=_num(budgets, "agent_usd", 5.0, float),
         agent_turns=_num(budgets, "agent_turns", 60, int),
         agent_enabled=agent.get("enabled") is not False,
+        ci_wait=ci.get("wait") is not False,
+        ci_wait_minutes=_num(ci, "wait_minutes", 20, int),
+        ci_fix_rounds=_num(ci, "fix_rounds", 2, int),
         agent_model=str(agent.get("model") or ""),
         pr_labels=_listof(labels.get("pr"), "labels.pr") or ["slopstopper", "steward"],
         ignore_label=str(labels.get("ignore") or "steward:ignore"),

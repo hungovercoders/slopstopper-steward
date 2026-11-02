@@ -19,7 +19,7 @@ from steward import gh
 
 AUTHOR = ("slopstopper-steward", "steward@slopstopper.dev")
 LOCAL_ONLY = (".steward-result.json", ".steward-release-notes.md", ".steward-prompt.md", ".steward-venv/",
-              ".steward-suite-diff.md", ".steward-schema-diff.md")
+              ".steward-suite-diff.md", ".steward-schema-diff.md", ".steward-ci-failures.md")
 
 
 # Every git command the steward runs, before or after the agent, ignores
@@ -107,6 +107,28 @@ def commit(ws: Workspace, message: str) -> bool:
 
 def push(ws: Workspace, name: str) -> None:
     ws.git("push", "--no-verify", "--force-with-lease", "-u", "origin", name)
+
+
+def head_sha(ws: Workspace) -> str:
+    return ws.git("rev-parse", "HEAD").stdout.strip()
+
+
+def pr_number(url: str) -> int:
+    """The number at the end of a pull request URL."""
+    return int(url.rstrip("/").rsplit("/", 1)[-1])
+
+
+def set_draft(repo: str, number: int) -> None:
+    """Convert an open PR to a draft (REST cannot; `gh pr ready --undo` can)."""
+    result = gh.gh("pr", "ready", "--undo", str(number), "-R", repo)
+    if result.returncode != 0:
+        raise gh.GhError(f"pr ready --undo {number} on {repo}: {result.stderr.strip()}")
+
+
+def update_pr_body(repo: str, number: int, body: str) -> None:
+    result = gh.gh("pr", "edit", str(number), "-R", repo, "--body-file", "-", input=body)
+    if result.returncode != 0:
+        raise gh.GhError(f"pr edit {number} on {repo}: {result.stderr.strip()}")
 
 
 def ensure_labels(repo: str, labels: list[str]) -> None:
