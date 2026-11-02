@@ -254,6 +254,17 @@ def test_an_unsettled_self_review_is_not_pushed(bump, monkeypatch):
     assert out.status == "red" and seen["pushes"] == [] and "was not pushed: its self-review" in seen["comments"][0][1]
 
 
+def test_a_cancelled_job_on_a_bump_is_skipped_without_spend_or_comment(bump):
+    """terminal-of-terror#69: the macOS job was cancelled, not failed. No
+    agent, no comment (so no marker), no merge; a re-run that goes green
+    is merged by the next run."""
+    go, waits, seen = bump
+    waits.append(([_run("Test (macos-latest)", conclusion="cancelled"), _run("Test (ubuntu)", rid=2)], False))
+    out = go(MERGE)
+    assert out.status == "skipped" and seen["agent"] == 0 and seen["comments"] == [] and "merged" not in seen
+    assert "cancelled before it finished: Test (macos-latest)" in out.detail
+
+
 def test_no_checks_or_wait_off_is_skipped_quietly(bump):
     go, waits, seen = bump
     waits.append(([], True))
