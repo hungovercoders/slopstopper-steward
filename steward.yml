@@ -16,9 +16,8 @@ mode: pr
 
 upgrade:
   policy: latest
-  # 0 for the first upgrade, so apic can move to 0.27.0 the day it shipped;
-  # set back to 2 afterwards, so a bad release can be yanked before it lands.
-  min_age_days: 0
+  # A release has two days to be yanked before the steward moves a pin to it.
+  min_age_days: 2
 
 budgets:
   repos_per_run: 5
@@ -32,3 +31,14 @@ agent:
   # light edits, at a known cost. Each PR and report names the exact model
   # the alias resolved to; pin that id here to hold it still.
   model: sonnet
+  # A second, read-only run reads the pending diff after the agent changed
+  # the tree; changes it asks for get one correction round, and an
+  # unanswered review makes the PR a draft.
+  self_review: true
+
+merge:
+  # Off until the self-review has been read on a few PRs. On, a green
+  # upgrade or refresh PR (merge.kinds) is squash-merged by the run that
+  # opened it; a triage PR, a draft, or anything the steward did not see
+  # green itself is left for a person.
+  auto: false

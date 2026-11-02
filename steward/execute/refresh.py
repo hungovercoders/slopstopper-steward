@@ -237,7 +237,13 @@ def _tree_diff(ws: Workspace, *flags: str) -> str:
 def suite_diff(ws: Workspace) -> str:
     """The install's change, as a unified diff the agent can read (it has no
     `git diff`), cut to a size a brief can hold."""
-    text = _tree_diff(ws) or "(the install changed nothing)\n"
+    return change_diff(ws, "(the install changed nothing)\n")
+
+
+def change_diff(ws: Workspace, empty: str = "(nothing changed)\n") -> str:
+    """The whole pending change against HEAD, bounded; what the self-review
+    reads, and what the steward would commit."""
+    text = _tree_diff(ws) or empty
     return text if len(text) <= DIFF_LIMIT else text[:DIFF_LIMIT] + "\n… (cut: the rest is in the PR's diff)\n"
 
 

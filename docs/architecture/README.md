@@ -140,6 +140,13 @@ flowchart TB
    `package-lock.json` has its lock regenerated (`npm install
    --package-lock-only --ignore-scripts`, apart as the agent user), since
    every browser workflow starts with `npm ci`.
+
+   With `merge.auto` (default false) a ready PR whose kind `merge.kinds`
+   names (upgrades and refreshes by default) is merged here, by
+   `merge.method`, once the wait has seen its checks green: a draft, a
+   wait that was skipped, stopped or saw no check, and a kind not named
+   are all left for a person, as is a merge GitHub refuses (a protected
+   base wanting a review), which the body reports under "Not merged".
 7. **report** writes `.steward/reports/run.{md,json}` and the Actions job
    summary.
 ## Where the agent is boxed
@@ -236,10 +243,23 @@ The rest of the brief:
   finding's check green in its own clone. Otherwise it says `Refs #N`
   with a "Not verified by the steward" section, so merging never closes
   an issue on the agent's word alone.
+- With `agent.self_review` (default true), any run that changed the tree
+  is followed by a second run that can read but not write: no editing
+  tool, no `echo` or `mkdir`, the whole pending diff in
+  `.steward-change.md`, and its verdict is its final message rather than
+  a file. `changes-requested` with findings gets one correction round,
+  in the first agent's box, with the findings in `.steward-review.md`;
+  `fixed` settles it, whether by a change or by an answer in `notes`. A
+  review left unsettled makes the PR a draft (in a CI fix round, the fix
+  is not pushed). A reviewer that gave no verdict, timed out, or changed
+  the tree anyway never blocks: the PR body says so and the steward's
+  own verification stands. Every verdict, with its cost, is in the PR
+  body and the report row.
 
 ## What never happens
 
-No merge, no push to a default branch, no second PR for an order that has
-one open, no edit of an issue, no label on an issue, no repo settings
-change. An issue with the `labels.ignore` label (`steward:ignore` by
-default) is never picked up.
+No push to a default branch, no merge outside `merge.auto` (and then
+only of the run's own green PR), no second PR for an order that has one
+open, no edit of an issue, no label on an issue, no repo settings change.
+An issue with the `labels.ignore` label (`steward:ignore` by default) is
+never picked up.

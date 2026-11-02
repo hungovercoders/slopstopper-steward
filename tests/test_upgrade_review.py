@@ -278,3 +278,27 @@ def test_the_review_hands_the_agent_the_schema_diff(upgrade):
     order, inv = _order("0.26.0")
     runner.work_refresh(order, inv, CFG, ws, ctx)
     assert (ws.path / ".steward-schema-diff.md").read_text() == "--- schema @ v0.26.0\n+++ schema @ v0.27.0\n"
+
+
+def test_a_review_left_unsettled_opens_a_draft_and_an_approved_one_is_ready(upgrade, monkeypatch):
+    ws, ctx, seen = upgrade
+    script = [AgentResult(True, outcome="fixed", summary="carried one knob over"),
+              AgentResult(True, outcome="changes-requested", summary="the knob is in the wrong file", findings=["x: move it"]),
+              AgentResult(True, outcome="skipped", summary="could not")]
+    def run(ws, brief, *a, **k):
+        seen["briefs"].append(brief)
+        if k.get("edits", True):
+            (ws.path / "knob.txt").write_text(str(len(seen["briefs"])))   # every writing pass changes the tree
+        return AgentResult(**script.pop(0).to_dict())
+    monkeypatch.setattr(runner.agent, "run", run)
+    order, inv = _order("0.26.0")
+    out = runner.work_refresh(order, inv, CFG, ws, ctx)
+    assert len(seen["briefs"]) == 3 and out.status == "draft" and seen["draft"] is True
+    assert "### Reviewed" in seen["body"] and "### Self-review not settled" in seen["body"] and "- x: move it" in seen["body"]
+    assert out.agent["review"]["outcome"] == "changes-requested" and not out.agent["review"]["settled"]
+    script += [AgentResult(True, outcome="fixed", summary="carried one knob over"),
+               AgentResult(True, outcome="approved", summary="right file, right why")]
+    seen["briefs"].clear()
+    out = runner.work_refresh(order, inv, CFG, ws, ctx)
+    assert len(seen["briefs"]) == 2 and out.status == "pr" and seen["draft"] is False
+    assert "**Self-review (approved):** right file, right why" in seen["body"]

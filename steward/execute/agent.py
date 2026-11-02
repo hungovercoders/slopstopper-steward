@@ -64,8 +64,16 @@ def run_rules(checks: Sequence[str]) -> list[str]:
     return rules
 
 
-def allowed_tools(checks: Sequence[str] = ()) -> list[str]:
-    return [*ALLOWED_TOOLS, *run_rules(checks)]
+def allowed_tools(checks: Sequence[str] = (), edits: bool = True) -> list[str]:
+    """The allow-list; without `edits` (the self-review) no tool that writes
+    a file is on it, `echo` and `mkdir` included, and the verdict comes
+    back on stdout instead of in the result file."""
+    tools = ALLOWED_TOOLS if edits else tuple(t for t in ALLOWED_TOOLS if t not in EDIT_TOOLS and t not in WRITING_BASH)
+    return [*tools, *run_rules(checks)]
+
+
+EDIT_TOOLS = ("Edit", "Write", "MultiEdit")
+WRITING_BASH = ("Bash(mkdir *)", "Bash(echo *)")
 # Named as well as left off the allow-list, so a permission prompt the
 # headless run would auto-answer never lets one through. `find -exec`,
 # `task` (runs whatever Taskfile.ss.yml says), `git grep -O<cmd>` and the
@@ -80,7 +88,7 @@ DISALLOWED_TOOLS = (
     "Bash(find *)", "Bash(task *)", "Bash(python*)", "Bash(sh *)", "Bash(bash *)", "Bash(env *)", "Bash(cd *)",
     *(f"Bash(slopstopper run {t}*)" for t in _NEVER_RUN),
     *(f"Bash(slopstopper run --json {t}*)" for t in _NEVER_RUN),
-    *(f"{tool}({path})" for tool in ("Edit", "Write", "MultiEdit")
+    *(f"{tool}({path})" for tool in EDIT_TOOLS
       for path in ("./.git/**", "**/.git/**", "**/.git")),
     "WebFetch", "WebSearch",
 )
@@ -100,6 +108,8 @@ class AgentResult:
     model: str = ""          # what the CLI ran, from the result's modelUsage: the pin is an alias
     error: str = ""
     denied: list[str] = field(default_factory=list)   # tool calls the box refused, as the agent made them
+    findings: list[str] = field(default_factory=list)  # a self-review's asks, one per line
+    review: dict | None = None                         # the self-review of this run's change, once made
 
     def to_dict(self) -> dict:
         return self.__dict__.copy()
@@ -170,11 +180,16 @@ def environment(cli_bin: Path | None = None, base: dict[str, str] | None = None,
     return sandbox.environment(cli_bin.parent if cli_bin else None, home, model_key=True, base=base)
 
 
-def _command(prompt: str, cfg: Config, protect: Sequence[Path] = (), checks: Sequence[str] = ()) -> list[str]:
-    deny = [*DISALLOWED_TOOLS, *(f"{tool}(/{p}/**)" for p in protect for tool in ("Edit", "Write", "MultiEdit"))]
+def _command(prompt: str, cfg: Config, protect: Sequence[Path] = (), checks: Sequence[str] = (),
+             edits: bool = True) -> list[str]:
+    deny = [*DISALLOWED_TOOLS, *(f"{tool}(/{p}/**)" for p in protect for tool in EDIT_TOOLS)]
+    if not edits:
+        # The whole tools, and the default mode: `acceptEdits` also waves
+        # through a few filesystem commands, which a reader has no use for.
+        deny += [*EDIT_TOOLS, "NotebookEdit"]
     args = [
-        "claude", "-p", prompt, "--output-format", "json", "--permission-mode", "acceptEdits",
-        "--allowedTools", *allowed_tools(checks), "--disallowedTools", *deny,
+        "claude", "-p", prompt, "--output-format", "json", "--permission-mode", "acceptEdits" if edits else "default",
+        "--allowedTools", *allowed_tools(checks, edits), "--disallowedTools", *deny,
         "--max-turns", str(cfg.agent_turns), "--max-budget-usd", str(cfg.agent_usd),
     ]
     if cfg.agent_model:
@@ -225,30 +240,46 @@ def _read_result(raw: bytes, out: AgentResult) -> None:
     out.outcome = str(data.get("outcome") or "partial")
     out.summary = str(data.get("summary") or "")
     out.category = str(data.get("category") or "")
-    verified = data.get("verified") or []
-    out.verified = [str(v) for v in verified] if isinstance(verified, list) else [str(verified)]
+    out.verified = _strings(data.get("verified"))
     upstream = data.get("upstream")
     out.upstream = upstream if isinstance(upstream, dict) and upstream else None
     out.notes = str(data.get("notes") or "")
+    out.findings = _strings(data.get("findings"))
+
+
+def _strings(value: object) -> list[str]:
+    """A list field as the agent wrote it: a list of strings, a lone string
+    as one item, blanks dropped."""
+    items = value if isinstance(value, list) else [value]
+    return [str(v) for v in items if v is not None and str(v).strip()]
+
+
+def verdict_bytes(text: str) -> bytes | None:
+    """The JSON object in a reviewer's final message, fences and prose
+    around it dropped, as the bytes `_read_result` reads; None without one."""
+    start, end = text.find("{"), text.rfind("}")
+    return text[start:end + 1].encode("utf-8") if 0 <= start < end else None
 
 
 def run(ws: Workspace, prompt: str, cfg: Config, cli_bin: Path | None = None, timeout: int = 3600,
         protect: Sequence[Path] = (), preflight: Callable[[], str | None] | None = None,
-        checked: set[Path] | None = None, checks: Sequence[str] = ()) -> AgentResult:
+        checked: set[Path] | None = None, checks: Sequence[str] = (), edits: bool = True) -> AgentResult:
     """One boxed run. `protect` are absolute paths outside the clone the agent
     must not edit (the run's venvs); `timeout` comes from the run, so an
     agent never outlives the token the steward will push with. `preflight`
     says why the agent cannot run, or None; a run passes its own cached
     answer, so the probe runs once per run, not once per order. `checked`
     holds the CLIs already proven to run as the agent user, likewise.
-    `checks` are the `slopstopper run` targets the agent may call."""
+    `checks` are the `slopstopper run` targets the agent may call. Without
+    `edits` the run is a reader (the self-review): no writing tool, and its
+    verdict is its final message, read the way a result file is."""
     why_not = (preflight or available)()
     if why_not:
         return AgentResult(False, error=why_not)
     (ws.path / ".steward-prompt.md").write_text(prompt, encoding="utf-8")
     result_path = ws.path / RESULT_FILE
     result_path.unlink(missing_ok=True)
-    argv, rejected = _command(prompt, cfg, protect, checks), []
+    argv, rejected = _command(prompt, cfg, protect, checks, edits), []
     try:
         proc, raw = _launch(ws, argv, cli_bin, timeout, rejected, checked)
     except subprocess.TimeoutExpired:
@@ -263,15 +294,23 @@ def run(ws: Workspace, prompt: str, cfg: Config, cli_bin: Path | None = None, ti
     meta = _meta(proc.stdout)
     out = AgentResult(True, cost_usd=meta.get("total_cost_usd"), turns=meta.get("num_turns"), denied=_denied(meta),
                       model=_model(meta))
+    if not edits:
+        raw = verdict_bytes(str(meta.get("result") or ""))
     if raw is not None:
         _read_result(raw, out)
     else:
-        out.outcome = "partial" if ws.dirty() else "skipped"
-        out.error = (meta.get("result") or proc.stderr.strip()[-500:] or "agent left no result file")[:500]
-        if proc.returncode < 0 or proc.returncode >= 128:
-            out.error = f"the agent was killed by a signal (exit {proc.returncode}; out of memory?). {out.error}"[:500]
+        _no_result(out, ws, meta, proc)
     out.notes = " ".join(n for n in (out.notes, _rejected_note(rejected)) if n)
     return out
+
+
+def _no_result(out: AgentResult, ws: Workspace, meta: dict, proc: subprocess.CompletedProcess) -> None:
+    """A run that left no result (file or verdict): partial if it changed
+    the tree, else skipped, with whatever it said last as the error."""
+    out.outcome = "partial" if ws.dirty() else "skipped"
+    out.error = (meta.get("result") or proc.stderr.strip()[-500:] or "agent left no result file")[:500]
+    if proc.returncode < 0 or proc.returncode >= 128:
+        out.error = f"the agent was killed by a signal (exit {proc.returncode}; out of memory?). {out.error}"[:500]
 
 
 def _launch(ws: Workspace, argv: list[str], cli_bin: Path | None, timeout: int, rejected: list[str],
