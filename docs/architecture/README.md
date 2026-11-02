@@ -127,7 +127,10 @@ flowchart TB
 6. **settle** waits for the PR's own checks, the last verifier: the
    browser and API checks only exist there. It polls the head commit's
    check runs (`ci.wait_minutes` per wait, inside the run's token
-   deadline). A red slopstopper check goes to the agent with the tail of
+   deadline) until every run is complete, each PR-triggered `ss-*`
+   workflow has reported and the set has held still for 90 seconds, or
+   the runs have been complete and still for 5 minutes (a workflow a
+   `paths:` filter kept from running never reports). A red slopstopper check goes to the agent with the tail of
    its job log and the triage skill, on the same branch; the steward
    pushes and waits again, up to `ci.fix_rounds` times. Green: the body
    says so. Red, out of rounds or out of time: the PR becomes a draft
