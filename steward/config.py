@@ -21,6 +21,16 @@ Configuration
     ci.fix_rounds            Agent attempts at a red PR before it is drafted. Default 2.
     agent.enabled            false disables every agentic order; upgrades still run.
     agent.model              Model name handed to claude --model (empty: the CLI default).
+    agent.self_review        After an agent run that changed the tree, a second, read-only run
+                             reviews the pending diff; changes it asks for get one correction
+                             round. A review left unanswered makes the PR a draft. Default true.
+    merge.auto               Merge a steward PR itself once its checks are green and the run
+                             has nothing left against it (no draft, no red, no open review).
+                             Default false.
+    merge.kinds              Which order kinds may be merged: upgrade, refresh, triage.
+                             Default [upgrade, refresh].
+    merge.method             squash | merge | rebase. Default squash.
+    merge.delete_branch      Delete the steward branch after the merge. Default true.
     labels.pr                Labels on every steward PR.
     labels.ignore            An issue carrying this label is never picked up.
     slopstopper.repo         Where slopstopper lives (bugs go here; skills are fetched here).
@@ -37,6 +47,8 @@ from steward import yamlish
 DEFAULT_PATH = Path("steward.yml")
 MODES = ("plan", "pr")
 POLICIES = ("latest", "minor", "patch")
+MERGE_METHODS = ("squash", "merge", "rebase")
+ORDER_KINDS = ("upgrade", "refresh", "triage")
 
 
 @dataclass
@@ -57,6 +69,11 @@ class Config:
     ci_wait_minutes: int = 20
     ci_fix_rounds: int = 2
     agent_model: str = ""
+    self_review: bool = True
+    merge_auto: bool = False
+    merge_kinds: list[str] = field(default_factory=lambda: ["upgrade", "refresh"])
+    merge_method: str = "squash"
+    merge_delete_branch: bool = True
     pr_labels: list[str] = field(default_factory=lambda: ["slopstopper", "steward"])
     ignore_label: str = "steward:ignore"
     slopstopper_repo: str = "hungovercoders/slopstopper"
@@ -104,7 +121,7 @@ def from_dict(data: dict) -> Config:
     budgets, agent, labels, ss = (
         _section(data, "budgets"), _section(data, "agent"), _section(data, "labels"), _section(data, "slopstopper"),
     )
-    ci = _section(data, "ci")
+    ci, merge = _section(data, "ci"), _section(data, "merge")
     cfg = Config(
         orgs=orgs,
         include=_listof(repos.get("include"), "repos.include"),
@@ -122,16 +139,38 @@ def from_dict(data: dict) -> Config:
         ci_wait_minutes=_num(ci, "wait_minutes", 20, int),
         ci_fix_rounds=_num(ci, "fix_rounds", 2, int),
         agent_model=str(agent.get("model") or ""),
+        self_review=agent.get("self_review") is not False,
+        **_merge(merge),
         pr_labels=_listof(labels.get("pr"), "labels.pr") or ["slopstopper", "steward"],
         ignore_label=str(labels.get("ignore") or "steward:ignore"),
         slopstopper_repo=str(ss.get("repo") or "hungovercoders/slopstopper"),
         package=str(ss.get("package") or "slopstopper-cli"),
     )
+    _check(cfg)
+    return cfg
+
+
+def _merge(section: dict) -> dict:
+    """The `merge:` keys. `auto` is on only for a real `true`."""
+    kinds = section.get("kinds")
+    return {
+        "merge_auto": section.get("auto") is True,
+        "merge_kinds": _listof(kinds, "merge.kinds") if kinds is not None else ["upgrade", "refresh"],
+        "merge_method": str(section.get("method") or "squash"),
+        "merge_delete_branch": section.get("delete_branch") is not False,
+    }
+
+
+def _check(cfg: Config) -> None:
     if cfg.mode not in MODES:
         raise ValueError(f"steward.yml: mode must be one of {MODES}, not {cfg.mode!r}")
     if cfg.policy not in POLICIES:
         raise ValueError(f"steward.yml: upgrade.policy must be one of {POLICIES}, not {cfg.policy!r}")
-    return cfg
+    if cfg.merge_method not in MERGE_METHODS:
+        raise ValueError(f"steward.yml: merge.method must be one of {MERGE_METHODS}, not {cfg.merge_method!r}")
+    odd = [k for k in cfg.merge_kinds if k not in ORDER_KINDS]
+    if odd:
+        raise ValueError(f"steward.yml: merge.kinds must be among {ORDER_KINDS}, not {odd}")
 
 
 def load(path: Path = DEFAULT_PATH) -> Config:

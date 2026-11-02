@@ -156,7 +156,108 @@ def _agent_section(result: AgentResult | None) -> str:
         text += f"\n\nNotes: {result.notes}"
     if result.denied:
         text += "\n\nRefused by the agent's box: " + "; ".join(f"`{d}`" for d in result.denied)
+    return text + _self_review_text(result.review)
+
+
+def _ran(row: dict) -> str:
+    return ", ".join(x for x in (row.get("model") or "", f"${row['cost_usd']:.2f}" if row.get("cost_usd") is not None else "",
+                                f"{row['turns']} turns" if row.get("turns") is not None else "") if x)
+
+
+def _self_review_text(review: dict | None) -> str:
+    if not review:
+        return ""
+    ran, none = _ran(review), review["outcome"] == "no verdict"
+    text = f"\n\n**Self-review ({review['outcome']}{'; ' + ran if ran else ''}):** {review['note'] if none else review['summary']}"
+    if review["findings"]:
+        text += "\n" + "\n".join(f"- {f}" for f in review["findings"])
+    fix = review.get("correction")
+    if fix:
+        ran = _ran(fix)
+        text += (f"\n\nCorrection round ({fix['outcome']}{'; ' + ran if ran else ''}): {fix['summary'] or fix['error']}"
+                 + (f" Notes: {fix['notes']}" if fix["notes"] else ""))
+    if review["note"] and not none:
+        text += f"\n\n{review['note']}"
     return text
+
+
+def _review_blocks(result: AgentResult | None) -> str:
+    """Why the agent's self-review keeps the PR a draft, or "": a review that
+    asked for changes and did not get them. No verdict never blocks."""
+    if result and result.review and not result.review.get("settled", True):
+        return f"its self-review asked for changes that were not made ({result.review['note']})"
+    return ""
+
+
+def _blocked_section(blocked: str) -> str:
+    return (f"### Self-review not settled\n\nOpened as a draft: {blocked}. The findings are above; "
+            "address them on this branch before merging.\n\n") if blocked else ""
+
+
+VERDICTS = ("approved", "changes-requested")
+
+
+def _agent_pass(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, cli: Path,
+                ctx: RunContext, brief: str, checks: list[str], apart: list[str]) -> AgentResult:
+    """One agent run, then its self-review when it changed the tree: a
+    read-only second run over the pending diff, and one correction round
+    when that asks for changes. The result is the first run's, with the
+    review on it; a correction left `partial` makes the result partial."""
+    before = refresh.fingerprint(ws)
+    result = agent.run(ws, brief, cfg, cli, timeout=ctx.agent_timeout(), protect=ctx.protected(),
+                       preflight=ctx.agent_unavailable, checked=ctx.checked_clis, checks=checks)
+    if not cfg.self_review or not result.ran or result.error or refresh.fingerprint(ws) == before:
+        return result
+    result.review = _self_review(order, inv, cfg, ws, cli, ctx, result, checks)
+    if result.review["outcome"] == "changes-requested":
+        _correct(order, inv, cfg, ws, cli, ctx, result, checks, apart)
+    return result
+
+
+def _self_review(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, cli: Path,
+                 ctx: RunContext, result: AgentResult, checks: list[str]) -> dict:
+    """The reviewer's verdict on `.steward-change.md`. Anything but a clear
+    verdict reads as none, which never blocks; a reviewer that changed the
+    tree (it has no editing tool, but Bash can redirect) is not trusted."""
+    (ws.path / ".steward-change.md").write_text(refresh.change_diff(ws), encoding="utf-8")
+    before = refresh.fingerprint(ws)
+    verdict = agent.run(ws, prompts.self_review(order, inv, result.summary, checks), cfg, cli,
+                        timeout=ctx.agent_timeout(), protect=ctx.protected(), preflight=ctx.agent_unavailable,
+                        checked=ctx.checked_clis, checks=checks, edits=False)
+    review = {"outcome": verdict.outcome, "summary": verdict.summary, "findings": verdict.findings, "corrected": False,
+              "settled": True, "note": "", "cost_usd": verdict.cost_usd, "turns": verdict.turns, "model": verdict.model}
+    if not verdict.ran or verdict.error:
+        review.update(outcome="no verdict", note=f"the reviewer did not finish: {verdict.error}")
+    elif refresh.fingerprint(ws) != before:
+        review.update(outcome="no verdict", note="the reviewer changed the tree, which it must not, so its verdict is not used")
+    elif verdict.outcome not in VERDICTS:
+        review.update(outcome="no verdict", note=f"the reviewer gave no verdict ({verdict.outcome or 'empty'})")
+    elif verdict.outcome == "changes-requested" and not verdict.findings:
+        review["outcome"] = "approved"   # the brief says so: no finding is an approval
+    return review
+
+
+def _correct(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, cli: Path,
+             ctx: RunContext, result: AgentResult, checks: list[str], apart: list[str]) -> None:
+    """The one correction round. `fixed` settles the review, whether the
+    agent changed the tree or answered a finding in its notes; anything
+    else leaves it open, and the PR a draft."""
+    review = result.review
+    (ws.path / ".steward-review.md").write_text("# Self-review findings\n\n" + "\n".join(f"- {f}" for f in review["findings"])
+                                                + "\n", encoding="utf-8")
+    before = refresh.fingerprint(ws)
+    fix = agent.run(ws, prompts.correct(order, inv, review["findings"], cfg.slopstopper_repo, checks, apart), cfg, cli,
+                    timeout=ctx.agent_timeout(), protect=ctx.protected(), preflight=ctx.agent_unavailable,
+                    checked=ctx.checked_clis, checks=checks)
+    review["correction"] = {"outcome": fix.outcome, "summary": fix.summary, "notes": fix.notes, "error": fix.error,
+                            "cost_usd": fix.cost_usd, "turns": fix.turns, "model": fix.model}
+    review["corrected"] = fix.ran and refresh.fingerprint(ws) != before
+    review["settled"] = fix.ran and not fix.error and fix.outcome == "fixed"
+    result.denied += fix.denied
+    if fix.ran and fix.outcome == "partial":
+        result.outcome, result.notes = "partial", " ".join(n for n in (result.notes, fix.notes) if n)
+    if not review["settled"]:
+        review["note"] = f"the correction round did not settle it: {fix.error or fix.notes or fix.summary or fix.outcome}"
 
 
 def _upstream_section(result: AgentResult, cfg: Config) -> str:
@@ -202,8 +303,7 @@ def _review(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.W
     brief = prompts.review(order, inv, order.details["review"], marks, red, cfg.slopstopper_repo,
                            start=start, checks=checks, apart=apart)
     before = refresh.fingerprint(ws)
-    result = agent.run(ws, brief, cfg, cli, timeout=ctx.agent_timeout(), protect=ctx.protected(),
-                       preflight=ctx.agent_unavailable, checked=ctx.checked_clis, checks=checks)
+    result = _agent_pass(order, inv, cfg, ws, cli, ctx, brief, checks, apart)
     if result.ran and refresh.fingerprint(ws) != before:
         red, unverified = _verify_pass(ws, cli, ctx)
     return red, unverified, result, _unreviewed(result)
@@ -298,8 +398,7 @@ def _settle_red(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspa
     agent.ensure_skills(ws, order.target, cfg.slopstopper_repo)
     checks, apart = _runnable(ws, cli)
     brief = prompts.verify(order, inv, red, cfg.slopstopper_repo, checks=checks, apart=apart)
-    result = agent.run(ws, brief, cfg, cli, timeout=ctx.agent_timeout(), protect=ctx.protected(),
-                       preflight=ctx.agent_unavailable, checked=ctx.checked_clis, checks=checks)
+    result = _agent_pass(order, inv, cfg, ws, cli, ctx, brief, checks, apart)
     if not result.ran:
         return red, unverified, result
     red, unverified = _verify_pass(ws, cli, ctx)
@@ -361,13 +460,44 @@ def _settle_ci(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspac
             info["note"] = f"the wait stopped: {_failure(exc)}"
     not_green = bool(info["failing"] or info["timed_out"])
     number = workspace.pr_number(url)
+    status = "draft" if draft or not_green else "pr"
+    if status == "pr":
+        status = _merge(order, cfg, number, info)
     try:
-        workspace.update_pr_body(order.repo, number, _with_section(body, _ci_section(info)))
+        workspace.update_pr_body(order.repo, number, _with_section(body, _ci_section(info) + _merge_section(info)))
         if not_green and not draft:
             workspace.set_draft(order.repo, number)
     except Exception as exc:
         info["note"] = (info["note"] + " " if info["note"] else "") + f"the PR could not be updated: {_failure(exc)}"
-    return ("draft" if draft or not_green else "pr"), info
+    return status, info
+
+
+def _merge(order: Order, cfg: Config, number: int, info: dict) -> str:
+    """Merge a ready PR when `merge.auto` covers its kind and the steward
+    saw its checks green itself: a wait that was skipped, stopped or saw
+    no check proves nothing, and the PR is left for a person. Returns the
+    order's status, `merged` or `pr`."""
+    if not cfg.merge_auto or order.kind not in cfg.merge_kinds:
+        return "pr"
+    if not info["waited"] or not info.get("checks") or info["note"]:
+        info["merge_note"] = info["note"] or "the steward saw no check on the PR, so it has nothing green to merge on"
+        return "pr"
+    try:
+        workspace.merge_pr(order.repo, number, cfg.merge_method, cfg.merge_delete_branch)
+    except Exception as exc:  # a protected base, a review rule: the PR stays ready, the body says why
+        info["merge_note"] = _failure(exc)
+        return "pr"
+    info["merged"], info["merge_method"] = True, cfg.merge_method
+    return "merged"
+
+
+def _merge_section(info: dict) -> str:
+    if info.get("merged"):
+        return (f"### Merged\n\nThe steward merged this PR ({info['merge_method']}) once its checks were green: "
+                "`merge.auto` is on in its steward.yml.\n\n")
+    if info.get("merge_note"):
+        return f"### Not merged\n\n`merge.auto` is on, but {info['merge_note']}. Merge it by hand once read.\n\n"
+    return ""
 
 
 def _ci_loop(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, cli: Path | None,
@@ -418,11 +548,14 @@ def _ci_fix_round(order: Order, inv: inventory.Inventory, cfg: Config, ws: works
     (ws.path / ".steward-ci-failures.md").write_text(ci.failures_markdown(ours, tails), encoding="utf-8")
     checks, apart = _runnable(ws, cli)
     brief = prompts.ci_fix(order, inv, ours, cfg.slopstopper_repo, checks=checks, apart=apart)
-    result = agent.run(ws, brief, cfg, cli, timeout=ctx.agent_timeout(), protect=ctx.protected(),
-                       preflight=ctx.agent_unavailable, checked=ctx.checked_clis, checks=checks)
+    result = _agent_pass(order, inv, cfg, ws, cli, ctx, brief, checks, apart)
     info["agent"].append(result.to_dict())
     if not result.ran or not ws.dirty():
         info["note"] = f"the agent changed nothing in round {number}: {result.summary or result.error}"
+        return False
+    blocked = _review_blocks(result)
+    if blocked:
+        info["note"] = f"the agent's round {number} was not pushed: {blocked}"
         return False
     info["locks"] += _sync_locks(ws)
     red = _verify_after_fix(order, ws, cli, ctx)
@@ -485,10 +618,11 @@ def work_refresh(order: Order, inv: inventory.Inventory, cfg: Config, ws: worksp
     summary = _refresh_summary(order, inv, moved) + _agent_section(result)
     extra = _review_section(order, unreviewed)
     extra += _red_section("Still red after the refresh", red, "Opened as a draft: settle these before merging.\n\n")
-    extra += _locks_section(locks) + _unverified_section(unverified)
+    blocked = _review_blocks(result)
+    extra += _blocked_section(blocked) + _locks_section(locks) + _unverified_section(unverified)
     if notes:
         extra += f"<details><summary>Release notes between the two pins</summary>\n\n{notes}\n</details>\n"
-    draft = bool(red or unreviewed or any(r["status"] == "failed" for r in locks))
+    draft = bool(red or unreviewed or blocked or any(r["status"] == "failed" for r in locks))
     body = _pr_body(order, cfg, summary, extra)
     url = workspace.open_pr(ws, order.title, body, cfg.pr_labels, draft=draft)
     status, ci_info = _settle_ci(order, inv, cfg, ws, cli, ctx, url, body, draft)
@@ -545,8 +679,7 @@ def work_triage(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspa
     agent.ensure_skills(ws, version, cfg.slopstopper_repo)
     checks, apart = _runnable(ws, cli)
     brief = prompts.triage(order, inv, issue.get("body") or "", cfg.slopstopper_repo, checks=checks, apart=apart)
-    result = agent.run(ws, brief, cfg, cli, timeout=ctx.agent_timeout(), protect=ctx.protected(),
-                       preflight=ctx.agent_unavailable, checked=ctx.checked_clis, checks=checks)
+    result = _agent_pass(order, inv, cfg, ws, cli, ctx, brief, checks, apart)
     if not result.ran:
         return Outcome(order.to_dict(), "skipped", detail=result.error, agent=result.to_dict())
     red, unverified = _recheck(order, ws, cli, ctx)
@@ -564,10 +697,11 @@ def _triage_pr(order: Order, cfg: Config, ws: workspace.Workspace, result: Agent
     not red; `Closes #N` only when the steward verified the check green."""
     assert order.finding
     extra = _red_section(f"`{order.finding.check}` is still red on this branch", red) + _upstream_section(result, cfg)
-    extra += _unverified_section(unverified)
+    blocked = _review_blocks(result)
+    extra += _blocked_section(blocked) + _unverified_section(unverified)
     if result.notes:
         extra += f"Notes: {result.notes}\n\n"
-    draft = bool(red) or result.outcome != "fixed"
+    draft = bool(red) or result.outcome != "fixed" or bool(blocked)
     body = _pr_body(order, cfg, _triage_summary(result), extra, closes=not red and not unverified)
     url = workspace.open_pr(ws, order.title, body, cfg.pr_labels, draft=draft)
     status, ci_info = ("draft" if draft else "pr"), None

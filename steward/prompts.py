@@ -127,14 +127,89 @@ green, `partial` when some stay for a person (say which in `notes`), `skipped` w
 """
 
 
+SELF_REVIEW = """\
+# Steward work order: review the change before it is pushed
+
+Repository: `{repo}` (default branch `{default_branch}`), profile `{profile}`.
+You are on branch `{branch}`. The steward's agent just worked this order: {what}.
+Its own account of the work: {summary}
+
+You are the second pair of eyes, and you can change nothing: no editing tool is available to you.
+`.steward-change.md` holds the whole pending change as a unified diff, which is what the steward will
+commit; read it, and the files it touches where the diff alone is not enough. Judge the change only:
+
+- Does it do what the order asked, the way the `slopstopper-triage` skill (or, for an upgrade, the
+  `slopstopper-install` skill's refresh section) says? Read the skill if you need its rules.
+- Does it break one of the steward's rules: a check disabled to go green, an `ss-*.yml` workflow,
+  `ss-*` action or `Taskfile.ss.yml` edited, the pin in `mise.toml` moved, a suppression or threshold
+  without a `# why` comment that holds up?
+- Does it leave something next to it broken: a reference to a file it moved, a lock out of step, a
+  doc that now states the wrong thing, a knob set in the wrong place?
+
+You may run these checks here, read-only, to confirm: {checks}. One plain command per Bash call, no
+`cd`, pipes or loops; any other command is refused with no one to approve it, so do not retry one.
+
+Reply with one JSON object and nothing else as your final message:
+
+```json
+{{"outcome": "approved" | "changes-requested",
+  "summary": "one or two sentences for the PR body",
+  "findings": ["<file>: <what is wrong, and what to do instead>", "..."]}}
+```
+
+`changes-requested` is for a defect in the change itself: wrong, unsafe, incomplete against the order,
+or against the rules above. Style is not a finding, and neither is work the order did not ask for.
+An empty `findings` means approved.
+"""
+
+
+CORRECT = """\
+# Steward work order: address the review of your change
+
+Repository: `{repo}` (default branch `{default_branch}`), profile `{profile}`.
+You are on branch `{branch}`. An earlier pass worked this order: {what}.
+A reviewer read the pending change (the diff as it then stood is in `.steward-change.md`, its
+findings in `.steward-review.md`) and asked for changes:
+
+{findings}
+
+Address each finding you agree with, in the tree. Where you disagree, leave it and say why in `notes`.
+The rules you worked under are unchanged:
+
+{guardrails}
+For this order, `outcome` is `fixed` when every finding is addressed or answered, `partial` when
+something is left for a person (say what in `notes`), `skipped` when you changed nothing.
+"""
+
+
+def _what(order) -> str:
+    return (f"the slopstopper-cli pin moved to `{order.target}`" if order.kind in ("upgrade", "refresh")
+            else f"a fix for #{order.finding.number} ({order.finding.check or 'a slopstopper finding'})"
+            if order.finding else "an order")
+
+
+def self_review(order, inv, summary: str, checks=()) -> str:
+    names = ", ".join(f"`{c}`" for c in checks) or "none (nothing this clone can verify)"
+    return SELF_REVIEW.format(
+        repo=order.repo, default_branch=order.default_branch, profile=inv.profile or "ui (default)",
+        branch=order.branch, what=_what(order), summary=summary.strip() or "(none given)", checks=names,
+    )
+
+
+def correct(order, inv, findings: list[str], slopstopper_repo: str, checks=(), apart=()) -> str:
+    return CORRECT.format(
+        repo=order.repo, default_branch=order.default_branch, profile=inv.profile or "ui (default)",
+        branch=order.branch, what=_what(order), findings="\n".join(f"- {f}" for f in findings) or "- (none listed)",
+        guardrails=_guardrails(slopstopper_repo, checks, apart),
+    )
+
+
 def ci_fix(order, inv, failures: list[dict], slopstopper_repo: str, checks=(), apart=()) -> str:
     rows = [f"- `{f['name']}` ({f['conclusion']}), workflow `{f['workflow'].rsplit('/', 1)[-1]}`: {f['url']}"
             for f in failures]
-    what = (f"the slopstopper-cli pin moved to `{order.target}`" if order.kind in ("upgrade", "refresh")
-            else f"a fix for #{order.finding.number}" if order.finding else "an order")
     return CI_FIX.format(
         repo=order.repo, default_branch=order.default_branch, profile=inv.profile or "ui (default)",
-        branch=order.branch, what=what, failures="\n".join(rows),
+        branch=order.branch, what=_what(order), failures="\n".join(rows),
         guardrails=_guardrails(slopstopper_repo, checks, apart),
     )
 

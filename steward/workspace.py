@@ -19,7 +19,8 @@ from steward import gh
 
 AUTHOR = ("slopstopper-steward", "steward@slopstopper.dev")
 LOCAL_ONLY = (".steward-result.json", ".steward-release-notes.md", ".steward-prompt.md", ".steward-venv/",
-              ".steward-suite-diff.md", ".steward-schema-diff.md", ".steward-ci-failures.md")
+              ".steward-suite-diff.md", ".steward-schema-diff.md", ".steward-ci-failures.md",
+              ".steward-change.md", ".steward-review.md")
 
 
 # Every git command the steward runs, before or after the agent, ignores
@@ -129,6 +130,18 @@ def update_pr_body(repo: str, number: int, body: str) -> None:
     result = gh.gh("pr", "edit", str(number), "-R", repo, "--body-file", "-", input=body)
     if result.returncode != 0:
         raise gh.GhError(f"pr edit {number} on {repo}: {result.stderr.strip()}")
+
+
+def merge_pr(repo: str, number: int, method: str = "squash", delete_branch: bool = True) -> None:
+    """Merge an open PR now, the way `merge.method` says. GitHub's own rules
+    still apply: a protected base that wants a review or a check the
+    steward did not wait for refuses, and the refusal is the error."""
+    args = ["pr", "merge", str(number), "-R", repo, f"--{method}"]
+    if delete_branch:
+        args.append("--delete-branch")
+    result = gh.gh(*args)
+    if result.returncode != 0:
+        raise gh.GhError(f"pr merge {number} on {repo}: {result.stderr.strip() or result.stdout.strip()}")
 
 
 def ensure_labels(repo: str, labels: list[str]) -> None:

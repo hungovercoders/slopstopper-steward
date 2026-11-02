@@ -10,10 +10,11 @@ artifact. Three tables:
 | Section | Holds |
 | ------- | ----- |
 | Adopters | each repo, its pin, PyPI's latest, the CLI that wrote its suite, open findings, the evidence it was found by |
-| Orders | each order worked and its status: `pr`, `draft`, `skipped` (with why), `failed` (with the error), `deferred` (the push token would expire before it finished; the next run picks it up), or `planned` in a dry run |
+| Orders | each order worked and its status: `pr`, `merged` (with `merge.auto`), `draft`, `skipped` (with why), `failed` (with the error), `deferred` (the push token would expire before it finished; the next run picks it up), or `planned` in a dry run |
 | Deferred / Skipped | what the budgets left for next time, orders with an open PR, disabled workflows that need an admin |
 
-Agent cost and turns are on the order's row when one ran.
+Agent cost and turns are on the order's row when one ran, with the
+self-review's verdict and cost after them.
 
 ## What each PR means
 
@@ -54,6 +55,23 @@ steward does not come back to a settled order. "Not awaited" means the run
 hit its time limit before the checks finished; the PR is ready and its
 checks are whatever the PR page shows. `ci.wait_minutes`, `ci.fix_rounds`
 and `ci.wait` in `steward.yml` set the limits.
+
+### "Self-review" and "Merged"
+
+Under the agent's own account of its work sits a second agent's verdict
+on the diff: "Self-review (approved)", or "changes-requested" with its
+findings and the correction round's answer. "Self-review not settled"
+means the findings were not addressed and the PR is a draft: read them,
+fix or dismiss them on the branch, and mark it ready. "No verdict" means
+the reviewer did not answer usably; nothing is held on it.
+
+"Merged" means `merge.auto` is on and the run merged its own PR once the
+checks were green; the run report's row says `merged`. "Not merged" means
+it was on but the merge did not happen (GitHub refused it, or the steward
+never saw the checks green itself); the PR is ready for a person. Turn it
+on in `steward.yml` once the self-review has earned it on a few PRs, and
+keep a branch rule on the base if a human review must stay in the loop:
+the steward merges with the token's rights and nothing more.
 
 ## Keeping the steward off something
 

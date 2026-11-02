@@ -159,6 +159,7 @@ def settle(monkeypatch, tmp_path):
     monkeypatch.setattr(workspace, "push", lambda ws, branch: seen.__setitem__("pushes", seen["pushes"] + 1))
     monkeypatch.setattr(workspace, "update_pr_body", lambda repo, number, body: seen.__setitem__("body", body))
     monkeypatch.setattr(workspace, "set_draft", lambda repo, number: seen.__setitem__("drafted", True))
+    monkeypatch.setattr(workspace, "merge_pr", lambda repo, number, method, delete: seen.__setitem__("merged", (number, method, delete)))
     order = plan.Order("upgrade-0.28.0", "upgrade", "acme/a", "t", "r", 0, "main", "0.28.0", "0.27.0")
     inv = Inventory(Repo("acme/a", pinned="0.27.0"), "0.28.0")
     ws = workspace.Workspace("acme/a", tmp_path, "main")
@@ -255,6 +256,81 @@ def test_an_already_draft_pr_is_not_drafted_twice(settle):
     waits.append(([_run("smoke-test", conclusion="failure")], False))
     status, info = go(from_dict({"orgs": ["acme"], "ci": {"fix_rounds": 0}}), draft=True)
     assert status == "draft" and not seen["drafted"]
+
+
+# ── merge.auto ──
+
+AUTO = from_dict({"orgs": ["acme"], "merge": {"auto": True}})
+
+
+def test_a_green_pr_is_merged_when_merge_auto_is_on(settle):
+    go, waits, seen = settle
+    waits.append(([_run("smoke-test"), _run("e2e", rid=2)], False))
+    status, info = go(AUTO)
+    assert status == "merged" and seen["merged"] == (7, "squash", True) and info["merged"]
+    assert "### Merged" in seen["body"] and "(squash)" in seen["body"] and "checks are green" in seen["body"]
+
+
+def test_merge_is_off_by_default_and_per_kind(settle):
+    go, waits, seen = settle
+    waits.append(([_run("smoke-test")], False))
+    assert go()[0] == "pr" and "merged" not in seen and "Merged" not in seen["body"]
+    waits.append(([_run("smoke-test")], False))
+    status, info = go(from_dict({"orgs": ["acme"], "merge": {"auto": True, "kinds": ["triage"]}}))
+    assert status == "pr" and "merged" not in seen and "merge_note" not in info
+
+
+def test_a_refused_merge_leaves_the_pr_ready_and_says_why(settle, monkeypatch):
+    go, waits, seen = settle
+    def refuse(repo, number, method, delete):
+        raise ci.gh.GhError("pr merge 7 on acme/a: Base branch requires 1 approving review")
+    monkeypatch.setattr(workspace, "merge_pr", refuse)
+    waits.append(([_run("smoke-test")], False))
+    status, info = go(AUTO)
+    assert status == "pr" and not seen["drafted"] and "requires 1 approving review" in info["merge_note"]
+    assert "### Not merged" in seen["body"] and "Merge it by hand" in seen["body"]
+
+
+def test_nothing_short_of_seen_green_is_merged(settle):
+    go, waits, seen = settle
+    waits.append(([_run("smoke-test", conclusion="failure")], False))
+    assert go(from_dict({"orgs": ["acme"], "merge": {"auto": True}, "ci": {"fix_rounds": 0}}))[0] == "draft"
+    waits.append(([_run("smoke-test")], False))
+    assert go(AUTO, draft=True)[0] == "draft"                       # a draft is a person's
+    waits.append(([], True))
+    status, info = go(AUTO)                                           # no check ran: nothing green to merge on
+    assert status == "pr" and "no check ran on the PR" in info["merge_note"]
+    status, info = go(from_dict({"orgs": ["acme"], "merge": {"auto": True}, "ci": {"wait": False}}))
+    assert status == "pr" and info["merge_note"] == "ci.wait is off"
+    assert "merged" not in seen
+
+
+def test_a_merge_follows_a_fix_round_too(settle):
+    go, waits, seen = settle
+    waits += [([_run("smoke-test", conclusion="failure")], False), ([_run("smoke-test", rid=5)], False)]
+    status, info = go(from_dict({"orgs": ["acme"], "merge": {"auto": True, "method": "merge", "delete_branch": False}}))
+    assert status == "merged" and seen["merged"] == (7, "merge", False) and info["rounds"] == 1
+
+
+def test_merge_pr_runs_gh(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(workspace.gh, "gh", lambda *a, **k: seen.update(args=a) or subprocess.CompletedProcess([], 0, "", ""))
+    workspace.merge_pr("acme/a", 7, "squash", True)
+    assert seen["args"] == ("pr", "merge", "7", "-R", "acme/a", "--squash", "--delete-branch")
+    workspace.merge_pr("acme/a", 7, "rebase", False)
+    assert seen["args"] == ("pr", "merge", "7", "-R", "acme/a", "--rebase")
+    monkeypatch.setattr(workspace.gh, "gh", lambda *a, **k: subprocess.CompletedProcess([], 1, "", "GraphQL: Pull request is in clean status"))
+    with pytest.raises(ci.gh.GhError, match="clean status"):
+        workspace.merge_pr("acme/a", 7)
+
+
+def test_an_unsettled_review_in_a_fix_round_is_not_pushed(settle, monkeypatch):
+    go, waits, seen = settle
+    monkeypatch.setattr(runner, "_review_blocks", lambda result: "its self-review asked for changes that were not made (x)")
+    waits.append(([_run("smoke-test", conclusion="failure")], False))
+    status, info = go(AUTO)
+    assert status == "draft" and seen["pushes"] == 0 and "was not pushed: its self-review asked" in seen["body"]
+    assert "merged" not in seen
 
 
 def test_ci_budget_respects_the_deadline():

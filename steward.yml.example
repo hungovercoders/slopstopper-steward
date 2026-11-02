@@ -29,6 +29,13 @@ ci:
 agent:
   enabled: true            # false: upgrades still run, findings are reported not worked
   model: ""                # handed to `claude --model` (an alias like sonnet, or an id); empty uses the CLI default. The PR and report name what ran
+  self_review: true        # a read-only second run reviews the agent's diff; one correction round; unanswered, the PR is a draft
+
+merge:
+  auto: false              # true: a green PR of a kind below is merged by the run that opened it (drafts and refusals are left ready)
+  kinds: [upgrade, refresh] # upgrade | refresh | triage
+  method: squash           # squash | merge | rebase
+  delete_branch: true      # delete the steward/<order> branch after the merge
 
 labels:
   pr: [slopstopper, steward]

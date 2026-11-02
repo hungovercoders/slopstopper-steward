@@ -20,7 +20,7 @@ def _cell(text: object, limit: int = 300) -> str:
 @dataclass
 class Outcome:
     order: dict
-    status: str  # pr | draft | skipped | failed | planned
+    status: str  # pr | merged | draft | skipped | failed | deferred | planned
     pr_url: str = ""
     detail: str = ""
     agent: dict | None = None
@@ -100,7 +100,13 @@ def _agent_cell(agent: dict | None) -> str:
     if not agent or agent.get("cost_usd") is None:
         return ""
     model = f", {agent['model']}" if agent.get("model") else ""
-    return f" (agent ${agent['cost_usd']:.2f}, {agent.get('turns')} turns{model})"
+    review = agent.get("review") or {}
+    tail = ""
+    if review.get("outcome"):
+        tail = f"; self-review {review['outcome']}" + (", corrected" if review.get("corrected") else "")
+        if review.get("cost_usd") is not None:
+            tail += f" ${review['cost_usd']:.2f}"
+    return f" (agent ${agent['cost_usd']:.2f}, {agent.get('turns')} turns{model}{tail})"
 
 
 def _ci_cell(ci: dict | None) -> str:
@@ -115,4 +121,9 @@ def _ci_cell(ci: dict | None) -> str:
         return f" · CI red after {rounds} fix round(s): {names}"
     if ci.get("timed_out"):
         return f" · CI still running after {ci.get('waited_minutes', '?')} min"
-    return " · CI green" + (f" after {rounds} fix round(s)" if rounds else "")
+    green = " · CI green" + (f" after {rounds} fix round(s)" if rounds else "")
+    if ci.get("merged"):
+        return green + " · merged"
+    if ci.get("merge_note"):
+        return green + f" · not merged ({ci['merge_note']})"
+    return green

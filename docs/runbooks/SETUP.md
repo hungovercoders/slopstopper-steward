@@ -27,7 +27,10 @@ Developer settings → GitHub Apps) with repository permissions
 *Contents: read and write*, *Workflows: read and write*, *Pull requests:
 read and write*, *Issues: read*, *Checks: read*, *Actions: read*,
 *Metadata: read*. *Checks* and *Actions* are what let the steward wait for
-a PR's own checks and read a failing job's log.
+a PR's own checks and read a failing job's log. The same *Contents* and
+*Pull requests* rights let it merge with `merge.auto`; a base branch rule
+requiring a review or a status check the steward does not wait for makes
+GitHub refuse that merge, which the PR body then reports.
 *Workflows* is what lets an upgrade or refresh push the `ss-*.yml` files
 `slopstopper install` rewrites: without it GitHub refuses the push, and
 the order fails with that refusal. Install it on the adopter repos (or
