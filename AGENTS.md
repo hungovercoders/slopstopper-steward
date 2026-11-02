@@ -25,9 +25,9 @@ the steward only drives them. It also has slopstopper installed on itself
 3. **Every write is a PR on a `steward/<order>` branch**, carrying
    `<!-- steward:order=<id> -->`, except a fix commit pushed onto a
    Dependabot PR's own branch (`dependabot.enabled`), fast-forward only.
-   Never a push to a default branch. A merge only with `merge.auto`, of a
-   PR the steward opened and saw green in the same run. One open PR per
-   order; re-runs are idempotent.
+   Never a push to a default branch. A merge only of a PR the steward saw
+   green in the same run: its own with `merge.auto`, Dependabot's with
+   `dependabot.merge`. One open PR per order; re-runs are idempotent.
 4. **Exit codes follow slopstopper's:** 0 ran clean, 1 ran and failed, 2
    could not run. `--json` prints one value and nothing else.
 5. **Conventional Commits.** Third-party actions are pinned to a commit SHA.

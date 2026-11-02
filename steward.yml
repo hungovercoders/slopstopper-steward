@@ -39,9 +39,12 @@ agent:
 dependabot:
   # Dependabot's open PRs on these repos are orders too: the steward waits
   # for each one's checks and, red, fixes on Dependabot's own branch (one
-  # comment on the PR says what it did). It never merges one.
+  # comment on the PR says what it did). Green, it merges a patch or minor
+  # bump itself; the major ones are listed and left to a person.
   enabled: true
   updates: [patch, minor]
+  merge: true
+  budget: 10
 
 merge:
   # Off until the self-review has been read on a few PRs. On, a green

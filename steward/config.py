@@ -35,6 +35,12 @@ Configuration
                              red, fix on Dependabot's own branch within `ci.fix_rounds`. The
                              steward never merges one. Default false.
     dependabot.updates       Which bumps it may work: patch, minor, major. Default [patch, minor].
+    dependabot.merge         Merge a Dependabot PR whose checks the steward saw green, by
+                             `merge.method`, deleting the branch per `merge.delete_branch`.
+                             Independent of `merge.auto`, which covers the steward's own PRs.
+                             Default false.
+    dependabot.budget        Dependabot PRs worked per repo per run, apart from
+                             `budgets.prs_per_repo` (which counts open steward PRs). Default 5.
     labels.pr                Labels on every steward PR.
     labels.ignore            An issue carrying this label is never picked up.
     slopstopper.repo         Where slopstopper lives (bugs go here; skills are fetched here).
@@ -52,7 +58,7 @@ DEFAULT_PATH = Path("steward.yml")
 MODES = ("plan", "pr")
 POLICIES = ("latest", "minor", "patch")
 MERGE_METHODS = ("squash", "merge", "rebase")
-ORDER_KINDS = ("upgrade", "refresh", "triage")   # the kinds merge.kinds may name: a Dependabot PR is never merged
+ORDER_KINDS = ("upgrade", "refresh", "triage")   # the kinds merge.kinds may name; Dependabot PRs have dependabot.merge
 LEVELS = ("patch", "minor", "major")
 
 
@@ -81,6 +87,8 @@ class Config:
     merge_delete_branch: bool = True
     dependabot_enabled: bool = False
     dependabot_updates: list[str] = field(default_factory=lambda: ["patch", "minor"])
+    dependabot_merge: bool = False
+    dependabot_budget: int = 5
     pr_labels: list[str] = field(default_factory=lambda: ["slopstopper", "steward"])
     ignore_label: str = "steward:ignore"
     slopstopper_repo: str = "hungovercoders/slopstopper"
@@ -151,6 +159,8 @@ def from_dict(data: dict) -> Config:
         dependabot_enabled=bot.get("enabled") is True,
         dependabot_updates=_listof(bot.get("updates"), "dependabot.updates") if bot.get("updates") is not None
         else ["patch", "minor"],
+        dependabot_merge=bot.get("merge") is True,
+        dependabot_budget=_num(bot, "budget", 5, int),
         pr_labels=_listof(labels.get("pr"), "labels.pr") or ["slopstopper", "steward"],
         ignore_label=str(labels.get("ignore") or "steward:ignore"),
         slopstopper_repo=str(ss.get("repo") or "hungovercoders/slopstopper"),
