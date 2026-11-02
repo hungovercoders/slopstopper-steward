@@ -139,9 +139,23 @@ def run_apart(user: str, clone: Path, argv: Sequence[str], env: Mapping[str, str
     copy is removed after. For a check that installs and runs the repo's
     own code: that code then runs as a user holding no token and no model
     key, apart from the steward's clone and the agent's processes."""
+    return run_apart_bring(user, clone, argv, env, path_first, timeout)[0]
+
+
+def run_apart_bring(user: str, clone: Path, argv: Sequence[str], env: Mapping[str, str], path_first: Path | None,
+                    timeout: int, bring: Sequence[str] = ()) -> tuple[subprocess.CompletedProcess, dict[str, bytes]]:
+    """`run_apart`, also bringing back the named clone-relative files as the
+    copy left them (read as the agent user, so the steward never reads the
+    copy itself). A file the copy lacks is left out."""
     with copy_for(user, clone) as iso:
         cmd = command(iso, argv, env, path_first, timeout=timeout)
-        return subprocess.run(cmd, capture_output=True, text=True, env=dict(env), timeout=timeout + KILL_AFTER + 60)
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=dict(env), timeout=timeout + KILL_AFTER + 60)
+        files: dict[str, bytes] = {}
+        for rel in bring:
+            done = _sudo(user, "cat", str(iso.tree / rel), check=False, timeout=120)
+            if done.returncode == 0:
+                files[rel] = done.stdout.encode("utf-8")
+        return proc, files
 
 
 def unavailable(user: str, program: str = "claude") -> str | None:

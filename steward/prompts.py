@@ -104,6 +104,39 @@ when you could not do the review.
 """
 
 
+CI_FIX = """\
+# Steward work order: settle the pull request's failing checks
+
+Repository: `{repo}` (default branch `{default_branch}`), profile `{profile}`.
+You are on branch `{branch}`, the branch of an open pull request the steward made ({what}).
+The pull request's own CI ran, and these slopstopper checks failed on it:
+
+{failures}
+
+`.steward-ci-failures.md` holds the end of each failing job's log. These are checks that need the
+built site or a deployed URL, so you cannot run them here; the pull request's CI runs them again
+after the steward pushes your change. Read `.claude/skills/slopstopper-triage/SKILL.md` and work
+each failure with it: read the log for the real cause first (a step before the check, such as
+`npm ci`, failing is the cause, not the check), then fix it the way the skill says.
+
+{guardrails}
+For this order, `outcome` is `fixed` when you changed something that should turn each failing check
+green, `partial` when some stay for a person (say which in `notes`), `skipped` when you changed nothing.
+"""
+
+
+def ci_fix(order, inv, failures: list[dict], slopstopper_repo: str, checks=(), apart=()) -> str:
+    rows = [f"- `{f['name']}` ({f['conclusion']}), workflow `{f['workflow'].rsplit('/', 1)[-1]}`: {f['url']}"
+            for f in failures]
+    what = (f"the slopstopper-cli pin moved to `{order.target}`" if order.kind in ("upgrade", "refresh")
+            else f"a fix for #{order.finding.number}" if order.finding else "an order")
+    return CI_FIX.format(
+        repo=order.repo, default_branch=order.default_branch, profile=inv.profile or "ui (default)",
+        branch=order.branch, what=what, failures="\n".join(rows),
+        guardrails=_guardrails(slopstopper_repo, checks, apart),
+    )
+
+
 def _guardrails(slopstopper_repo: str, checks, apart=()) -> str:
     names = ", ".join(f"`{c}`" for c in checks) or "none (nothing this clone can verify)"
     proved = ""

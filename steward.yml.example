@@ -21,6 +21,11 @@ budgets:
   agent_usd: 5             # dollar cap per agent invocation
   agent_turns: 60          # turn cap per agent invocation
 
+ci:
+  wait: true               # after opening a PR, wait for its checks and fix what the triage skill covers
+  wait_minutes: 20         # the most one wait may take; the run's token deadline caps it too
+  fix_rounds: 2            # agent attempts at a red PR; still red after that, it is a draft naming the checks
+
 agent:
   enabled: true            # false: upgrades still run, findings are reported not worked
   model: ""                # handed to `claude --model` (an alias like sonnet, or an id); empty uses the CLI default. The PR and report name what ran

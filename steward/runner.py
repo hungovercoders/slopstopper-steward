@@ -12,7 +12,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from steward import discover, gh, inventory, isolation, prompts, versions, workspace
+from steward import ci, discover, gh, inventory, isolation, prompts, versions, workspace
+from steward.redact import redact
 from steward.config import Config
 from steward.execute import agent, refresh
 from steward.execute.agent import AgentResult
@@ -26,6 +27,7 @@ STEWARD_URL = "https://github.com/hungovercoders/slopstopper-steward"
 MIN_ORDER_SECONDS = 20 * 60
 # What an order keeps back from its agent for verification, push and PR.
 AFTER_AGENT_SECONDS = 10 * 60
+CI_MARGIN_SECONDS = 8 * 60    # kept back from a wait for the PR's checks: a push, the body, the report
 
 
 @dataclass
@@ -273,7 +275,8 @@ def _verify_pass(ws: workspace.Workspace, cli: Path, ctx: RunContext | None = No
     checks = refresh.static_checks(ws, cli)
     red = refresh.verify(ws, cli, checks.runnable)
     apart_red, apart_unverified = _apart(ws, cli, checks.environment, ctx)
-    return red + apart_red, checks.unverified + apart_unverified
+    deployed = [{"check": c, "why": refresh.DEPLOYED_WHY} for c in checks.deployed]
+    return red + apart_red, checks.unverified + apart_unverified + deployed
 
 
 def _settle_red(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, cli: Path,
@@ -302,6 +305,113 @@ def _unverified_section(unverified: list[dict]) -> str:
     return f"### Not verified by the steward\n\n{rows}\n\nThis PR's own `ss-*` workflows run them.\n\n"
 
 
+def _sync_locks(ws: workspace.Workspace) -> list[dict]:
+    try:
+        return refresh.sync_lockfiles(ws, isolation.agent_user())
+    except Exception as exc:  # the PR still opens; the body says the lock was not kept in step
+        return [{"dir": ".", "status": "failed", "detail": _failure(exc)}]
+
+
+def _locks_section(rows: list[dict]) -> str:
+    if not rows:
+        return ""
+    lines = "\n".join(f"- `{r['dir']}/package-lock.json`: {r['status']}" + (f" ({r['detail']})" if r["detail"] else "")
+                       for r in rows)
+    return ("### Lockfiles\n\nThe install changed `package.json`, so the lock was regenerated "
+            f"(`npm install --package-lock-only --ignore-scripts`):\n\n{lines}\n\n")
+
+
+def _ci_budget(cfg: Config, ctx: RunContext) -> float:
+    cap = cfg.ci_wait_minutes * 60
+    left = ctx.remaining()
+    return cap if left is None else min(cap, left - CI_MARGIN_SECONDS)
+
+
+def _settle_ci(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, cli: Path | None,
+               ctx: RunContext, url: str, body: str, draft: bool) -> tuple[str, dict]:
+    """Wait for the PR's checks, the last verifier. Red slopstopper checks go
+    to the agent with their logs, up to `ci.fix_rounds` times, each wait
+    bounded by `ci.wait_minutes` and the run's deadline. The body gets a
+    section saying how it ended; a PR that is not green becomes a draft.
+    Returns (status, what happened)."""
+    info: dict = {"waited": False, "rounds": 0, "failing": [], "timed_out": False, "note": "", "agent": []}
+    if not cfg.ci_wait:
+        info["note"] = "ci.wait is off"
+    else:
+        _ci_loop(order, inv, cfg, ws, cli, ctx, info)
+    number = workspace.pr_number(url)
+    workspace.update_pr_body(order.repo, number, body + _ci_section(info))
+    not_green = bool(info["failing"] or info["timed_out"])
+    if not_green and not draft:
+        workspace.set_draft(order.repo, number)
+    return ("draft" if draft or not_green else "pr"), info
+
+
+def _ci_loop(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, cli: Path | None,
+             ctx: RunContext, info: dict) -> None:
+    """Wait, and while a slopstopper check is red and a round is left, fix and wait again."""
+    sha = workspace.head_sha(ws)
+    for round_ in range(cfg.ci_fix_rounds + 1):
+        budget = _ci_budget(cfg, ctx)
+        if budget < 60:
+            info["note"] = "the run was out of time before the PR's checks finished"
+            return
+        runs, timed_out = ci.wait(order.repo, sha, budget)
+        info.update(waited=True, timed_out=timed_out, waited_minutes=round(budget / 60), checks=len(runs))
+        red = ci.describe(order.repo, runs)
+        info["failing"] = [{k: r[k] for k in ("name", "conclusion", "url", "workflow", "ours")} for r in red]
+        ours = [r for r in red if r["ours"]]
+        if _ci_stops(cfg, cli, red, ours, timed_out, round_):
+            return
+        if not _ci_fix_round(order, inv, cfg, ws, cli, ctx, ours, info, round_ + 1):
+            return
+        sha = workspace.head_sha(ws)
+
+
+def _ci_stops(cfg: Config, cli: Path | None, red: list, ours: list, timed_out: bool, round_: int) -> bool:
+    """Nothing left to do: green, out of time, out of rounds, nothing the
+    triage skill covers, or no agent to work it."""
+    return (not red or timed_out or round_ == cfg.ci_fix_rounds or not ours
+            or not cfg.agent_enabled or cli is None)
+
+
+def _ci_fix_round(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, cli: Path,
+                  ctx: RunContext, ours: list[dict], info: dict, number: int) -> bool:
+    """One agent attempt at the red slopstopper checks, from their logs;
+    pushed when it changed something. Returns whether a wait should follow."""
+    tails = {r["name"]: ci.log_tail(order.repo, r["id"]) for r in ours[:8]}
+    (ws.path / ".steward-ci-failures.md").write_text(ci.failures_markdown(ours, tails), encoding="utf-8")
+    checks, apart = _runnable(ws, cli)
+    brief = prompts.ci_fix(order, inv, ours, cfg.slopstopper_repo, checks=checks, apart=apart)
+    result = agent.run(ws, brief, cfg, cli, timeout=ctx.agent_timeout(), protect=ctx.protected(),
+                       preflight=ctx.agent_unavailable, checked=ctx.checked_clis, checks=checks)
+    info["agent"].append(result.to_dict())
+    message = f"fix(slopstopper): settle the pull request's checks (round {number})\n\n{result.summary or result.error}"
+    if not result.ran or not workspace.commit(ws, message):
+        info["note"] = f"the agent changed nothing in round {number}: {result.summary or result.error}"
+        return False
+    workspace.push(ws, order.branch)
+    info["rounds"] = number
+    return True
+
+
+def _ci_section(info: dict) -> str:
+    if not info["waited"]:
+        return f"### Checks\n\nNot awaited: {info['note']}.\n\n"
+    rounds = info["rounds"]
+    after = f" after {rounds} fix round(s)" if rounds else ""
+    if info["failing"]:
+        rows = "\n".join(f"- `{f['name']}` ({f['conclusion']}): {f['url']}" + ("" if f["ours"] else " (not a slopstopper check)")
+                         for f in info["failing"])
+        tail = f" {info['note']}." if info["note"] else ""
+        return (f"### CI still red{after}\n\n{rows}\n\nOpened as a draft.{tail} Work the `slopstopper-triage` skill "
+                "on this branch; the steward's next run does not re-open a settled order.\n\n")
+    if info["timed_out"]:
+        return (f"### Checks\n\nStill running after {info.get('waited_minutes')} minutes{after}; the steward could not "
+                "wait longer. Opened as a draft: mark it ready once they are green.\n\n")
+    return f"### Checks\n\nThe PR's {info.get('checks', 0)} checks are green{after}.\n\n"
+
+
 def work_refresh(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, ctx: RunContext) -> Outcome:
     assert order.target
     moved = refresh.set_pin(ws.path / "mise.toml", order.target)
@@ -314,6 +424,7 @@ def work_refresh(order: Order, inv: inventory.Inventory, cfg: Config, ws: worksp
     known = order.kind == "upgrade" or versions.parse(start) is not None
     notes = release_notes(cfg, start, order.target, ctx.releases) if known else ""
     (ws.path / ".steward-release-notes.md").write_text(notes, encoding="utf-8")
+    locks = _sync_locks(ws)
     red, unverified, result, unreviewed = _settle(order, inv, cfg, ws, cli, ctx)
     if not workspace.commit(ws, f"{order.title}\n\n{order.reason}."):
         return Outcome(order.to_dict(), "skipped", detail="nothing changed after the refresh")
@@ -321,13 +432,15 @@ def work_refresh(order: Order, inv: inventory.Inventory, cfg: Config, ws: worksp
     summary = _refresh_summary(order, inv, moved) + _agent_section(result)
     extra = _review_section(order, unreviewed)
     extra += _red_section("Still red after the refresh", red, "Opened as a draft: settle these before merging.\n\n")
-    extra += _unverified_section(unverified)
+    extra += _locks_section(locks) + _unverified_section(unverified)
     if notes:
         extra += f"<details><summary>Release notes between the two pins</summary>\n\n{notes}\n</details>\n"
-    draft = bool(red or unreviewed)
-    url = workspace.open_pr(ws, order.title, _pr_body(order, cfg, summary, extra), cfg.pr_labels, draft=draft)
-    return Outcome(order.to_dict(), "draft" if draft else "pr", pr_url=url, red=red, unverified=unverified,
-                   agent=result.to_dict() if result else None)
+    draft = bool(red or unreviewed or any(r["status"] == "failed" for r in locks))
+    body = _pr_body(order, cfg, summary, extra)
+    url = workspace.open_pr(ws, order.title, body, cfg.pr_labels, draft=draft)
+    status, ci_info = _settle_ci(order, inv, cfg, ws, cli, ctx, url, body, draft)
+    return Outcome(order.to_dict(), status, pr_url=url, red=red, unverified=unverified,
+                   agent=result.to_dict() if result else None, ci=ci_info)
 
 
 # ── triage ───────────────────────────────────────────────────────────
@@ -388,11 +501,12 @@ def work_triage(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspa
         return Outcome(order.to_dict(), "skipped", detail=result.summary or result.error or "agent changed nothing",
                        agent=result.to_dict())
     workspace.push(ws, order.branch)
-    return _triage_pr(order, cfg, ws, result, red, unverified)
+    return _triage_pr(order, cfg, ws, result, red, unverified, inv=inv, cli=cli, ctx=ctx)
 
 
 def _triage_pr(order: Order, cfg: Config, ws: workspace.Workspace, result: AgentResult,
-               red: list[dict], unverified: list[dict]) -> Outcome:
+               red: list[dict], unverified: list[dict], inv: inventory.Inventory | None = None,
+               cli: Path | None = None, ctx: RunContext | None = None) -> Outcome:
     """Open the triage PR: a draft unless the agent fixed it and the check is
     not red; `Closes #N` only when the steward verified the check green."""
     assert order.finding
@@ -403,8 +517,11 @@ def _triage_pr(order: Order, cfg: Config, ws: workspace.Workspace, result: Agent
     draft = bool(red) or result.outcome != "fixed"
     body = _pr_body(order, cfg, _triage_summary(result), extra, closes=not red and not unverified)
     url = workspace.open_pr(ws, order.title, body, cfg.pr_labels, draft=draft)
-    return Outcome(order.to_dict(), "draft" if draft else "pr", pr_url=url, red=red, unverified=unverified,
-                   agent=result.to_dict())
+    status, ci_info = ("draft" if draft else "pr"), None
+    if inv is not None and ctx is not None:
+        status, ci_info = _settle_ci(order, inv, cfg, ws, cli, ctx, url, body, draft)
+    return Outcome(order.to_dict(), status, pr_url=url, red=red, unverified=unverified, agent=result.to_dict(),
+                   ci=ci_info)
 
 
 # ── the run ──────────────────────────────────────────────────────────
@@ -449,9 +566,6 @@ def _work(order: Order, inv: inventory.Inventory, cfg: Config, ctx: RunContext) 
         return Outcome(order.to_dict(), "failed", detail=_failure(exc))
 
 
-# A credential that could appear in a tool's error output: GitHub tokens,
-# and userinfo in a URL (`https://x-access-token:...@github.com`).
-_SECRET = re.compile(r"\bgh[opsur]_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}|(?<=://)[^/@\s]+(?=@)")
 
 
 def _failure(exc: Exception) -> str:
@@ -462,7 +576,7 @@ def _failure(exc: Exception) -> str:
     if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
         err = exc.stderr if isinstance(exc.stderr, str) else exc.stderr.decode("utf-8", "replace")
         detail += " " + err.strip()[-400:]
-    return _SECRET.sub("***", detail)[:900]
+    return redact(detail)[:900]
 
 
 def run(cfg: Config, only: str | None, dry_run: bool, workdir: Path | None) -> RunReport:

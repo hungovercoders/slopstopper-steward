@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -26,6 +27,7 @@ from typing import Sequence
 
 from steward.checks import NEEDS_ENVIRONMENT
 from steward import gh, isolation, sandbox
+from steward.redact import redact
 from steward.pin import PIN_KEY, PIN_LINE, PinError, set_pin  # noqa: F401  (re-exported)
 from steward.versions import MIN_INSTALL_VERSION, parse
 from steward.workspace import LOCAL_ONLY, Workspace
@@ -84,6 +86,7 @@ def _json(cli: Path, cwd: Path, *args: str, ok_codes: tuple[int, ...] = (0,)):
 
 
 ENVIRONMENT_WHY = "needs the project's installed dependencies; its workflow installs them"
+DEPLOYED_WHY = "needs the built site or a deployed URL; its workflow on the PR runs it, and the steward waits for that"
 
 
 @dataclass
@@ -94,6 +97,7 @@ class Checks:
     runnable: list[str] = field(default_factory=list)
     unverified: list[dict] = field(default_factory=list)  # {check, why}
     environment: list[str] = field(default_factory=list)
+    deployed: list[str] = field(default_factory=list)     # the repo keeps them; only the PR's CI can run them
 
 
 def _missing_tools(cli: Path, cwd: Path) -> dict[str, str]:
@@ -125,7 +129,7 @@ def static_checks(ws: Workspace, cli: Path) -> Checks:
     dropped = set(expanded["workflows"])
     kept = [r["name"] for r in rows if not r.get("disabled") and r.get("workflow") not in dropped]
     missing = _missing_tools(cli, ws.path)
-    out = Checks()
+    out = Checks(deployed=[r["name"] for r in rows if not r.get("disabled") and r.get("workflow") in dropped])
     for check in kept:
         if check in NEEDS_ENVIRONMENT:
             out.environment.append(check)
@@ -241,6 +245,67 @@ def fingerprint(ws: Workspace) -> str:
     """A digest of the tree's change from HEAD, binary files included: equal
     before and after the agent means it left the tree as it was."""
     return hashlib.sha256(_tree_diff(ws, "--binary").encode("utf-8", "surrogateescape")).hexdigest()
+
+
+LOCKFILE = "package-lock.json"
+
+
+def lockfiles_to_sync(ws: Workspace) -> list[str]:
+    """The directories (clone-relative, "" for the root) whose `package.json`
+    the install changed or created and that keep a `package-lock.json`. The
+    installer merges the suite's devDependencies into the manifest and never
+    touches the lock, and every browser workflow begins with `npm ci`, which
+    refuses a lock that no longer matches."""
+    spec = ["--", "package.json", "*/package.json"]
+    changed = ws.git("diff", "--name-only", "HEAD", *spec, check=False).stdout.split()
+    new = ws.git("ls-files", "-z", "--others", "--exclude-standard", *spec, check=False).stdout.split("\0")
+    dirs = set()
+    for p in (*changed, *new):
+        if p and "node_modules" not in Path(p).parts:
+            dirs.add(str(Path(p).parent) if "/" in p else "")
+    return sorted(d for d in dirs if (ws.path / d / LOCKFILE).is_file())
+
+
+def sync_lockfiles(ws: Workspace, user: str | None, timeout: int = 900) -> list[dict]:
+    """Regenerate each stale lock with npm itself (`--package-lock-only
+    --ignore-scripts`: nothing installed, no repo code run), apart as the
+    agent user when there is one and it can reach npm, else in the sandbox
+    environment. Returns a row per lock for the PR body: {dir, status
+    (synced | unchanged | failed), detail}."""
+    rows = []
+    npm = shutil.which("npm")
+    for d in lockfiles_to_sync(ws):
+        rel = f"{d}/{LOCKFILE}" if d else LOCKFILE
+        argv = ["npm", "install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund",
+                *(["--prefix", d] if d else [])]
+        before = (ws.path / rel).read_bytes()
+        try:
+            proc, after = _npm(ws, argv, rel, Path(npm).parent if npm else None, user, timeout)
+        except (isolation.IsolationError, subprocess.TimeoutExpired, OSError) as exc:
+            rows.append({"dir": d or ".", "status": "failed", "detail": redact(str(exc))[:300]})
+            continue
+        if proc.returncode != 0 or after is None:
+            rows.append({"dir": d or ".", "status": "failed", "detail": redact(proc.stderr.strip()[-300:]) or f"npm exited {proc.returncode}"})
+        elif after != before:
+            (ws.path / rel).write_bytes(after)
+            rows.append({"dir": d or ".", "status": "synced", "detail": ""})
+        else:
+            rows.append({"dir": d or ".", "status": "unchanged", "detail": ""})
+    return rows
+
+
+def _npm(ws: Workspace, argv: list[str], rel: str, npm_dir: Path | None, user: str | None, timeout: int
+         ) -> tuple[subprocess.CompletedProcess, bytes | None]:
+    """npm apart as `user` (falling back to the sandbox environment when that
+    user cannot reach npm, exit 127), else in the sandbox environment."""
+    if user:
+        proc, files = isolation.run_apart_bring(user, ws.path, argv, sandbox.environment(npm_dir), npm_dir, timeout, bring=[rel])
+        if proc.returncode != 127:
+            return proc, files.get(rel)
+    with sandbox.scratch_home() as home:
+        proc = subprocess.run(argv, cwd=ws.path, capture_output=True, text=True, timeout=timeout,
+                              env=sandbox.environment(npm_dir, home))
+    return proc, (ws.path / rel).read_bytes() if (ws.path / rel).is_file() else None
 
 
 SCHEMA = ".slopstopper.yml.example"

@@ -13,6 +13,7 @@ from steward.execute.agent import AgentResult
 from steward.inventory import Inventory
 
 CFG = from_dict({"orgs": ["acme"]})
+GREEN_RUN = {"id": 1, "name": "smoke-test", "status": "completed", "conclusion": "success", "url": "", "app": "github-actions"}
 
 
 @pytest.mark.parametrize("start, expect", [
@@ -99,6 +100,13 @@ def upgrade(monkeypatch, tmp_path):
                         or AgentResult(True, outcome="fixed", summary="carried one knob over"))
     monkeypatch.setattr(workspace, "commit", lambda ws, msg: True)
     monkeypatch.setattr(workspace, "push", lambda ws, branch: None)
+    # the PR's own checks: green at once unless a test says otherwise
+    monkeypatch.setattr(workspace, "head_sha", lambda ws: "abc123")
+    monkeypatch.setattr(workspace, "update_pr_body", lambda repo, number, body: seen.update(final_body=body))
+    monkeypatch.setattr(workspace, "set_draft", lambda repo, number: seen.update(drafted=True))
+    monkeypatch.setattr(runner.ci, "wait", lambda repo, sha, seconds: ([GREEN_RUN], False))
+    monkeypatch.setattr(runner.ci, "describe", lambda repo, runs: [])
+    monkeypatch.setattr(refresh, "sync_lockfiles", lambda ws, user: [])
 
     def open_pr(ws, title, body, labels, draft=False):
         seen.update(draft=draft, body=body)
