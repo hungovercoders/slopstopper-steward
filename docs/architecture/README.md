@@ -172,8 +172,12 @@ it can fail.
    in a repository the agent wrote), and edits to the run's venvs.
 2. **What the agent can see.** Its environment is rebuilt from an
    allow-list (`steward/sandbox.py`): no `GH_TOKEN`, no `GITHUB_TOKEN`, no
-   `STEWARD_*`, and a throwaway `HOME`, so there is no stored `gh` login
-   and no `~/.gitconfig` to use or plant. `PYTHONSAFEPATH` stops a
+   `STEWARD_*`, and a throwaway `HOME` with the XDG directories under it,
+   so there is no stored `gh` login and no `~/.gitconfig` to use or
+   plant. As the agent user those are set again after `sudo`, whose PAM
+   session adds what `/etc/environment` holds (on the GitHub runner,
+   `XDG_CONFIG_HOME=/home/runner/.config`, which Semgrep would otherwise
+   try to write under and fail). `PYTHONSAFEPATH` stops a
    `lizard` module planted in the clone from being imported by `python -m lizard`. The
    one secret it gets is the model key, because it is the model.
 3. **What the steward does after it.** `.git/config` is restored from a
