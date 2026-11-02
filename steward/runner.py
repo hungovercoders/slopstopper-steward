@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import subprocess
 import tempfile
@@ -312,6 +311,15 @@ def _sync_locks(ws: workspace.Workspace) -> list[dict]:
         return [{"dir": ".", "status": "failed", "detail": _failure(exc)}]
 
 
+def _merge_locks(first: list[dict], second: list[dict]) -> list[dict]:
+    """One row per directory: a later `synced` or `failed` replaces an earlier `unchanged`."""
+    rows = {r["dir"]: r for r in first}
+    for r in second:
+        if r["status"] != "unchanged" or r["dir"] not in rows:
+            rows[r["dir"]] = r
+    return list(rows.values())
+
+
 def _locks_section(rows: list[dict]) -> str:
     if not rows:
         return ""
@@ -334,16 +342,22 @@ def _settle_ci(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspac
     bounded by `ci.wait_minutes` and the run's deadline. The body gets a
     section saying how it ended; a PR that is not green becomes a draft.
     Returns (status, what happened)."""
-    info: dict = {"waited": False, "rounds": 0, "failing": [], "timed_out": False, "note": "", "agent": []}
+    info: dict = {"waited": False, "rounds": 0, "failing": [], "timed_out": False, "note": "", "agent": [], "locks": []}
     if not cfg.ci_wait:
         info["note"] = "ci.wait is off"
     else:
-        _ci_loop(order, inv, cfg, ws, cli, ctx, info)
-    number = workspace.pr_number(url)
-    workspace.update_pr_body(order.repo, number, body + _ci_section(info))
+        try:
+            _ci_loop(order, inv, cfg, ws, cli, ctx, info)
+        except Exception as exc:  # the PR exists: say what stopped the wait, never lose it
+            info["note"] = f"the wait stopped: {_failure(exc)}"
     not_green = bool(info["failing"] or info["timed_out"])
-    if not_green and not draft:
-        workspace.set_draft(order.repo, number)
+    number = workspace.pr_number(url)
+    try:
+        workspace.update_pr_body(order.repo, number, body + _ci_section(info))
+        if not_green and not draft:
+            workspace.set_draft(order.repo, number)
+    except Exception as exc:
+        info["note"] = (info["note"] + " " if info["note"] else "") + f"the PR could not be updated: {_failure(exc)}"
     return ("draft" if draft or not_green else "pr"), info
 
 
@@ -351,14 +365,19 @@ def _ci_loop(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.
              ctx: RunContext, info: dict) -> None:
     """Wait, and while a slopstopper check is red and a round is left, fix and wait again."""
     sha = workspace.head_sha(ws)
+    expected, workflows = ci.expected_workflows(ws.path), {}
     for round_ in range(cfg.ci_fix_rounds + 1):
         budget = _ci_budget(cfg, ctx)
         if budget < 60:
             info["note"] = "the run was out of time before the PR's checks finished"
             return
-        runs, timed_out = ci.wait(order.repo, sha, budget)
+        runs, timed_out, workflows = ci.wait(order.repo, sha, budget, expected, workflows)
+        if not runs:  # nothing ran, or nothing registered in time: not red, not green
+            info.update(waited=True, checks=0, timed_out=False,
+                        note=f"no check ran on the PR within {round(budget / 60)} minutes" if timed_out else "")
+            return
         info.update(waited=True, timed_out=timed_out, waited_minutes=round(budget / 60), checks=len(runs))
-        red = ci.describe(order.repo, runs)
+        red = ci.describe(order.repo, runs, workflows)
         info["failing"] = [{k: r[k] for k in ("name", "conclusion", "url", "workflow", "ours")} for r in red]
         ours = [r for r in red if r["ours"]]
         if _ci_stops(cfg, cli, red, ours, timed_out, round_):
@@ -377,8 +396,15 @@ def _ci_stops(cfg: Config, cli: Path | None, red: list, ours: list, timed_out: b
 
 def _ci_fix_round(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, cli: Path,
                   ctx: RunContext, ours: list[dict], info: dict, number: int) -> bool:
-    """One agent attempt at the red slopstopper checks, from their logs;
-    pushed when it changed something. Returns whether a wait should follow."""
+    """One agent attempt at the red slopstopper checks, from their logs. The
+    lock is kept in step and the steward's own verification re-run before
+    the push: a fix that goes red here is not pushed, and the PR is drafted.
+    Returns whether a wait should follow."""
+    try:
+        agent.ensure_skills(ws, order.target or inv.repo.pinned, cfg.slopstopper_repo)
+    except RuntimeError as exc:
+        info["note"] = f"the skills could not be fetched for round {number}: {exc}"
+        return False
     tails = {r["name"]: ci.log_tail(order.repo, r["id"]) for r in ours[:8]}
     (ws.path / ".steward-ci-failures.md").write_text(ci.failures_markdown(ours, tails), encoding="utf-8")
     checks, apart = _runnable(ws, cli)
@@ -386,18 +412,35 @@ def _ci_fix_round(order: Order, inv: inventory.Inventory, cfg: Config, ws: works
     result = agent.run(ws, brief, cfg, cli, timeout=ctx.agent_timeout(), protect=ctx.protected(),
                        preflight=ctx.agent_unavailable, checked=ctx.checked_clis, checks=checks)
     info["agent"].append(result.to_dict())
-    message = f"fix(slopstopper): settle the pull request's checks (round {number})\n\n{result.summary or result.error}"
-    if not result.ran or not workspace.commit(ws, message):
+    if not result.ran or not ws.dirty():
         info["note"] = f"the agent changed nothing in round {number}: {result.summary or result.error}"
         return False
+    info["locks"] += _sync_locks(ws)
+    red = _verify_after_fix(order, ws, cli, ctx)
+    if red:
+        info["note"] = (f"the agent's round {number} left the steward's own checks red "
+                        f"({', '.join(r['check'] for r in red)}), so it was not pushed")
+        return False
+    workspace.commit(ws, f"fix(slopstopper): settle the pull request's checks (round {number})\n\n"
+                         f"{result.summary or result.error}")
     workspace.push(ws, order.branch)
     info["rounds"] = number
     return True
 
 
+def _verify_after_fix(order: Order, ws: workspace.Workspace, cli: Path, ctx: RunContext) -> list[dict]:
+    """The steward's own gate again after the agent's fix: the finding's check
+    for a triage order, every static check for an upgrade or refresh."""
+    if order.kind == "triage":
+        return _recheck(order, ws, cli, ctx)[0]
+    return _verify_pass(ws, cli, ctx)[0]
+
+
 def _ci_section(info: dict) -> str:
     if not info["waited"]:
         return f"### Checks\n\nNot awaited: {info['note']}.\n\n"
+    if not info.get("checks"):
+        return f"### Checks\n\n{info['note'] or 'No check ran on this PR'}; nothing to wait for.\n\n"
     rounds = info["rounds"]
     after = f" after {rounds} fix round(s)" if rounds else ""
     if info["failing"]:
@@ -424,8 +467,9 @@ def work_refresh(order: Order, inv: inventory.Inventory, cfg: Config, ws: worksp
     known = order.kind == "upgrade" or versions.parse(start) is not None
     notes = release_notes(cfg, start, order.target, ctx.releases) if known else ""
     (ws.path / ".steward-release-notes.md").write_text(notes, encoding="utf-8")
-    locks = _sync_locks(ws)
+    locks = _sync_locks(ws)   # the install's change to package.json, before anything reads the tree
     red, unverified, result, unreviewed = _settle(order, inv, cfg, ws, cli, ctx)
+    locks = _merge_locks(locks, _sync_locks(ws))   # and the agent's, if it changed package.json too
     if not workspace.commit(ws, f"{order.title}\n\n{order.reason}."):
         return Outcome(order.to_dict(), "skipped", detail="nothing changed after the refresh")
     workspace.push(ws, order.branch)

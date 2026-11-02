@@ -104,8 +104,9 @@ def upgrade(monkeypatch, tmp_path):
     monkeypatch.setattr(workspace, "head_sha", lambda ws: "abc123")
     monkeypatch.setattr(workspace, "update_pr_body", lambda repo, number, body: seen.update(final_body=body))
     monkeypatch.setattr(workspace, "set_draft", lambda repo, number: seen.update(drafted=True))
-    monkeypatch.setattr(runner.ci, "wait", lambda repo, sha, seconds: ([GREEN_RUN], False))
-    monkeypatch.setattr(runner.ci, "describe", lambda repo, runs: [])
+    monkeypatch.setattr(runner.ci, "wait", lambda repo, sha, seconds, expected=None, workflows=None: ([GREEN_RUN], False, {}))
+    monkeypatch.setattr(runner.ci, "describe", lambda repo, runs, workflows=None: [])
+    monkeypatch.setattr(runner.ci, "expected_workflows", lambda root: set())
     monkeypatch.setattr(refresh, "sync_lockfiles", lambda ws, user: [])
 
     def open_pr(ws, title, body, labels, draft=False):

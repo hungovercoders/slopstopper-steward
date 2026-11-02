@@ -152,9 +152,11 @@ def run_apart_bring(user: str, clone: Path, argv: Sequence[str], env: Mapping[st
         proc = subprocess.run(cmd, capture_output=True, text=True, env=dict(env), timeout=timeout + KILL_AFTER + 60)
         files: dict[str, bytes] = {}
         for rel in bring:
-            done = _sudo(user, "cat", str(iso.tree / rel), check=False, timeout=120)
+            # bytes, not text: a lock with CRLF or a non-UTF-8 byte comes back as it is
+            done = subprocess.run(["sudo", "-n", "-u", user, "--", "cat", str(iso.tree / rel)],
+                                  capture_output=True, timeout=120)
             if done.returncode == 0:
-                files[rel] = done.stdout.encode("utf-8")
+                files[rel] = done.stdout
         return proc, files
 
 

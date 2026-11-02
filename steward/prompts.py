@@ -113,11 +113,13 @@ The pull request's own CI ran, and these slopstopper checks failed on it:
 
 {failures}
 
-`.steward-ci-failures.md` holds the end of each failing job's log. These are checks that need the
-built site or a deployed URL, so you cannot run them here; the pull request's CI runs them again
-after the steward pushes your change. Read `.claude/skills/slopstopper-triage/SKILL.md` and work
-each failure with it: read the log for the real cause first (a step before the check, such as
-`npm ci`, failing is the cause, not the check), then fix it the way the skill says.
+`.steward-ci-failures.md` holds the end of each failing job's log. A check named in the rules below
+as one you may run here, reproduce here first; the browser and API checks need the built site or a
+deployed URL and run only on the pull request's CI, which runs again after the steward pushes your
+change. Read `.claude/skills/slopstopper-triage/SKILL.md` and work each failure with it: read the log
+for the real cause first (a step before the check, such as `npm ci`, failing is the cause, not the
+check), then fix it the way the skill says. The steward keeps `package-lock.json` in step with
+`package.json` itself after you finish, so do not regenerate a lock by hand.
 
 {guardrails}
 For this order, `outcome` is `fixed` when you changed something that should turn each failing check

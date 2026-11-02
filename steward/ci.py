@@ -6,19 +6,29 @@ for the head commit's check runs, hands the failing slopstopper ones to
 the agent with the tail of each job's log, pushes the fix and waits
 again, within `ci.wait_minutes` per wait, `ci.fix_rounds` rounds and the
 run's token deadline. A PR it cannot get green is a draft that says what
-is red. The App's Actions: read permission covers the reads here.
+is red. The reads need the App's Checks: read (check runs) and Actions:
+read (jobs and their logs).
+
+"Settled" is more than "nothing running": the PR-triggered `ss-*`
+workflows on the branch must each have a check run, and the set of runs
+must have held still for QUIET_SECONDS, since a PR's runs register over
+a minute or more and a bot's instant check would otherwise read as the
+whole of CI.
 """
 
 from __future__ import annotations
 
+import re
 import time
+from pathlib import Path
 from typing import Callable
 
 from steward import gh
 from steward.redact import redact
 
 POLL_SECONDS = 30
-APPEAR_SECONDS = 180          # a head with no check run this long has no CI worth waiting for
+APPEAR_SECONDS = 180          # a head with no check run this long, and none expected, has no CI
+QUIET_SECONDS = 90            # the run set must hold still this long before it counts as settled
 LOG_LINES = 80
 LOG_CHARS = 6000
 RED = {"failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale"}
@@ -27,7 +37,12 @@ WORKFLOW_PREFIX = ".github/workflows/ss-"   # slopstopper's workflows: what the 
 
 def check_runs(repo: str, sha: str) -> list[dict]:
     """The check runs on `sha`, each as {id, name, status, conclusion, url, app}."""
-    data = gh.api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100") or {}
+    try:
+        data = gh.api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100") or {}
+    except gh.GhError as exc:
+        if "403" in str(exc):
+            raise gh.GhError(f"{exc} (reading check runs needs the App's Checks: read permission)") from exc
+        raise
     rows = data.get("check_runs") if isinstance(data, dict) else None
     out = []
     for r in rows or []:
@@ -45,20 +60,55 @@ def failed(runs: list[dict]) -> list[dict]:
     return [r for r in runs if r["status"] == "completed" and r["conclusion"] in RED]
 
 
-def wait(repo: str, sha: str, seconds: float, now: Callable[[], float] = time.time,
-         sleep: Callable[[float], None] = time.sleep) -> tuple[list[dict], bool]:
-    """Poll until every check run on `sha` has completed, or `seconds` have
-    passed. Returns (runs, timed_out). A head on which no check run appears
-    within APPEAR_SECONDS is settled with none: the repo runs no CI on it."""
+_ON_PR = re.compile(r"^\s*pull_request(_target)?\s*:|^on:\s*\[[^\]]*\bpull_request\b", re.M)
+
+
+def expected_workflows(root: Path) -> set[str]:
+    """The slopstopper workflows on the branch that run on a pull request,
+    as `.github/workflows/<name>`: each should produce a check run on the
+    PR's head, and the wait is not over until each has."""
+    out = set()
+    for path in sorted((root / ".github" / "workflows").glob("ss-*.yml")):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if _ON_PR.search(text):
+            out.add(f".github/workflows/{path.name}")
+    return out
+
+
+def _learn(repo: str, runs: list[dict], workflows: dict) -> None:
+    for r in runs:
+        if r["id"] not in workflows:
+            workflows[r["id"]] = workflow_of(repo, r["id"]) if r["app"] == "github-actions" else ""
+
+
+def wait(repo: str, sha: str, seconds: float, expected: set[str] = frozenset(), workflows: dict | None = None,
+         now: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep
+         ) -> tuple[list[dict], bool, dict]:
+    """Poll until the checks on `sha` have settled, or `seconds` have passed.
+    Settled: every run complete, every expected workflow present, and the
+    run set unchanged for QUIET_SECONDS. Returns (runs, timed_out, the
+    run id -> workflow path map learned on the way). A head on which no
+    run appears within APPEAR_SECONDS, with none expected, is settled with
+    none; with some expected, the wait goes on to its limit."""
+    workflows = {} if workflows is None else workflows
     start = now()
+    fingerprint, since = None, start
     runs = check_runs(repo, sha)
     while True:
-        if runs and settled(runs):
-            return runs, False
-        if not runs and now() - start >= APPEAR_SECONDS:
-            return [], False
+        fp = tuple(sorted((r["id"], r["status"], r["conclusion"]) for r in runs))
+        if fp != fingerprint:
+            fingerprint, since = fp, now()
+        _learn(repo, runs, workflows)
+        seen = set(workflows.values())
+        if runs and settled(runs) and expected <= seen and now() - since >= QUIET_SECONDS:
+            return runs, False, workflows
+        if not runs and not expected and now() - start >= APPEAR_SECONDS:
+            return [], False, workflows
         if now() - start >= seconds:
-            return runs, True
+            return runs, True, workflows
         sleep(min(POLL_SECONDS, max(1.0, seconds - (now() - start))))
         runs = check_runs(repo, sha)
 
@@ -74,14 +124,13 @@ def workflow_of(repo: str, job_id) -> str:
     return str((run or {}).get("path") or "")
 
 
-def describe(repo: str, runs: list[dict]) -> list[dict]:
+def describe(repo: str, runs: list[dict], workflows: dict | None = None) -> list[dict]:
     """The failed runs, each with its workflow and whether it is slopstopper's
     (`ours`): the ones the triage skill covers and the agent may be asked to settle."""
-    out = []
-    for r in failed(runs):
-        workflow = workflow_of(repo, r["id"]) if r["app"] == "github-actions" else ""
-        out.append({**r, "workflow": workflow, "ours": workflow.startswith(WORKFLOW_PREFIX)})
-    return out
+    workflows = {} if workflows is None else workflows
+    _learn(repo, failed(runs), workflows)
+    return [{**r, "workflow": workflows[r["id"]], "ours": workflows[r["id"]].startswith(WORKFLOW_PREFIX)}
+            for r in failed(runs)]
 
 
 def log_tail(repo: str, job_id, lines: int = LOG_LINES) -> str:
@@ -102,7 +151,3 @@ def failures_markdown(red: list[dict], tails: dict[str, str]) -> str:
         if r["name"] in tails:
             parts.append("```text\n" + tails[r["name"]] + "\n```\n")
     return "\n".join(parts)
-
-
-def summary(red: list[dict]) -> str:
-    return ", ".join(sorted({r["name"] for r in red}))
