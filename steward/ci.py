@@ -29,6 +29,7 @@ from steward.redact import redact
 POLL_SECONDS = 30
 APPEAR_SECONDS = 180          # a head with no check run this long, and none expected, has no CI
 QUIET_SECONDS = 90            # the run set must hold still this long before it counts as settled
+GRACE_SECONDS = 300           # complete and still this long, the wait ends even if an expected workflow never ran
 LOG_LINES = 80
 LOG_CHARS = 6000
 RED = {"failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale"}
@@ -60,13 +61,17 @@ def failed(runs: list[dict]) -> list[dict]:
     return [r for r in runs if r["status"] == "completed" and r["conclusion"] in RED]
 
 
-_ON_PR = re.compile(r"^\s*pull_request(_target)?\s*:|^on:\s*\[[^\]]*\bpull_request\b", re.M)
+# `pull_request` only: a `pull_request_target` workflow (the labeler) runs in
+# the base's context and does not reliably report a check run on the head.
+_ON_PR = re.compile(r"^\s*pull_request\s*:|^on:\s*\[[^\]]*\bpull_request\b(?!_target)", re.M)
 
 
 def expected_workflows(root: Path) -> set[str]:
     """The slopstopper workflows on the branch that run on a pull request,
     as `.github/workflows/<name>`: each should produce a check run on the
-    PR's head, and the wait is not over until each has."""
+    PR's head, and the wait is not over until each has, or until the runs
+    that did come have been complete and still for GRACE_SECONDS (a
+    `paths:` filter can keep a workflow from running at all)."""
     out = set()
     for path in sorted((root / ".github" / "workflows").glob("ss-*.yml")):
         try:
@@ -103,8 +108,10 @@ def wait(repo: str, sha: str, seconds: float, expected: set[str] = frozenset(), 
             fingerprint, since = fp, now()
         _learn(repo, runs, workflows)
         seen = set(workflows.values())
-        if runs and settled(runs) and expected <= seen and now() - since >= QUIET_SECONDS:
-            return runs, False, workflows
+        if runs and settled(runs):
+            still = now() - since
+            if (expected <= seen and still >= QUIET_SECONDS) or still >= GRACE_SECONDS:
+                return runs, False, workflows
         if not runs and not expected and now() - start >= APPEAR_SECONDS:
             return [], False, workflows
         if now() - start >= seconds:

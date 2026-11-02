@@ -57,11 +57,14 @@ def test_wait_holds_until_every_expected_workflow_has_a_run(monkeypatch):
     assert not timed_out and {r["name"] for r in runs} == {"DCO", "smoke-test"} and workflows[2] == SS
 
 
-def test_wait_times_out_when_an_expected_workflow_never_reports(monkeypatch):
+def test_an_expected_workflow_that_never_reports_costs_the_grace_not_the_whole_wait(monkeypatch):
     _pages(monkeypatch, [_run("DCO", rid=1, app="dco")])
     clock, now, sleep = _clock()
-    runs, timed_out, _ = ci.wait("acme/a", "sha", 300, expected={SS}, now=now, sleep=sleep)
-    assert timed_out and len(runs) == 1
+    runs, timed_out, _ = ci.wait("acme/a", "sha", 1200, expected={SS}, now=now, sleep=sleep)
+    assert not timed_out and len(runs) == 1 and ci.GRACE_SECONDS <= clock["t"] < ci.GRACE_SECONDS + ci.POLL_SECONDS + 1
+    clock["t"] = 0.0
+    runs, timed_out, _ = ci.wait("acme/a", "sha", 200, expected={SS}, now=now, sleep=sleep)
+    assert timed_out                                   # a budget shorter than the grace still times out
 
 
 def test_wait_gives_up_on_a_head_that_never_gets_a_check(monkeypatch):
@@ -88,6 +91,8 @@ def test_expected_workflows_are_the_pr_triggered_ss_ones(tmp_path):
     (wf / "ss-b.yml").write_text("on: [push, pull_request]\n")
     (wf / "ss-c.yml").write_text("on:\n  schedule:\n    - cron: '0 3 * * 1'\n  workflow_dispatch:\n")
     (wf / "ci.yml").write_text("on: pull_request\n")
+    (wf / "ss-hygiene-auto-label-pr.yml").write_text("on:\n  pull_request_target:\n    types: [opened]\n")
+    (wf / "ss-d.yml").write_text("on: [push, pull_request_target]\n")
     assert ci.expected_workflows(tmp_path) == {".github/workflows/ss-a.yml", ".github/workflows/ss-b.yml"}
 
 
