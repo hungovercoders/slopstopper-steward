@@ -53,7 +53,9 @@ red" lists the checks that stayed red, with links; the PR is a draft.
 Work them with the `slopstopper-triage` skill on the PR's branch: the
 steward does not come back to a settled order. "Not awaited" means the run
 hit its time limit before the checks finished; the PR is ready and its
-checks are whatever the PR page shows. `ci.wait_minutes`, `ci.fix_rounds`
+checks are whatever the PR page shows. A check that was cancelled rather
+than failed is named as such and the PR is a draft: nothing ran to a
+verdict, so re-run the job. `ci.wait_minutes`, `ci.fix_rounds`
 and `ci.wait` in `steward.yml` set the limits.
 
 ### "Self-review" and "Merged"

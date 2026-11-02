@@ -458,7 +458,7 @@ def _settle_ci(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspac
             _ci_loop(order, inv, cfg, ws, cli, ctx, info)
         except Exception as exc:  # the PR exists: say what stopped the wait, never lose it
             info["note"] = f"the wait stopped: {_failure(exc)}"
-    not_green = bool(info["failing"] or info["timed_out"])
+    not_green = bool(info["failing"] or info["timed_out"] or info["cancelled"])
     number = workspace.pr_number(url)
     status = "draft" if draft or not_green else "pr"
     if status == "pr":
@@ -503,7 +503,8 @@ def _merge_section(info: dict) -> str:
 
 
 def _ci_info() -> dict:
-    return {"waited": False, "rounds": 0, "failing": [], "timed_out": False, "note": "", "agent": [], "locks": []}
+    return {"waited": False, "rounds": 0, "failing": [], "cancelled": [], "timed_out": False, "note": "", "agent": [],
+            "locks": []}
 
 
 def _ci_loop(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.Workspace, cli: Path | None,
@@ -524,14 +525,27 @@ def _ci_loop(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspace.
                         note=f"no check ran on the PR within {round(budget / 60)} minutes" if timed_out else "")
             return
         info.update(waited=True, timed_out=timed_out, waited_minutes=round(budget / 60), checks=len(runs))
-        red = ci.describe(order.repo, runs, workflows)
-        info["failing"] = [{k: r[k] for k in ("name", "conclusion", "url", "workflow", "ours")} for r in red]
-        ours = red if order.kind == "dependabot" else [r for r in red if r["ours"]]
-        if _ci_stops(cfg, cli, red, ours, timed_out, round_):
+        red, ours = _red_runs(order, ci.describe(order.repo, runs, workflows), info)
+        if red is None or _ci_stops(cfg, cli, red, ours, timed_out, round_):
             return
         if not _ci_fix_round(order, inv, cfg, ws, cli, ctx, ours, info, round_ + 1):
             return
         sha = workspace.head_sha(ws)
+
+
+def _red_runs(order: Order, described: list[dict], info: dict) -> tuple[list[dict] | None, list[dict]]:
+    """Sort the described runs into what failed and, of that, what the
+    agent may work (every failure on Dependabot's PR, slopstopper's on the
+    steward's). A cancelled job never ran to a verdict: not green, but
+    nothing for the agent either, so it is named apart and a re-run asked
+    for; when only cancellations remain, the wait ends there (None)."""
+    info["cancelled"] = sorted({r["name"] for r in described if r["conclusion"] == "cancelled"})
+    red = [r for r in described if r["conclusion"] != "cancelled"]
+    info["failing"] = [{k: r[k] for k in ("name", "conclusion", "url", "workflow", "ours")} for r in red]
+    if info["cancelled"] and not red:
+        info["note"] = f"cancelled before it finished: {', '.join(info['cancelled'])}; nothing to work, re-run it"
+        return None, []
+    return red, (red if order.kind == "dependabot" else [r for r in red if r["ours"]])
 
 
 def _ci_stops(cfg: Config, cli: Path | None, red: list, ours: list, timed_out: bool, round_: int) -> bool:
@@ -633,6 +647,10 @@ def _ci_section(info: dict) -> str:
     if info["timed_out"]:
         return (f"### Checks\n\nStill running after {info.get('waited_minutes')} minutes{after}; the steward could not "
                 "wait longer. Opened as a draft: mark it ready once they are green.\n\n")
+    if info["cancelled"]:
+        names = ", ".join(f"`{n}`" for n in info["cancelled"])
+        return (f"### Checks\n\n{names} cancelled before finishing{after}, so the PR is not proven green. Opened as a "
+                "draft: re-run the job, and mark it ready once it passes.\n\n")
     return f"### Checks\n\nThe PR's {info.get('checks', 0)} checks are green{after}.\n\n"
 
 
@@ -785,7 +803,7 @@ def _dependabot_status(info: dict) -> str:
     ran, still running, not awaited): nothing to act on either way."""
     if info["failing"]:
         return "red"
-    if info["waited"] and info.get("checks") and not info["timed_out"]:
+    if info["waited"] and info.get("checks") and not info["timed_out"] and not info["cancelled"]:
         return "green"
     return "skipped"
 

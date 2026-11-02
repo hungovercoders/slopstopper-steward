@@ -121,6 +121,8 @@ def _ci_cell(ci: dict | None) -> str:
         return f" · CI red after {rounds} fix round(s): {names}"
     if ci.get("timed_out"):
         return f" · CI still running after {ci.get('waited_minutes', '?')} min"
+    if ci.get("cancelled"):
+        return f" · CI cancelled: {', '.join(ci['cancelled'])} (re-run it)"
     green = " · CI green" + (f" after {rounds} fix round(s)" if rounds else "")
     if ci.get("merged"):
         return green + " · merged"

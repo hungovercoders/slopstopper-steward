@@ -71,10 +71,16 @@ branch per `merge.delete_branch`. The conditions are the ones a steward
 PR's merge has: the wait really saw checks, none red, none still running,
 nothing stopped the wait. A merge GitHub refuses (a branch rule wanting a
 review, a conflict) is said in the comment and the PR left green for a
-person. `merge.auto` and `merge.kinds` are a separate switch, for the
+person. A conflict clears itself: merging one bump often conflicts the
+next (`go.sum`, a lockfile), Dependabot rebases a conflicted PR on its
+own, the new head no longer matches the marker, and the next run merges
+it. `merge.auto` and `merge.kinds` are a separate switch, for the
 steward's own PRs.
 
-The order's status in the run report is `green`, `red`, `merged`, or
+A job that was cancelled rather than failed proves nothing either way:
+the order ends `skipped` with the job named, no agent runs and no comment
+is posted, so a re-run of the job that goes green is merged by the next
+run. The order's status in the run report is `green`, `red`, `merged`, or
 `skipped` when the checks never settled.
 
 ## Keeping it off

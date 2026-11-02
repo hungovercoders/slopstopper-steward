@@ -251,6 +251,28 @@ def test_out_of_rounds_means_a_draft_that_names_the_checks(settle):
     assert "### CI still red after 2 fix round(s)" in seen["body"] and "`smoke-test` (failure)" in seen["body"]
 
 
+def test_a_cancelled_check_is_unsettled_not_red(settle):
+    """A job cancelled before it finished proves nothing: no agent is spent
+    on it, the PR is a draft that names it, and a re-run is the fix."""
+    go, waits, seen = settle
+    waits.append(([_run("smoke-test", conclusion="cancelled"), _run("e2e", rid=2)], False))
+    status, info = go()
+    assert status == "draft" and seen["agent"] == 0 and seen["drafted"]
+    assert info["cancelled"] == ["smoke-test"] and info["failing"] == [] and "re-run it" in info["note"]
+    assert "`smoke-test` cancelled before finishing" in seen["body"] and "CI still red" not in seen["body"]
+    from steward import report
+    out = runner.Outcome({"id": "u", "repo": "acme/a"}, "draft", pr_url="https://x/1", ci=info)
+    assert "CI cancelled: smoke-test (re-run it)" in report.RunReport("pr", [], [out]).markdown()
+
+
+def test_a_cancelled_check_beside_a_real_failure_still_gets_the_failure_worked(settle):
+    go, waits, seen = settle
+    waits += [([_run("smoke-test", conclusion="failure"), _run("e2e", rid=2, conclusion="cancelled")], False),
+              ([_run("smoke-test", rid=3), _run("e2e", rid=4)], False)]
+    status, info = go()
+    assert status == "pr" and seen["agent"] == 1 and info["rounds"] == 1 and info["cancelled"] == []
+
+
 def test_a_repos_own_red_check_is_reported_not_worked(settle):
     go, waits, seen = settle
     waits.append(([_run("Test (ubuntu)", conclusion="failure", app="github-actions-other")], False))
