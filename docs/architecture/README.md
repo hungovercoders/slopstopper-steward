@@ -153,7 +153,9 @@ flowchart TB
    deadline) until every run is complete, each PR-triggered `ss-*`
    workflow has reported and the set has held still for 90 seconds, or
    the runs have been complete and still for 5 minutes (a workflow a
-   `paths:` filter kept from running never reports). A red slopstopper check goes to the agent with the tail of
+   `paths:` filter kept from running never reports). Still is counted
+   from the runs' own completion time, so checks that finished days ago
+   (an old Dependabot PR) settle on the first look. A red slopstopper check goes to the agent with the tail of
    its job log and the triage skill, on the same branch; the steward
    pushes and waits again, up to `ci.fix_rounds` times. Green: the body
    says so. Red, out of rounds or out of time: the PR becomes a draft

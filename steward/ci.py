@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import re
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
@@ -49,8 +50,27 @@ def check_runs(repo: str, sha: str) -> list[dict]:
     for r in rows or []:
         out.append({"id": r.get("id"), "name": str(r.get("name") or ""), "status": str(r.get("status") or ""),
                     "conclusion": r.get("conclusion"), "url": str(r.get("html_url") or ""),
-                    "app": str(((r.get("app") or {}).get("slug")) or "")})
+                    "app": str(((r.get("app") or {}).get("slug")) or ""), "completed_at": _epoch(r.get("completed_at"))})
     return out
+
+
+def _epoch(stamp: object) -> float | None:
+    """GitHub's `2026-10-25T05:22:50Z` as epoch seconds, None when absent."""
+    try:
+        return datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp() if stamp else None
+    except ValueError:
+        return None
+
+
+def completed_since(runs: list[dict]) -> float | None:
+    """When the last of a complete run set finished, or None when any run
+    is still going or carries no time: the quiet period starts there, not
+    at the steward's first look, so checks that finished days ago (an old
+    Dependabot PR) count as settled at once rather than after a wait."""
+    if not settled(runs):
+        return None
+    stamps = [r.get("completed_at") for r in runs]
+    return max(stamps) if all(isinstance(t, (int, float)) for t in stamps) else None
 
 
 def settled(runs: list[dict]) -> bool:
@@ -105,7 +125,8 @@ def wait(repo: str, sha: str, seconds: float, expected: set[str] = frozenset(), 
     while True:
         fp = tuple(sorted((r["id"], r["status"], r["conclusion"]) for r in runs))
         if fp != fingerprint:
-            fingerprint, since = fp, now()
+            done = completed_since(runs)
+            fingerprint, since = fp, min(now(), done) if done is not None else now()
         _learn(repo, runs, workflows)
         seen = set(workflows.values())
         if runs and settled(runs):

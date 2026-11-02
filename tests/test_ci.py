@@ -67,6 +67,34 @@ def test_an_expected_workflow_that_never_reports_costs_the_grace_not_the_whole_w
     assert timed_out                                   # a budget shorter than the grace still times out
 
 
+def test_checks_that_finished_long_ago_are_settled_at_once(monkeypatch):
+    """An old Dependabot PR: every run complete for days. The quiet period
+    starts at the runs' completion, not at the steward's first look, so
+    neither the quiet wait nor the grace for a workflow that never ran is
+    paid again."""
+    old = [{**_run("smoke-test", rid=1), "completed_at": -3 * 86400.0}, {**_run("DCO", rid=2, app="dco"), "completed_at": -3 * 86400.0}]
+    _pages(monkeypatch, old)
+    monkeypatch.setattr(ci, "workflow_of", lambda repo, job: SS)
+    clock, now, sleep = _clock()
+    runs, timed_out, _ = ci.wait("acme/a", "sha", 1200, expected={SS, ".github/workflows/ss-never-ran.yml"}, now=now, sleep=sleep)
+    assert not timed_out and len(runs) == 2 and clock["t"] == 0.0
+    fresh = [{**r, "completed_at": 0.0} for r in old]            # just finished: the quiet period still applies
+    _pages(monkeypatch, fresh)
+    runs, timed_out, _ = ci.wait("acme/a", "sha", 1200, now=now, sleep=sleep)
+    assert not timed_out and clock["t"] >= ci.QUIET_SECONDS
+    assert ci.completed_since([_run("a", "in_progress", None)]) is None and ci.completed_since([_run("a")]) is None
+
+
+def test_check_runs_carry_their_completion_time(monkeypatch):
+    monkeypatch.setattr(ci.gh, "api", lambda path, **k: {"check_runs": [
+        {"id": 1, "name": "a", "status": "completed", "conclusion": "success", "html_url": "u", "app": {"slug": "github-actions"},
+         "completed_at": "2026-10-25T05:22:50Z"},
+        {"id": 2, "name": "b", "status": "in_progress", "conclusion": None, "app": {"slug": "github-actions"}, "completed_at": None}]})
+    runs = ci.check_runs("acme/a", "sha")
+    assert runs[0]["completed_at"] == 1792905770.0 and runs[1]["completed_at"] is None
+    assert ci._epoch("not a time") is None
+
+
 def test_wait_gives_up_on_a_head_that_never_gets_a_check(monkeypatch):
     monkeypatch.setattr(ci, "check_runs", lambda repo, sha: [])
     clock, now, sleep = _clock()
