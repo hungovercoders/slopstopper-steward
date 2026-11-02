@@ -60,13 +60,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator, Mapping, Sequence
 
+from steward import sandbox
+
 AGENT_USER_ENV = "STEWARD_AGENT_USER"
 # The agent's PATH: the pinned CLI's venv first, then system locations only
 # (never the steward's own home, mise shims or tool caches).
 SYSTEM_PATH = ("/usr/local/bin", "/usr/bin", "/bin")
 # Set per agent run rather than inherited: these name the steward's own
-# user and directories, which the agent user cannot use.
-PER_USER = ("PATH", "HOME", "TMPDIR", "USER", "LOGNAME", "RUNNER_TEMP")
+# user and directories, which the agent user cannot use. The XDG
+# directories are among them because `sudo` does not only reset the
+# environment: its PAM session (`pam_env`, `/etc/environment`) adds to it,
+# and the GitHub runner image puts `XDG_CONFIG_HOME=/home/runner/.config`
+# there. Left alone, that reaches the agent user, and Semgrep then fails
+# with a PermissionError on the runner's `.config` instead of scanning.
+PER_USER = ("PATH", "HOME", "TMPDIR", "USER", "LOGNAME", "RUNNER_TEMP", *sandbox.XDG)
+# Per-user too, but nothing of the agent's stands in for it: unset.
+UNSET = ("XDG_RUNTIME_DIR",)
 # `timeout` runs as the agent user and kills the agent's whole process
 # group when time is up: a signal to `sudo` would not reach a process the
 # steward does not own.
@@ -118,18 +127,21 @@ def command(iso: Isolated, argv: Sequence[str], env: Mapping[str, str], path_fir
             timeout: int | None = None) -> list[str]:
     """`argv` as the agent user, in its tree, with `env`. Secrets travel in
     the environment (`--preserve-env`), never on the command line where
-    another user could read them in the process list. PATH, HOME, TMPDIR
-    and the user's names are not secret and are set explicitly for the
-    agent user, since the steward's own values point at its directories
-    (and sudo's secure_path would replace PATH anyway). With `timeout`, the
-    run is wrapped in `timeout`, which the agent user owns and so can kill."""
+    another user could read them in the process list. PATH, HOME, the XDG
+    directories, TMPDIR and the user's names are not secret and are set
+    explicitly for the agent user, after sudo (whose PAM session adds what
+    `/etc/environment` holds), since the steward's own values point at its
+    directories (and sudo's secure_path would replace PATH anyway). With
+    `timeout`, the run is wrapped in `timeout`, which the agent user owns
+    and so can kill."""
     path = os.pathsep.join([*([str(path_first)] if path_first else []), *SYSTEM_PATH])
     keep = sorted(k for k in env if k not in PER_USER)
     preserve = [f"--preserve-env={','.join(keep)}"] if keep else []
     limit = ["/usr/bin/timeout", f"--kill-after={KILL_AFTER}", str(timeout)] if timeout else []
+    per_user = [f"PATH={path}", f"HOME={iso.home}", f"TMPDIR={iso.tmp}", f"USER={iso.user}", f"LOGNAME={iso.user}",
+                *(f"{k}={v}" for k, v in sandbox.xdg(iso.home).items())]
     return ["sudo", "-n", *preserve, "-u", iso.user, "--",
-            "/usr/bin/env", "-C", str(iso.tree), f"PATH={path}", f"HOME={iso.home}", f"TMPDIR={iso.tmp}",
-            f"USER={iso.user}", f"LOGNAME={iso.user}", *limit, *argv]
+            "/usr/bin/env", "-C", str(iso.tree), *(a for k in UNSET for a in ("-u", k)), *per_user, *limit, *argv]
 
 
 def run_apart(user: str, clone: Path, argv: Sequence[str], env: Mapping[str, str], path_first: Path | None,

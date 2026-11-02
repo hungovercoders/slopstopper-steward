@@ -78,11 +78,18 @@ def test_sync_back_never_writes_through_a_symlinked_directory(tmp_path):
 def test_command_keeps_secrets_off_the_command_line(tmp_path):
     iso = isolation.Isolated("steward-agent", tmp_path, tmp_path / "tree", tmp_path / "home", tmp_path / "tmp")
     env = {"PATH": "/x", "HOME": "/h", "TMPDIR": "/run/user/1000", "USER": "steward", "RUNNER_TEMP": "/r",
-           "ANTHROPIC_API_KEY": "sk-secret", "PYTHONSAFEPATH": "1"}
+           "ANTHROPIC_API_KEY": "sk-secret", "PYTHONSAFEPATH": "1", "XDG_CONFIG_HOME": "/home/runner/.config"}
     cmd = isolation.command(iso, ["claude", "-p", "brief"], env, Path("/venv/bin"), timeout=600)
     assert "sk-secret" not in " ".join(cmd)
     assert "--preserve-env=ANTHROPIC_API_KEY,PYTHONSAFEPATH" in cmd   # the steward's own dirs and names stay behind
     assert cmd[cmd.index("-C") + 1] == str(iso.tree) and f"HOME={iso.home}" in cmd
+    # the XDG directories are the agent's own, set after sudo's PAM session
+    # can add the runner's (`/etc/environment` holds XDG_CONFIG_HOME there)
+    assert f"XDG_CONFIG_HOME={iso.home}/.config" in cmd and f"XDG_CACHE_HOME={iso.home}/.cache" in cmd
+    assert f"XDG_DATA_HOME={iso.home}/.local/share" in cmd and f"XDG_STATE_HOME={iso.home}/.local/state" in cmd
+    assert "/home/runner" not in " ".join(cmd)
+    u = cmd.index("-u", cmd.index("/usr/bin/env"))
+    assert cmd[u + 1] == "XDG_RUNTIME_DIR" and u < cmd.index(f"HOME={iso.home}")   # an option, before the pairs
     assert f"TMPDIR={iso.tmp}" in cmd and "USER=steward-agent" in cmd and "LOGNAME=steward-agent" in cmd
     assert "PATH=/venv/bin:/usr/local/bin:/usr/bin:/bin" in cmd
     i = cmd.index("/usr/bin/timeout")                                 # the agent user's own timeout wraps the run
@@ -894,3 +901,30 @@ def test_a_failed_cleanup_is_said(monkeypatch, tmp_path, capsys):
         pass
     err = capsys.readouterr().err
     assert "warning" in err and str(tmp_path / "root") in err and "did not finish" in err
+
+
+def test_the_sandbox_home_brings_its_xdg_directories(tmp_path):
+    from steward import sandbox
+    env = sandbox.environment(home=tmp_path, base={"PATH": "/x", "HOME": "/h", "XDG_CONFIG_HOME": "/home/runner/.config"})
+    assert env["HOME"] == str(tmp_path) and env["XDG_CONFIG_HOME"] == str(tmp_path / ".config")
+    assert env["XDG_CACHE_HOME"] == str(tmp_path / ".cache")
+    without = sandbox.environment(base={"PATH": "/x", "HOME": "/h", "XDG_CONFIG_HOME": "/home/runner/.config"})
+    assert without["HOME"] == "/h" and "XDG_CONFIG_HOME" not in without   # no home of its own: no XDG claim either
+
+
+@pytest.mark.skipif(not AGENT_USER, reason="set STEWARD_TEST_AGENT_USER to a user the test may sudo to")
+def test_the_agent_user_sees_its_own_xdg_directories(tmp_path):
+    """What sudo's PAM session adds (`/etc/default/locale` here, the
+    runner's `/etc/environment` on Actions) comes after `--preserve-env`
+    and before `env`, so only what `env` sets can be relied on."""
+    import tempfile
+    clone = Path(tempfile.mkdtemp(prefix="steward-xdg-test-", dir="/tmp"))   # readable by the agent user, unlike tmp_path
+    clone.chmod(0o755)
+    (clone / "keep.txt").write_text("x")
+    with isolation.copy_for(AGENT_USER, clone) as iso:
+        cmd = isolation.command(iso, ["/usr/bin/env"], {"XDG_CONFIG_HOME": "/home/runner/.config"}, None, timeout=60)
+        out = subprocess.run(cmd, capture_output=True, text=True, env={"XDG_CONFIG_HOME": "/home/runner/.config"},
+                             timeout=120).stdout
+    seen = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+    assert seen["XDG_CONFIG_HOME"] == f"{iso.home}/.config" and seen["HOME"] == str(iso.home)
+    assert "XDG_RUNTIME_DIR" not in seen
