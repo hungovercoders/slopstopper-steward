@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from steward import ci, discover, gh, inventory, isolation, prompts, versions, workspace
-from steward.redact import redact
+from steward.redact import redact, unlink
 from steward.config import Config
 from steward.execute import agent, refresh
 from steward.execute.agent import AgentResult
@@ -117,11 +117,20 @@ def _pr_body(order: Order, cfg: Config, summary: str, extra: str = "", closes: b
                 "close it once the check passes on the default branch (most slopstopper checks close their own issue "
                 "when they next pass there).\n\n")
     return (
-        f"{link}{summary}\n\n{extra}"
-        f"\n---\nOpened by [slopstopper-steward]({STEWARD_URL}) for `{order.repo}`. Order `{order.id}`; "
+        f"{link}{unlink(summary)}\n\n{unlink(extra)}"
+        f"{FOOTER}Opened by [slopstopper-steward]({STEWARD_URL}) for `{order.repo}`. Order `{order.id}`; "
         f"a label `{cfg.ignore_label}` on an issue keeps the steward off it.\n"
         f"<!-- steward:order={order.id} -->\n"
     )
+
+
+FOOTER = "\n---\n"
+
+
+def _with_section(body: str, section: str) -> str:
+    """`section` above the footer, so the order marker stays last."""
+    head, sep, tail = body.rpartition(FOOTER)
+    return f"{head}{section}{sep}{tail}" if sep else body + section
 
 
 def _evidence(verdict: dict) -> list[str]:
@@ -353,7 +362,7 @@ def _settle_ci(order: Order, inv: inventory.Inventory, cfg: Config, ws: workspac
     not_green = bool(info["failing"] or info["timed_out"])
     number = workspace.pr_number(url)
     try:
-        workspace.update_pr_body(order.repo, number, body + _ci_section(info))
+        workspace.update_pr_body(order.repo, number, _with_section(body, _ci_section(info)))
         if not_green and not draft:
             workspace.set_draft(order.repo, number)
     except Exception as exc:
