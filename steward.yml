@@ -16,8 +16,10 @@ mode: pr
 
 upgrade:
   policy: latest
-  # A release has two days to be yanked before the steward moves a pin to it.
-  min_age_days: 2
+  # 0 for one run, so the adopters move to 0.29.0 (the installer lock fix)
+  # the day it shipped; set back to 2 afterwards, so a bad release can be
+  # yanked before it lands.
+  min_age_days: 0
 
 budgets:
   repos_per_run: 5
