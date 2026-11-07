@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import urllib.error
@@ -33,9 +34,27 @@ class CannotRun(Exception):
 
 def _cfg(args) -> Config:
     try:
-        return load(Path(args.config))
+        cfg = load(Path(args.config))
     except (OSError, ValueError, TypeError) as exc:
         raise CannotRun(str(exc)) from exc
+    for line in owner_mismatch(cfg, os.environ.get("GITHUB_REPOSITORY", "")):
+        print(f"! {line}", file=sys.stderr)
+    return cfg
+
+
+def owner_mismatch(cfg: Config, repository: str) -> list[str]:
+    """A warning when `steward.yml` names no org that owns the repo the run
+    is in. On Actions the workflow mints its GitHub App token for that
+    owner (`github.repository_owner`), so a fork or template copy whose
+    `orgs` still names the upstream org would plan the wrong organisation
+    with a token that cannot read it. Stewarding another org from here is
+    allowed (a PAT in STEWARD_TOKEN does it), so this warns, never fails."""
+    owner = repository.split("/", 1)[0] if repository else ""
+    if not owner or owner in cfg.orgs:
+        return []
+    return [f"steward.yml names {', '.join(cfg.orgs)} but this run is in {owner}'s repo; the workflow mints its "
+            f"GitHub App token for {owner}. Set orgs to {owner} unless you steward other organisations from here "
+            "with STEWARD_TOKEN (docs/runbooks/SETUP.md, steps 2 and 3)."]
 
 
 def _need_gh() -> None:

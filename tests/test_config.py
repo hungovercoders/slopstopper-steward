@@ -17,7 +17,8 @@ def test_include_narrows():
     assert cfg.allows("acme/a") and not cfg.allows("acme/b")
 
 
-@pytest.mark.parametrize("bad", [{}, {"orgs": []}, {"orgs": ["a"], "mode": "yolo"}, {"orgs": ["a"], "upgrade": {"policy": "major"}}])
+@pytest.mark.parametrize("bad", [{}, {"orgs": []}, {"orgs": ["a"], "mode": "yolo"}, {"orgs": ["a"], "upgrade": {"policy": "major"}},
+                                 {"orgs": ["your-org"]}, {"orgs": ["acme", "your-org"]}])
 def test_rejects_bad_config(bad):
     with pytest.raises(ValueError):
         config.from_dict(bad)
@@ -26,3 +27,8 @@ def test_rejects_bad_config(bad):
 def test_missing_file(tmp_path):
     with pytest.raises(FileNotFoundError):
         config.load(tmp_path / "nope.yml")
+
+
+def test_placeholder_org_names_the_runbook():
+    with pytest.raises(ValueError, match="SETUP.md"):
+        config.from_dict({"orgs": ["your-org"]})
