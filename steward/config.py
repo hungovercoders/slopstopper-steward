@@ -181,7 +181,13 @@ def _merge(section: dict) -> dict:
     }
 
 
+PLACEHOLDER_ORG = "your-org"   # what steward.yml.example ships; a copy must replace it
+
+
 def _check(cfg: Config) -> None:
+    if PLACEHOLDER_ORG in cfg.orgs:
+        raise ValueError(f"steward.yml: orgs still names the example {PLACEHOLDER_ORG!r}; set your own organisation "
+                         "(docs/runbooks/SETUP.md, step 2)")
     if cfg.mode not in MODES:
         raise ValueError(f"steward.yml: mode must be one of {MODES}, not {cfg.mode!r}")
     if cfg.policy not in POLICIES:

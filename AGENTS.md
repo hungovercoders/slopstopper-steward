@@ -67,7 +67,7 @@ docs/                  one concern per doc; docs/README.md is the map
 | --------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
 | changing what the steward reads from slopstopper, or slopstopper moved something | Read [docs/architecture/CONTRACT.md](./docs/architecture/CONTRACT.md). It lists every surface and how a change on either side is caught |
 | asking how a run works, what an order is, or where the agent is boxed | Read [docs/architecture/README.md](./docs/architecture/README.md). It has the pipeline, the order kinds and the guardrails |
-| setting the steward up for an organisation (tokens, secrets, first run) | Read [docs/runbooks/SETUP.md](./docs/runbooks/SETUP.md). It walks the GitHub App, the secrets and the dry run |
+| setting the steward up for an organisation (a fork or template copy, tokens, secrets, first run) | Read [docs/runbooks/SETUP.md](./docs/runbooks/SETUP.md). It walks the copy, the GitHub App, the secrets and the dry run |
 | reading a run report, keeping the steward off an issue, or handling a draft PR | Read [docs/runbooks/OPERATE.md](./docs/runbooks/OPERATE.md). It covers labels, budgets and what each outcome means |
 | contributing code: tests, exit codes, commit conventions          | Read [docs/contributing/README.md](./docs/contributing/README.md) first                         |
 | doing any task not covered above                                 | Read [docs/README.md](./docs/README.md) before you start; do not guess a convention              |

@@ -15,6 +15,10 @@ name: Steward · Run
 # orders need CLAUDE_CODE_OAUTH_TOKEN (a Claude Pro/Max subscription, from
 # `claude setup-token`) or ANTHROPIC_API_KEY (pay-as-you-go API billing);
 # without either, upgrades still run and findings are only reported.
+#
+# Nothing here names an organisation: the App token is minted for the
+# owner of the repo this workflow runs in, so a fork or template copy
+# changes only steward.yml (docs/runbooks/SETUP.md, step 1).
 
 on:
   schedule:

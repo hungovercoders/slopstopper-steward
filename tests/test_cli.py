@@ -95,3 +95,32 @@ def test_app_token_without_identity_is_accepted(monkeypatch, tmp_path):
 def test_module_entrypoint():
     done = subprocess.run([sys.executable, "-m", "steward", "--version"], cwd=ROOT, capture_output=True, text=True)
     assert done.returncode == 0 and "slopstopper-steward" in done.stdout
+
+
+def test_owner_mismatch_warns_only_off_actions_owner():
+    from steward.config import from_dict
+    cfg = from_dict({"orgs": ["acme"]})
+    assert cli.owner_mismatch(cfg, "") == []
+    assert cli.owner_mismatch(cfg, "acme/steward") == []
+    assert cli.owner_mismatch(from_dict({"orgs": ["acme", "beta"]}), "beta/steward") == []
+    [line] = cli.owner_mismatch(cfg, "beta/steward")
+    assert "names acme" in line and "beta's repo" in line and "STEWARD_TOKEN" in line
+
+
+def test_owner_mismatch_is_a_warning_on_stderr(monkeypatch, tmp_path, capsys):
+    cfg = tmp_path / "steward.yml"
+    cfg.write_text("orgs: [acme]\n")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "beta/slopstopper-steward")
+    monkeypatch.setattr(cli.gh, "available", lambda: True)
+    monkeypatch.setattr(cli.gh, "authenticated", lambda: True)
+    monkeypatch.setattr(cli.discover, "discover", lambda c: [])
+    rc = cli.main(["--config", str(cfg), "discover", "--json"])
+    out, err = capsys.readouterr()
+    assert rc == 0 and json.loads(out) == [] and "this run is in beta's repo" in err
+
+
+def test_placeholder_org_cannot_run(tmp_path, capsys):
+    cfg = tmp_path / "steward.yml"
+    cfg.write_text("orgs:\n  - your-org\n")
+    rc = cli.main(["--config", str(cfg), "plan"])
+    assert rc == 2 and "SETUP.md" in capsys.readouterr().err

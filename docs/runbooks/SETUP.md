@@ -1,16 +1,55 @@
 # Set the steward up for an organisation
 
-One repo (this one, or a fork of it) per organisation or group of
-organisations. The run is a GitHub Actions workflow in that repo; the
-only state is `steward.yml` and the PRs it opens.
+One repo per organisation or group of organisations: this one for
+hungovercoders, a copy of it for anyone else. The run is a GitHub Actions
+workflow in that repo; the only state is `steward.yml` and the PRs it
+opens. Nothing in the package or the workflow names an organisation, so
+a copy changes one file and adds its own secrets.
 
-## 1. Name the orgs
+## 1. Your own copy
 
-Copy `steward.yml.example` to `steward.yml`, set `orgs`, and start in
-`mode: plan` so the first runs only report. Narrow with `repos.include`
+**Fork (recommended).** Fork `hungovercoders/slopstopper-steward` into
+your organisation. The fork keeps its link to upstream, so GitHub's
+*Sync fork* button (or `git fetch upstream && git merge upstream/main`)
+brings later steward fixes in with one click; your only local commits
+are `steward.yml` and the odd badge, so the merge is clean. GitHub
+disables scheduled workflows on a fork until you enable Actions on it
+once, from the fork's Actions tab.
+
+**Template.** When the repo's owner has marked it a template, *Use this
+template* creates a repo with a clean history and no upstream link.
+Choose it when a fork is not allowed in your organisation, or you want
+no trace of hungovercoders' history. Fixes then come by hand: add
+`https://github.com/hungovercoders/slopstopper-steward` as a remote named
+`upstream` and merge or cherry-pick when its releases say so.
+
+Either way, keep the name `slopstopper-steward` if you can: every PR body
+the steward writes links to the steward repo by that name. Then make the
+copy yours:
+
+- `steward.yml`: replace it, step 2. The committed one is hungovercoders'.
+- `README.md`: the badge block points at hungovercoders' workflows. Run
+  `slopstopper install` once in the copy to regenerate it for yours, or
+  delete the block between the `badges:begin` and `badges:end` markers.
+- Everything else stays. The `ss-*.yml` workflows and `.slopstopper.yml`
+  are slopstopper installed on the steward itself, so your copy is an
+  adopter and your steward keeps its own pin current. `steward-ci.yml`
+  clones `hungovercoders/slopstopper` for the contract test, which is
+  upstream for every copy.
+
+A copy whose `steward.yml` still names the example `your-org` exits 2
+before it reads anything. A copy whose `orgs` misses the owner of the
+repo it runs in prints a warning on every command, since the App token
+in step 3 is minted for that owner; it still runs, for the one case where
+one copy stewards several organisations with a PAT.
+
+## 2. Name the orgs
+
+Copy `steward.yml.example` over `steward.yml`, set `orgs` to your
+organisation, and start in `mode: plan` so the first runs only report. Narrow with `repos.include`
 while you watch it work.
 
-## 2. A token that can write to the adopters
+## 3. A token that can write to the adopters
 
 `GITHUB_TOKEN` is scoped to the steward repo, so writes elsewhere need one
 of two things. A GitHub App is the better one: installable per repo,
@@ -59,7 +98,7 @@ they are missing and never alters one that exists, since `slopstopper`
 is the label the adopter's own suite uses. If it cannot add them, the PR
 is still opened, unlabelled.
 
-## 3. The agent
+## 4. The agent
 
 On Actions the agent runs as its own OS user: the run workflow creates
 `steward-agent` and sets `STEWARD_AGENT_USER`, so it cannot touch the
@@ -98,7 +137,7 @@ are reported as skipped with the reason. `budgets.agent_usd` and
 `budgets.agent_turns` cap each invocation; `agent.enabled: false`
 switches the agentic orders off entirely.
 
-## 4. First run
+## 5. First run
 
 Run **Steward · Run** from the Actions tab with *Plan only* ticked, or
 locally:
@@ -116,7 +155,7 @@ Read the report. Repos you expected and do not see are missing both the
 there once. When the plan looks right, set `mode: pr` and widen
 `budgets.repos_per_run` as the PRs prove themselves.
 
-## 5. Schedule
+## 6. Schedule
 
 `steward-run.yml` runs weekly (Monday 06:17 UTC) and on dispatch; one run
 at a time (`concurrency`). A `plan` job dry-runs every adopter, then one

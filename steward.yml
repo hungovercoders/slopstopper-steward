@@ -1,4 +1,6 @@
-# What this repo's own steward run covers. Schema: steward.yml.example.
+# hungovercoders' live config: what this repo's own steward run covers.
+# Running a copy of this repo for another organisation, replace this
+# file from steward.yml.example (docs/runbooks/SETUP.md, steps 1 and 2).
 orgs:
   - hungovercoders
 
