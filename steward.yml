@@ -9,6 +9,7 @@ orgs:
 repos:
   include:
     - hungovercoders/apic
+    - hungovercoders/site
     - hungovercoders/slopstopper-steward
     - hungovercoders/terminal-of-terror
 
@@ -16,9 +17,8 @@ mode: pr
 
 upgrade:
   policy: latest
-  # 0 for one run, so the adopters move to 0.29.0 (the installer lock fix)
-  # the day it shipped; set back to 2 afterwards, so a bad release can be
-  # yanked before it lands.
+  # 0: a release is a target the day it ships. Raise to 2 to give a bad
+  # release time to be yanked before the steward moves a pin to it.
   min_age_days: 0
 
 budgets:
