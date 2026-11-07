@@ -16,7 +16,8 @@ steward contract ../slopstopper   # do slopstopper's surfaces still hold?
 
 Not a hosted service: each organisation runs its own copy of this repo.
 Fork it (or use it as a template), replace `steward.yml` with your org,
-add a GitHub App and an Anthropic key or Claude token as secrets, and
+add a GitHub App (its ID a variable, its key a secret) and an Anthropic
+key or Claude token as a secret, and
 run *Steward · Run* with *Plan only*. Nothing under `steward/` names an
 organisation. [`docs/runbooks/SETUP.md`](./docs/runbooks/SETUP.md) walks
 the copy, the token and the first dry run.
