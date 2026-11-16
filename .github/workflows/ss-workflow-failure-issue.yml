@@ -29,6 +29,7 @@ on:
       - "SlopStopper · Reliability Smoke Tests"
       - "SlopStopper · E2E Check"
       - "SlopStopper · API Headers Check"
+      - "SlopStopper · HTTPS Redirect Check"
       - "SlopStopper · DAST Analysis"
       - "SlopStopper · SAST Analysis"
       - "SlopStopper · Secrets Detection"
