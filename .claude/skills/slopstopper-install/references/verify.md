@@ -44,12 +44,13 @@ For each failure: fix the root cause locally, re-run **just that one check** to 
 
 ### Pass B: Dynamic checks (need a URL + a built site)
 
-**Under `--profile library` there is no Pass B.** Every URL-driven check is dropped, so Pass A *is* the local loop. Under `--profile api` the browser checks are gone, so Pass B is the four API checks plus DAST:
+**Under `--profile library` there is no Pass B.** Every URL-driven check is dropped, so Pass A *is* the local loop. Under `--profile api` the browser checks are gone, so Pass B is the four API checks, the HTTPS redirect check and DAST:
 
 ```bash
 task ss:reliability:api-health  -- https://api-preview.example.com
 task ss:reliability:api-latency -- https://api-preview.example.com
 task ss:security:api-headers    -- https://api-preview.example.com
+task ss:security:https          -- https://api-preview.example.com
 task ss:hygiene:openapi         -- https://api-preview.example.com
 task ss:security:dast           -- https://api-preview.example.com   # needs Docker
 ```

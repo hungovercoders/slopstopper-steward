@@ -24,7 +24,7 @@ ls .slopstopper.yml .ss/.workflows-installed 2>/dev/null
 
 ## What slopstopper is, in three lines
 
-A Python CLI plus GitHub Actions workflows that run security, hygiene and reliability checks on every PR. One command to install into any repo. The `slopstopper-cli` Python package owns every check's logic. Every workflow boils down to `slopstopper run <category>:<check>` (runs the check, writes `.ss/reports/`) and `slopstopper emit <category>:<check> --target {pr-comment,issue}` (posts the result). The install lands ~30 workflows, pins the CLI via **mise** (`mise.toml`), merges devDeps into `package.json` (or creates a minimal one), seeds `.slopstopper.yml`, and creates a `Taskfile.yml` if the target has none. Don't run it blind.
+A Python CLI plus GitHub Actions workflows that run security, hygiene and reliability checks on every PR. One command to install into any repo. The `slopstopper-cli` Python package owns every check's logic. Every workflow boils down to `slopstopper run <category>:<check>` (runs the check, writes `.ss/reports/`) and `slopstopper emit <category>:<check> --target {pr-comment,issue}` (posts the result). The install lands ~31 workflows, pins the CLI via **mise** (`mise.toml`), merges devDeps into `package.json` (or creates a minimal one), seeds `.slopstopper.yml`, and creates a `Taskfile.yml` if the target has none. Don't run it blind.
 
 ## The playbook
 
@@ -45,7 +45,7 @@ A Python CLI plus GitHub Actions workflows that run security, hygiene and reliab
 Say so plainly if:
 
 - The target has no CI at all and the user only wants one check. Point them at `pipx install slopstopper-cli` and a single `slopstopper run …` instead.
-- It's a one-file script or library where 30 workflows is overkill (`--profile library` still ships 14).
+- It's a one-file script or library where 31 workflows is overkill (`--profile library` still ships 14).
 - It's a **private repo with a tight CI-minutes budget**. Actions minutes are free on public repos and billed on private ones; the dynamic checks (Playwright, Lighthouse, ZAP-in-Docker) are the expensive ones. Call the cost out and let the user decide (Step 1.12 in `references/preflight.md`).
 
 ## Step 10: When to hand off

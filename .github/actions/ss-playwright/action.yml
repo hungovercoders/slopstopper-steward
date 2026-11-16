@@ -112,9 +112,17 @@ runs:
       env:
         BROWSER: ${{ inputs.browser }}
       run: |
+        set -o pipefail
+        log="$(mktemp)"
         for attempt in 1 2; do
-          if timeout --kill-after=30s 5m npx playwright install "$BROWSER"; then
+          if timeout --kill-after=30s 5m npx playwright install "$BROWSER" 2>&1 | tee "$log"; then
             exit 0
+          fi
+          # A Playwright older than the runner's OS refuses outright, and a
+          # retry or a re-run gets the same answer: say what to change.
+          if grep -q "does not support" "$log"; then
+            echo "::error::The installed Playwright does not support this runner's OS (see the line above). Raise it in the lockfile: npm install --save-dev @playwright/test@latest. Until then, set runs-on to the previous image."
+            exit 1
           fi
           echo "::warning::Playwright browser download attempt ${attempt} failed or stalled after 5 minutes"
         done

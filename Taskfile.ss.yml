@@ -558,6 +558,30 @@ tasks:
     cmds:
       - slopstopper run security:api-headers -- {{.CLI_ARGS}}
 
+  security:https:
+    desc: Audit a live site for the HTTP to HTTPS redirect and the HSTS header
+    summary: |
+      Asks the deployed site two questions. Does `http://<host>/` redirect
+      (301/302/307/308) to `https://` on the same host? Does the https
+      response send `Strict-Transport-Security` with a max-age above zero?
+      A site that answers plain HTTP with a page works in a browser that
+      remembers the https URL and fails for a link that starts `http://`.
+
+      Skips (exit 0) for a local or non-https target, where there is no
+      edge to redirect. Exits 2 when the https host does not answer.
+
+      Configuration (also read from .slopstopper.yml's `security.https`):
+        HTTPS_TEST_URL     - base URL of the site (required)
+
+      Flags:
+        --no-require-hsts  - don't demand HSTS
+
+      Usage:
+        task ss:security:https -- https://your-site.example.com
+        HTTPS_TEST_URL=https://your-site.example.com task ss:security:https
+    cmds:
+      - slopstopper run security:https -- {{.CLI_ARGS}}
+
   security:scan:
     desc: Run full security scan suite (SAST + vulnerabilities + licences + DAST + API headers + secrets)
     # Runs every scan even when an earlier one fails. sast exits 1 on

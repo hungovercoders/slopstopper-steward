@@ -15,6 +15,7 @@
 | `ss-security-licences-check.yml` | `task ss:security:licences` | `slopstopper run security:licences` | – | – | – |
 | `ss-security-dast-check.yml` | `task ss:security:dast -- <URL>` | `slopstopper run security:dast <URL>` | ✓ | ✓ (site mode only) | ✓ |
 | `ss-security-api-headers-check.yml` | `task ss:security:api-headers -- <URL>` | `slopstopper run security:api-headers <URL>` | ✓ | – (probe a deployed origin) | – |
+| `ss-security-https-check.yml` | `task ss:security:https -- <URL>` | `slopstopper run security:https <URL>` | ✓ | – (skips on localhost; probe the deployed site) | – |
 | `ss-hygiene-complexity-check.yml` | `task ss:hygiene:complexity` | `slopstopper run hygiene:complexity` | – | – | – |
 | `ss-hygiene-csp-exceptions-check.yml` | `task ss:hygiene:csp-exceptions` | `slopstopper run hygiene:csp-exceptions` | – | – | – |
 | `ss-hygiene-privacy-check.yml` | `task ss:hygiene:privacy` | `slopstopper run hygiene:privacy` | – | – | – |
